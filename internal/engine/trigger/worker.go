@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/scrypster/muninndb/internal/storage"
@@ -101,6 +102,56 @@ func (w *TriggerWorker) vaultWS(vaultID uint32) [8]byte {
 	return ws
 }
 
+func normalizeTriggerText(text string) string {
+	text = strings.ToLower(text)
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == ' ' || r == '\n' || r == '\t':
+			return ' '
+		default:
+			return ' '
+		}
+	}, text)
+}
+
+func lexicalWriteScore(contexts []string, eng *storage.Engram) float64 {
+	engText := normalizeTriggerText(strings.Join(append([]string{eng.Concept, eng.Content}, eng.Tags...), " "))
+	if strings.TrimSpace(engText) == "" {
+		return 0
+	}
+
+	best := 0.0
+	for _, ctx := range contexts {
+		normalized := strings.Join(strings.Fields(normalizeTriggerText(ctx)), " ")
+		if normalized == "" {
+			continue
+		}
+		if strings.Contains(engText, normalized) {
+			return 1.0
+		}
+
+		tokens := strings.Fields(normalized)
+		if len(tokens) == 0 {
+			continue
+		}
+		matched := 0
+		for _, token := range tokens {
+			if strings.Contains(engText, token) {
+				matched++
+			}
+		}
+		score := float64(matched) / float64(len(tokens))
+		if score > best {
+			best = score
+		}
+	}
+	return best
+}
+
 func (w *TriggerWorker) handleWrite(ctx context.Context, event *EngramEvent) {
 	if !event.IsNew {
 		return
@@ -121,16 +172,16 @@ func (w *TriggerWorker) handleWrite(ctx context.Context, event *EngramEvent) {
 		sub.mu.Unlock()
 
 		// When either the engram or the subscription has no embedding, fall back
-		// to vectorScore=0. TriggerScore will still fire for Threshold=0 subs
-		// using decay, recency, and confidence components. This ensures
-		// PushOnWrite delivers even for engrams that have not yet been embedded.
+		// to lightweight lexical overlap so push-on-write still works immediately
+		// for fresh writes before background embedding catches up.
 		var vectorScore float64
 		if len(subVec) > 0 && len(engramVec) > 0 {
 			vectorScore = cosineSimilarity(subVec, engramVec)
 		}
+		ftsScore := lexicalWriteScore(sub.Context, event.Engram)
 
 		meta := engramToMeta(event.Engram)
-		score, above := TriggerScore(sub, meta, vectorScore, 0)
+		score, above := TriggerScore(sub, meta, vectorScore, ftsScore)
 		if !above {
 			continue
 		}
