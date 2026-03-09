@@ -131,6 +131,69 @@ func TestTriggerWorker_HandleWrite_NewEngram(t *testing.T) {
 	}
 }
 
+func TestTriggerWorker_HandleWrite_UsesLexicalFallbackForFreshWrites(t *testing.T) {
+	registry := newRegistry()
+	deliver := &DeliveryRouter{registry: registry}
+
+	var pushCount atomic.Int32
+	sub := &Subscription{
+		ID:             "test-sub-lexical",
+		VaultID:        1,
+		Context:        []string{"PUSH SENTINEL 123"},
+		Threshold:      0.2,
+		DeltaThreshold: 0.0,
+		PushOnWrite:    true,
+		expiresAt:      time.Now().Add(1 * time.Hour),
+		Deliver: func(ctx context.Context, push *ActivationPush) error {
+			pushCount.Add(1)
+			if push.Trigger != TriggerNewWrite {
+				t.Errorf("expected trigger %q, got %q", TriggerNewWrite, push.Trigger)
+			}
+			return nil
+		},
+		pushedScores: make(map[storage.ULID]float64),
+		rateLimiter:  newTokenBucket(10),
+	}
+	registry.Add(sub)
+
+	writeCh := make(chan *EngramEvent, 10)
+	worker := &TriggerWorker{
+		registry:     registry,
+		embedCache:   newEmbedCache(),
+		deliver:      deliver,
+		writeEvents:  writeCh,
+		cogEvents:    make(chan CognitiveEvent, 1),
+		contraEvents: make(chan ContradictEvent, 1),
+	}
+
+	writeCh <- &EngramEvent{
+		VaultID: 1,
+		IsNew:   true,
+		Engram: &storage.Engram{
+			ID:         storage.NewULID(),
+			Concept:    "gateway smoke",
+			Content:    "contains push sentinel 123 and should surface automatically",
+			Confidence: 0.92,
+			CreatedAt:  time.Now(),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		worker.Run(ctx)
+		close(done)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	<-done
+
+	if pushCount.Load() < 1 {
+		t.Fatalf("expected lexical fallback push for fresh write, got %d", pushCount.Load())
+	}
+}
+
 func TestTriggerWorker_HandleWrite_SkipsUpdates(t *testing.T) {
 	registry := newRegistry()
 	deliver := &DeliveryRouter{registry: registry}
