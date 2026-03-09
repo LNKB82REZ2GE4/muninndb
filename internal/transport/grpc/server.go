@@ -75,6 +75,7 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, tlsConfig *
 		grpc.KeepaliveParams(kasp),
 		grpc.UnaryInterceptor(server.authUnaryInterceptor),
 		grpc.StreamInterceptor(server.authStreamInterceptor),
+		grpc.ForceServerCodec(jsonCodec{}),
 	}
 	if tlsConfig != nil {
 		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsConfig)))
