@@ -69,6 +69,8 @@ func NewEnrichService(providerURL string) (*EnrichService, error) {
 		prov = NewOllamaLLMProvider()
 	case plugin.SchemeOpenAI:
 		prov = NewOpenAILLMProvider()
+	case plugin.SchemeLMStudio:
+		prov = NewOpenAILLMProvider()
 	case plugin.SchemeAnthropic:
 		prov = NewAnthropicLLMProvider()
 	case plugin.SchemeGoogle:
@@ -250,6 +252,9 @@ func (s *EnrichService) createRateLimiter(scheme plugin.ProviderScheme) *TokenBu
 		return NewTokenBucketLimiter(1000.0, 1000.0)
 	case plugin.SchemeOpenAI:
 		// 10 requests per second for OpenAI (gpt-4o-mini)
+		return NewTokenBucketLimiter(10.0, 10.0)
+	case plugin.SchemeLMStudio:
+		// Local LM Studio OpenAI-compatible endpoint.
 		return NewTokenBucketLimiter(10.0, 10.0)
 	case plugin.SchemeAnthropic:
 		// 8 requests per second for Anthropic (claude-haiku)

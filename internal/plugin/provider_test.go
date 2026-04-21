@@ -99,6 +99,29 @@ func TestParseOpenAIURL_InvalidBaseURL(t *testing.T) {
 	}
 }
 
+func TestParseLMStudioURL(t *testing.T) {
+	config, err := ParseProviderURL("lmstudio://qwen3-8b?base_url=http://192.168.1.50:1234/v1")
+	if err != nil {
+		t.Fatalf("failed to parse lmstudio URL: %v", err)
+	}
+
+	if config.Scheme != SchemeLMStudio {
+		t.Errorf("expected scheme 'lmstudio', got %q", config.Scheme)
+	}
+	if config.Host != "192.168.1.50" {
+		t.Errorf("expected host '192.168.1.50', got %q", config.Host)
+	}
+	if config.Port != 1234 {
+		t.Errorf("expected port 1234, got %d", config.Port)
+	}
+	if config.Model != "qwen3-8b" {
+		t.Errorf("expected model 'qwen3-8b', got %q", config.Model)
+	}
+	if config.BaseURL != "http://192.168.1.50:1234" {
+		t.Errorf("expected BaseURL 'http://192.168.1.50:1234', got %q", config.BaseURL)
+	}
+}
+
 func TestParseAnthropicURL(t *testing.T) {
 	config, err := ParseProviderURL("anthropic://claude-haiku")
 	if err != nil {
@@ -157,6 +180,7 @@ func TestParseMalformedURL(t *testing.T) {
 		"",                    // empty
 		"not-a-url",           // no scheme
 		"openai://",           // missing model
+		"lmstudio://",         // missing model/base_url
 		"ollama://localhost/", // missing port
 		"ollama://localhost/", // missing port
 	}

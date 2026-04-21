@@ -21,6 +21,7 @@ describe('parsePluginConfigResponse', () => {
         expect(r.enrichOllamaModel).toBeNull();
         expect(r.enrichModel).toBeNull();
         expect(r.enrichApiKey).toBeNull();
+        expect(r.enrichBaseUrl).toBeNull();
     });
 
     it('maps empty-string provider to none', () => {
@@ -96,6 +97,18 @@ describe('parsePluginConfigResponse', () => {
         expect(r.enrichProvider).toBe('openai');
         expect(r.enrichModel).toBe('gpt-4o-mini');
         expect(r.enrichApiKey).toBe('sk-openai-test');
+    });
+
+    it('parses lmstudio enrich URL to model and base URL', () => {
+        const r = parsePluginConfigResponse({
+            enrich_provider: 'lmstudio',
+            enrich_url: 'lmstudio://qwen3-8b?base_url=http%3A%2F%2F192.168.1.50%3A1234%2Fv1',
+            enrich_api_key: 'sk-lm-test',
+        });
+        expect(r.enrichProvider).toBe('lmstudio');
+        expect(r.enrichModel).toBe('qwen3-8b');
+        expect(r.enrichBaseUrl).toBe('http://192.168.1.50:1234/v1');
+        expect(r.enrichApiKey).toBe('sk-lm-test');
     });
 
     it('parses ollama enrich URL to model name', () => {

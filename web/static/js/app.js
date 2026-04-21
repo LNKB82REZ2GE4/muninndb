@@ -217,12 +217,16 @@ document.addEventListener('alpine:init', () => {
       embedUrl: '',           // custom base URL for openai-compatible endpoints
       embedShowForm: false,
       embedError: '',
-      enrichProvider: 'none', // 'none' | 'ollama' | 'openai' | 'anthropic' | 'google'
+      enrichProvider: 'none', // 'none' | 'ollama' | 'openai' | 'lmstudio' | 'anthropic' | 'google'
       enrichOllamaModel: 'llama3.2',
       enrichModel: 'claude-haiku-4-5-20251001',
       enrichApiKey: '',
+      enrichLMStudioBaseUrl: 'http://192.168.1.50:1234/v1',
       enrichShowForm: false,
       enrichError: '',
+      lmStudioModels: [],
+      lmStudioDetected: null,
+      lmStudioChecking: false,
       ollamaModels: [],
       ollamaEmbedModels: [],
       ollamaDetected: null,   // null=unchecked, true=running, false=not found
@@ -455,8 +459,11 @@ document.addEventListener('alpine:init', () => {
         } else if (this.settingsTab === 'plugins') {
           this.loadPlugins();
           this.loadEmbedStatus();
-          await this.loadSavedPluginConfig();  // must resolve before probeOllama reads model state
+          await this.loadSavedPluginConfig();  // must resolve before provider probes read model state
           this.probeOllama();
+          if (this.pluginCfg.enrichProvider === 'lmstudio') {
+            this.probeLMStudio();
+          }
         } else if (this.settingsTab === 'keys') {
           this.loadApiKeys();
           this.loadVaults();
@@ -1902,6 +1909,7 @@ document.addEventListener('alpine:init', () => {
             if (parsed.enrichOllamaModel !== null) c.enrichOllamaModel = parsed.enrichOllamaModel;
             if (parsed.enrichModel       !== null) c.enrichModel       = parsed.enrichModel;
             if (parsed.enrichApiKey      !== null) c.enrichApiKey      = parsed.enrichApiKey;
+            if (parsed.enrichBaseUrl     !== null) c.enrichLMStudioBaseUrl = parsed.enrichBaseUrl;
         } catch (e) {
             console.warn('loadSavedPluginConfig failed:', e);
         }
@@ -2619,11 +2627,13 @@ document.addEventListener('alpine:init', () => {
         enrich_provider: c.enrichProvider === 'none' ? '' : c.enrichProvider,
         enrich_url: c.enrichProvider === 'ollama'
           ? `ollama://localhost:11434/${c.enrichOllamaModel}`
-          : c.enrichProvider === 'openai' ? 'openai://gpt-4o-mini'
+          : c.enrichProvider === 'openai' ? `openai://${c.enrichModel || 'gpt-4o-mini'}`
+          : c.enrichProvider === 'lmstudio'
+            ? `lmstudio://${c.enrichModel || 'model'}?base_url=${encodeURIComponent(c.enrichLMStudioBaseUrl || 'http://192.168.1.50:1234/v1')}`
           : c.enrichProvider === 'anthropic' ? `anthropic://${c.enrichModel}`
           : c.enrichProvider === 'google' ? `google://${c.enrichModel}`
           : '',
-        enrich_api_key: (c.enrichProvider === 'openai' || c.enrichProvider === 'anthropic' || c.enrichProvider === 'google') ? c.enrichApiKey : '',
+        enrich_api_key: (c.enrichProvider === 'openai' || c.enrichProvider === 'lmstudio' || c.enrichProvider === 'anthropic' || c.enrichProvider === 'google') ? c.enrichApiKey : '',
       };
 
       try {
@@ -2962,6 +2972,36 @@ document.addEventListener('alpine:init', () => {
         this.pluginCfg.ollamaDetected = false;
       }
       this.pluginCfg.ollamaChecking = false;
+    },
+
+    async probeLMStudio() {
+      if (this.pluginCfg.lmStudioChecking) return;
+      this.pluginCfg.lmStudioChecking = true;
+      try {
+        const base = (this.pluginCfg.enrichLMStudioBaseUrl || 'http://192.168.1.50:1234/v1').replace(/\/+$/, '');
+        const url = `${base}/models`;
+        const headers = {};
+        if (this.pluginCfg.enrichApiKey) {
+          headers.Authorization = `Bearer ${this.pluginCfg.enrichApiKey}`;
+        }
+        const r = await fetch(url, { headers, signal: AbortSignal.timeout(3000) });
+        if (r.ok) {
+          const data = await r.json();
+          const models = Array.isArray(data?.data) ? data.data.map(m => m?.id).filter(Boolean) : [];
+          this.pluginCfg.lmStudioModels = models;
+          this.pluginCfg.lmStudioDetected = true;
+          if (models.length && !models.includes(this.pluginCfg.enrichModel)) {
+            this.pluginCfg.enrichModel = models[0];
+          }
+        } else {
+          this.pluginCfg.lmStudioDetected = false;
+          this.pluginCfg.lmStudioModels = [];
+        }
+      } catch {
+        this.pluginCfg.lmStudioDetected = false;
+        this.pluginCfg.lmStudioModels = [];
+      }
+      this.pluginCfg.lmStudioChecking = false;
     },
 
     // ── Explain Score ──────────────────────────────────────────────────────

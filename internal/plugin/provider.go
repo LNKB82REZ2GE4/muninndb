@@ -14,6 +14,7 @@ const (
 	SchemeLocal     ProviderScheme = "local"
 	SchemeOllama    ProviderScheme = "ollama"
 	SchemeOpenAI    ProviderScheme = "openai"
+	SchemeLMStudio  ProviderScheme = "lmstudio"
 	SchemeAnthropic ProviderScheme = "anthropic"
 	SchemeVoyage    ProviderScheme = "voyage"
 	SchemeCohere    ProviderScheme = "cohere"
@@ -69,6 +70,8 @@ func ParseProviderURL(raw string) (*ProviderConfig, error) {
 		return parseOllamaURL(parsed, config)
 	case SchemeOpenAI:
 		return parseOpenAIURL(parsed, config)
+	case SchemeLMStudio:
+		return parseLMStudioURL(parsed, config)
 	case SchemeAnthropic:
 		return parseAnthropicURL(parsed, config)
 	case SchemeVoyage:
@@ -193,6 +196,34 @@ func parseHTTPBaseURL(raw, provider string) (string, string, int, error) {
 		Path:   cleanPath,
 	}
 	return normalized.String(), host, port, nil
+}
+
+func parseLMStudioURL(parsed *url.URL, config *ProviderConfig) (*ProviderConfig, error) {
+	// lmstudio://model?base_url=http://192.168.1.50:1234/v1
+	model := parsed.Hostname()
+	if model == "" {
+		model = strings.TrimPrefix(parsed.Path, "/")
+		if model == "" && parsed.Opaque != "" {
+			model = parsed.Opaque
+		}
+	}
+	if model == "" {
+		return nil, fmt.Errorf("lmstudio URL requires a model (e.g., lmstudio://qwen3-8b?base_url=http://192.168.1.50:1234/v1)")
+	}
+	config.Model = model
+
+	baseURLRaw := strings.TrimSpace(parsed.Query().Get("base_url"))
+	if baseURLRaw == "" {
+		return nil, fmt.Errorf("lmstudio URL requires base_url (e.g., lmstudio://qwen3-8b?base_url=http://192.168.1.50:1234/v1)")
+	}
+	baseURL, host, port, err := parseHTTPBaseURL(baseURLRaw, "lmstudio")
+	if err != nil {
+		return nil, err
+	}
+	config.Host = host
+	config.Port = port
+	config.BaseURL = baseURL
+	return config, nil
 }
 
 func parseAnthropicURL(parsed *url.URL, config *ProviderConfig) (*ProviderConfig, error) {

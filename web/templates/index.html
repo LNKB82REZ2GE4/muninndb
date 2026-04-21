@@ -1797,9 +1797,9 @@
               <div style="margin-bottom:1rem;">
                 <div style="font-size:0.8125rem;font-weight:600;color:var(--text-primary);margin-bottom:0.625rem;">Select provider</div>
                 <div class="tab-bar" style="margin-top:0;margin-bottom:1rem;">
-                  <template x-for="opt in [{val:'none',label:'None'},{val:'ollama',label:'Ollama (local)'},{val:'openai',label:'OpenAI'},{val:'anthropic',label:'Anthropic'},{val:'google',label:'Google'}]" :key="opt.val">
+                  <template x-for="opt in [{val:'none',label:'None'},{val:'ollama',label:'Ollama (local)'},{val:'openai',label:'OpenAI'},{val:'lmstudio',label:'LM Studio'},{val:'anthropic',label:'Anthropic'},{val:'google',label:'Google'}]" :key="opt.val">
                     <button
-                      @click="pluginCfg.enrichProvider=opt.val;pluginCfg.enrichCmd='';if(opt.val==='google')pluginCfg.enrichModel='gemini-1.5-flash';if(opt.val==='anthropic')pluginCfg.enrichModel='claude-haiku-4-5-20251001'"
+                      @click="pluginCfg.enrichProvider=opt.val;pluginCfg.enrichCmd='';if(opt.val==='google')pluginCfg.enrichModel='gemini-1.5-flash';if(opt.val==='anthropic')pluginCfg.enrichModel='claude-haiku-4-5-20251001';if(opt.val==='openai')pluginCfg.enrichModel='gpt-4o-mini';if(opt.val==='lmstudio'){if(!pluginCfg.enrichLMStudioBaseUrl)pluginCfg.enrichLMStudioBaseUrl='http://192.168.1.50:1234/v1';probeLMStudio();}"
                       :class="pluginCfg.enrichProvider===opt.val ? 'tab-btn active' : 'tab-btn'"
                       x-text="opt.label">
                     </button>
@@ -1869,6 +1869,52 @@
                     <option value="gpt-3.5-turbo">gpt-3.5-turbo</option>
                   </select>
                 </div>
+              </div>
+
+              <!-- LM Studio fields -->
+              <div x-show="pluginCfg.enrichProvider==='lmstudio'" style="margin-bottom:1rem;">
+                <div class="form-group" style="margin-bottom:0.75rem;">
+                  <label>LM Studio API Key</label>
+                  <input class="input-field" type="password" x-model="pluginCfg.enrichApiKey" placeholder="sk-lm-..." autocomplete="off" />
+                </div>
+                <div class="form-group" style="margin-bottom:0.75rem;">
+                  <label>LM Studio base URL</label>
+                  <input class="input-field" x-model="pluginCfg.enrichLMStudioBaseUrl" placeholder="http://192.168.1.50:1234/v1" />
+                </div>
+                <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.75rem;">
+                  <template x-if="pluginCfg.lmStudioChecking">
+                    <span style="font-size:0.75rem;color:var(--text-muted);">Detecting LM Studio…</span>
+                  </template>
+                  <template x-if="!pluginCfg.lmStudioChecking && pluginCfg.lmStudioDetected === true">
+                    <span style="display:inline-flex;align-items:center;gap:0.3rem;font-size:0.75rem;font-weight:600;color:var(--success);">
+                      <span style="width:7px;height:7px;border-radius:50%;background:var(--success);flex-shrink:0;"></span>
+                      LM Studio detected — <span x-text="pluginCfg.lmStudioModels.length + ' model' + (pluginCfg.lmStudioModels.length !== 1 ? 's' : '') + ' available'"></span>
+                    </span>
+                  </template>
+                  <template x-if="!pluginCfg.lmStudioChecking && pluginCfg.lmStudioDetected === false">
+                    <span style="display:inline-flex;align-items:center;gap:0.3rem;font-size:0.75rem;font-weight:600;color:var(--warning);">
+                      <span style="width:7px;height:7px;border-radius:50%;background:var(--warning);flex-shrink:0;"></span>
+                      LM Studio not reachable
+                    </span>
+                  </template>
+                  <button class="btn-ghost" style="font-size:0.75rem;padding:0.15rem 0.5rem;margin-left:auto;" @click="probeLMStudio()">Refresh</button>
+                </div>
+                <template x-if="pluginCfg.lmStudioDetected === true && pluginCfg.lmStudioModels.length">
+                  <div class="form-group">
+                    <label>Model</label>
+                    <select class="input-field" x-model="pluginCfg.enrichModel">
+                      <template x-for="m in pluginCfg.lmStudioModels" :key="m">
+                        <option :value="m" x-text="m"></option>
+                      </template>
+                    </select>
+                  </div>
+                </template>
+                <template x-if="pluginCfg.lmStudioDetected !== true || !pluginCfg.lmStudioModels.length">
+                  <div class="form-group">
+                    <label>Model name</label>
+                    <input class="input-field" x-model="pluginCfg.enrichModel" placeholder="qwen3-8b" />
+                  </div>
+                </template>
               </div>
 
               <!-- Anthropic fields -->

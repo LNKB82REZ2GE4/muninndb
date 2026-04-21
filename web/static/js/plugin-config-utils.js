@@ -27,6 +27,7 @@
  *   enrich_url "anthropic://{model}"              → enrichModel
  *   enrich_url "openai://{model}"                 → enrichModel
  *   enrich_url "google://{model}"                 → enrichModel
+ *   enrich_url "lmstudio://{model}?base_url=..."  → enrichModel + enrichBaseUrl
  *
  * @param {object|null} data - raw API response object
  * @returns {object|null} parsed state, or null when data is falsy
@@ -43,6 +44,7 @@ export function parsePluginConfigResponse(data) {
         enrichOllamaModel: null,
         enrichModel:       null,
         enrichApiKey:      data.enrich_api_key  || null,
+        enrichBaseUrl:     null,
     };
 
     // ── Embed URL parsing ─────────────────────────────────────────────────────
@@ -73,6 +75,17 @@ export function parsePluginConfigResponse(data) {
         // "google://gemini-1.5-flash" → "gemini-1.5-flash"
         const model = enrichUrl.replace('google://', '');
         if (model) result.enrichModel = model;
+    } else if (result.enrichProvider === 'lmstudio' && enrichUrl.startsWith('lmstudio://')) {
+        // "lmstudio://qwen3-8b?base_url=http%3A%2F%2F192.168.1.50%3A1234%2Fv1"
+        try {
+            const parsed = new URL(enrichUrl);
+            const model = parsed.hostname || parsed.pathname.replace(/^\//, '');
+            const baseUrl = parsed.searchParams.get('base_url');
+            if (model) result.enrichModel = model;
+            if (baseUrl) result.enrichBaseUrl = baseUrl;
+        } catch (_) {
+            // ignore malformed saved values and keep defaults
+        }
     }
 
     return result;

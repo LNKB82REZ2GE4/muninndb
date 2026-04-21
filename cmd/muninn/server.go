@@ -469,6 +469,7 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 //
 //	ollama://localhost:11434/llama3.2          (local, no key required)
 //	openai://gpt-4o-mini                       (MUNINN_ENRICH_API_KEY required)
+//	lmstudio://qwen3-8b?base_url=http://192.168.1.50:1234/v1  (MUNINN_ENRICH_API_KEY required)
 //	anthropic://claude-haiku-4-5-20251001      (MUNINN_ANTHROPIC_KEY or MUNINN_ENRICH_API_KEY)
 //	google://gemini-1.5-flash                  (MUNINN_GOOGLE_KEY or MUNINN_ENRICH_API_KEY)
 //

@@ -17,7 +17,7 @@ type PluginConfig struct {
 	EmbedAPIKey   string `json:"embed_api_key"`  // API key (openai, voyage)
 
 	// Enrich provider settings
-	EnrichProvider string `json:"enrich_provider"` // "ollama", "openai", "anthropic"
+	EnrichProvider string `json:"enrich_provider"` // "ollama", "openai", "lmstudio", "anthropic", "google"
 	EnrichURL      string `json:"enrich_url"`      // full provider URL
 	EnrichAPIKey   string `json:"enrich_api_key"`  // API key
 
