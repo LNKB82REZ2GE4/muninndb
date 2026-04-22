@@ -32,9 +32,10 @@ type openaiChatRequest struct {
 
 // openaiMessage is a message in the OpenAI chat API.
 type openaiMessage struct {
-	Role      string          `json:"role"`
-	Content   string          `json:"content"`
-	Reasoning json.RawMessage `json:"reasoning,omitempty"`
+	Role             string          `json:"role"`
+	Content          string          `json:"content"`
+	Reasoning        json.RawMessage `json:"reasoning,omitempty"`
+	ReasoningContent string          `json:"reasoning_content,omitempty"` // LM Studio/OpenAI-compatible field
 }
 
 // openaiResponseFormat specifies JSON response format for OpenAI.
@@ -158,6 +159,9 @@ func (p *OpenAILLMProvider) Complete(ctx context.Context, system, user string) (
 		}
 		if reasoning != "" {
 			return reasoning, nil
+		}
+		if rc := strings.TrimSpace(msg.ReasoningContent); rc != "" {
+			return rc, nil
 		}
 
 		return "", fmt.Errorf("openai response has no content or reasoning")

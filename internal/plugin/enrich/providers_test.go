@@ -206,6 +206,33 @@ func TestOpenAIProvider_Complete_UsesReasoningFallback(t *testing.T) {
 	}
 }
 
+func TestOpenAIProvider_Complete_UsesReasoningContentFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resp := openaiChatResponse{
+			Choices: []struct {
+				Message openaiMessage `json:"message"`
+			}{
+				{Message: openaiMessage{Role: "assistant", ReasoningContent: "{\"ok\":true}"}},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	p := NewOpenAILLMProvider()
+	p.baseURL = srv.URL
+	p.model = "gpt-4o-mini"
+	p.apiKey = "test-key"
+
+	got, err := p.Complete(context.Background(), "system", "user")
+	if err != nil {
+		t.Fatalf("Complete failed: %v", err)
+	}
+	if got != `{"ok":true}` {
+		t.Fatalf("expected reasoning_content fallback payload, got %q", got)
+	}
+}
+
 func TestOpenAIProvider_Complete_UsesStructuredReasoningFallback(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		resp := openaiChatResponse{
