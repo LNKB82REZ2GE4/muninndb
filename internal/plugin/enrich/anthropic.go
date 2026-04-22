@@ -14,18 +14,19 @@ import (
 
 // AnthropicLLMProvider is an HTTP client for Anthropic's /v1/messages endpoint.
 type AnthropicLLMProvider struct {
-	client  *http.Client
-	baseURL string
-	model   string
-	apiKey  string
+	client    *http.Client
+	baseURL   string
+	model     string
+	apiKey    string
+	maxTokens int
 }
 
 // anthropicMessagesRequest is the request structure for Anthropic messages API.
 type anthropicMessagesRequest struct {
-	Model       string               `json:"model"`
-	MaxTokens   int                  `json:"max_tokens"`
-	System      string               `json:"system"`
-	Messages    []anthropicMessage   `json:"messages"`
+	Model     string             `json:"model"`
+	MaxTokens int                `json:"max_tokens"`
+	System    string             `json:"system"`
+	Messages  []anthropicMessage `json:"messages"`
 }
 
 // anthropicMessage is a message in the Anthropic messages API.
@@ -62,6 +63,10 @@ func (p *AnthropicLLMProvider) Init(ctx context.Context, cfg LLMProviderConfig) 
 	p.baseURL = cfg.BaseURL
 	p.model = cfg.Model
 	p.apiKey = cfg.APIKey
+	p.maxTokens = cfg.MaxTokens
+	if p.maxTokens <= 0 {
+		p.maxTokens = 16384
+	}
 
 	if p.apiKey == "" {
 		return fmt.Errorf("anthropic provider requires API key")
@@ -78,9 +83,14 @@ func (p *AnthropicLLMProvider) Init(ctx context.Context, cfg LLMProviderConfig) 
 
 // Complete sends a messages request to Anthropic.
 func (p *AnthropicLLMProvider) Complete(ctx context.Context, system, user string) (string, error) {
+	maxTokens := p.maxTokens
+	if maxTokens <= 0 {
+		maxTokens = 16384
+	}
+
 	req := anthropicMessagesRequest{
 		Model:     p.model,
-		MaxTokens: 1024,
+		MaxTokens: maxTokens,
 		System:    system,
 		Messages: []anthropicMessage{
 			{Role: "user", Content: user},

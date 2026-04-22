@@ -14,16 +14,17 @@ import (
 
 // GoogleLLMProvider is an HTTP client for Google's Gemini generateContent endpoint.
 type GoogleLLMProvider struct {
-	client  *http.Client
-	baseURL string
-	model   string
-	apiKey  string
+	client    *http.Client
+	baseURL   string
+	model     string
+	apiKey    string
+	maxTokens int
 }
 
 // googleGenerateRequest is the request structure for Gemini generateContent.
 type googleGenerateRequest struct {
-	Contents          []googleContent       `json:"contents"`
-	SystemInstruction *googleSystemContent  `json:"systemInstruction,omitempty"`
+	Contents          []googleContent        `json:"contents"`
+	SystemInstruction *googleSystemContent   `json:"systemInstruction,omitempty"`
 	GenerationConfig  googleGenerationConfig `json:"generationConfig"`
 }
 
@@ -75,6 +76,10 @@ func (p *GoogleLLMProvider) Init(ctx context.Context, cfg LLMProviderConfig) err
 	p.baseURL = cfg.BaseURL
 	p.model = cfg.Model
 	p.apiKey = cfg.APIKey
+	p.maxTokens = cfg.MaxTokens
+	if p.maxTokens <= 0 {
+		p.maxTokens = 16384
+	}
 
 	if p.apiKey == "" {
 		return fmt.Errorf("google provider requires API key")
@@ -94,6 +99,11 @@ func (p *GoogleLLMProvider) Init(ctx context.Context, cfg LLMProviderConfig) err
 
 // Complete sends a generateContent request to the Gemini API.
 func (p *GoogleLLMProvider) Complete(ctx context.Context, system, user string) (string, error) {
+	maxTokens := p.maxTokens
+	if maxTokens <= 0 {
+		maxTokens = 16384
+	}
+
 	req := googleGenerateRequest{
 		Contents: []googleContent{
 			{Role: "user", Parts: []googlePart{{Text: user}}},
@@ -103,7 +113,7 @@ func (p *GoogleLLMProvider) Complete(ctx context.Context, system, user string) (
 		},
 		GenerationConfig: googleGenerationConfig{
 			Temperature:      0.0,
-			MaxOutputTokens:  1024,
+			MaxOutputTokens:  maxTokens,
 			ResponseMimeType: "application/json",
 		},
 	}

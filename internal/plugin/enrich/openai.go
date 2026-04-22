@@ -15,10 +15,11 @@ import (
 
 // OpenAILLMProvider is an HTTP client for OpenAI's /v1/chat/completions endpoint.
 type OpenAILLMProvider struct {
-	client  *http.Client
-	baseURL string
-	model   string
-	apiKey  string
+	client    *http.Client
+	baseURL   string
+	model     string
+	apiKey    string
+	maxTokens int
 }
 
 // openaiChatRequest is the request structure for OpenAI chat API.
@@ -70,6 +71,10 @@ func (p *OpenAILLMProvider) Init(ctx context.Context, cfg LLMProviderConfig) err
 	p.baseURL = cfg.BaseURL
 	p.model = cfg.Model
 	p.apiKey = cfg.APIKey
+	p.maxTokens = cfg.MaxTokens
+	if p.maxTokens <= 0 {
+		p.maxTokens = 16384
+	}
 
 	if p.apiKey == "" {
 		return fmt.Errorf("openai provider requires API key")
@@ -91,12 +96,16 @@ func (p *OpenAILLMProvider) Init(ctx context.Context, cfg LLMProviderConfig) err
 func (p *OpenAILLMProvider) Complete(ctx context.Context, system, user string) (string, error) {
 	formats := []*openaiResponseFormat{{Type: "json_object"}, nil}
 	var lastErr error
+	maxTokens := p.maxTokens
+	if maxTokens <= 0 {
+		maxTokens = 16384
+	}
 
 	for i, format := range formats {
 		req := openaiChatRequest{
 			Model:       p.model,
 			Temperature: 0.0,
-			MaxTokens:   1024,
+			MaxTokens:   maxTokens,
 			Messages: []openaiMessage{
 				{Role: "system", Content: system},
 				{Role: "user", Content: user},

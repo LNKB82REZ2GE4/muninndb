@@ -27,7 +27,7 @@ type LLMProviderConfig struct {
 	BaseURL     string  // "http://localhost:11434" or "https://api.openai.com"
 	Model       string  // "llama3.2" or "gpt-4o-mini" or "claude-haiku"
 	APIKey      string  // empty for Ollama, required for cloud providers
-	MaxTokens   int     // max response tokens (default: 1024)
+	MaxTokens   int     // max response tokens (default: 16384)
 	Temperature float32 // 0.0 for deterministic extraction (default: 0.0)
 }
 
@@ -112,7 +112,7 @@ func (s *EnrichService) Init(ctx context.Context, cfg plugin.PluginConfig) error
 		BaseURL:     s.provCfg.BaseURL,
 		Model:       s.provCfg.Model,
 		APIKey:      cfg.APIKey,
-		MaxTokens:   1024,
+		MaxTokens:   16384,
 		Temperature: 0.0,
 	}
 
