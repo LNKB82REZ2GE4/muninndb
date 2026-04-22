@@ -627,6 +627,73 @@ func (s *Server) handlePutPluginConfig(w http.ResponseWriter, r *http.Request) {
 	s.sendJSON(w, http.StatusOK, cfg)
 }
 
+// handleProviderModels probes a provider's model list server-side to avoid browser CORS issues.
+// Currently supports provider="lmstudio" with an OpenAI-compatible /models endpoint.
+func (s *Server) handleProviderModels(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Provider string `json:"provider"`
+		BaseURL  string `json:"base_url"`
+		APIKey   string `json:"api_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid request body: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Provider) != "lmstudio" {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "unsupported provider")
+		return
+	}
+	base := strings.TrimRight(strings.TrimSpace(req.BaseURL), "/")
+	if base == "" {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "base_url is required")
+		return
+	}
+	if _, err := url.ParseRequestURI(base); err != nil {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid base_url")
+		return
+	}
+
+	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, base+"/models", nil)
+	if err != nil {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "failed to build provider request")
+		return
+	}
+	if strings.TrimSpace(req.APIKey) != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+strings.TrimSpace(req.APIKey))
+	}
+
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		s.sendError(r, w, http.StatusBadGateway, ErrStorageError, "provider unreachable: "+err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		s.sendError(r, w, http.StatusBadGateway, ErrStorageError, fmt.Sprintf("provider error %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
+		return
+	}
+
+	var modelsResp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&modelsResp); err != nil {
+		s.sendError(r, w, http.StatusBadGateway, ErrStorageError, "failed to parse provider response")
+		return
+	}
+
+	models := make([]string, 0, len(modelsResp.Data))
+	for _, m := range modelsResp.Data {
+		if id := strings.TrimSpace(m.ID); id != "" {
+			models = append(models, id)
+		}
+	}
+	s.sendJSON(w, http.StatusOK, map[string]any{"models": models})
+}
+
 // handleRenameVault renames a vault (metadata-only, no engram data changes).
 // POST /api/admin/vaults/{name}/rename
 // Body: {"new_name": "new-vault-name"}

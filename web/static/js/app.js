@@ -2979,23 +2979,19 @@ document.addEventListener('alpine:init', () => {
       this.pluginCfg.lmStudioChecking = true;
       try {
         const base = (this.pluginCfg.enrichLMStudioBaseUrl || 'http://192.168.1.50:1234/v1').replace(/\/+$/, '');
-        const url = `${base}/models`;
-        const headers = {};
-        if (this.pluginCfg.enrichApiKey) {
-          headers.Authorization = `Bearer ${this.pluginCfg.enrichApiKey}`;
-        }
-        const r = await fetch(url, { headers, signal: AbortSignal.timeout(3000) });
-        if (r.ok) {
-          const data = await r.json();
-          const models = Array.isArray(data?.data) ? data.data.map(m => m?.id).filter(Boolean) : [];
-          this.pluginCfg.lmStudioModels = models;
-          this.pluginCfg.lmStudioDetected = true;
-          if (models.length && !models.includes(this.pluginCfg.enrichModel)) {
-            this.pluginCfg.enrichModel = models[0];
-          }
-        } else {
-          this.pluginCfg.lmStudioDetected = false;
-          this.pluginCfg.lmStudioModels = [];
+        const data = await this.apiCall('/api/admin/provider-models', {
+          method: 'POST',
+          body: JSON.stringify({
+            provider: 'lmstudio',
+            base_url: base,
+            api_key: this.pluginCfg.enrichApiKey || '',
+          }),
+        });
+        const models = Array.isArray(data?.models) ? data.models.filter(Boolean) : [];
+        this.pluginCfg.lmStudioModels = models;
+        this.pluginCfg.lmStudioDetected = true;
+        if (models.length && !models.includes(this.pluginCfg.enrichModel)) {
+          this.pluginCfg.enrichModel = models[0];
         }
       } catch {
         this.pluginCfg.lmStudioDetected = false;

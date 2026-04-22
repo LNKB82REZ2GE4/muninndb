@@ -238,6 +238,7 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 	mux.HandleFunc("PUT /api/admin/vault/{name}/plasticity", s.withAdminMiddleware(s.handlePutVaultPlasticity(authStore)))
 	mux.HandleFunc("GET /api/admin/plugin-config", s.withAdminMiddleware(s.handleGetPluginConfig))
 	mux.HandleFunc("PUT /api/admin/plugin-config", s.withAdminMiddleware(s.handlePutPluginConfig))
+	mux.HandleFunc("POST /api/admin/provider-models", s.withAdminMiddleware(s.handleProviderModels))
 	mux.HandleFunc("DELETE /api/admin/vaults/{name}", s.withAdminMiddleware(s.handleDeleteVault))
 	mux.HandleFunc("POST /api/admin/vaults/{name}/clear", s.withAdminMiddleware(s.handleClearVault))
 	mux.HandleFunc("POST /api/admin/vaults/{name}/clone", s.withAdminMiddleware(s.handleCloneVault))
