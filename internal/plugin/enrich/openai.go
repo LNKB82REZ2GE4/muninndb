@@ -88,70 +88,85 @@ func (p *OpenAILLMProvider) Init(ctx context.Context, cfg LLMProviderConfig) err
 
 // Complete sends a chat completion request to OpenAI.
 func (p *OpenAILLMProvider) Complete(ctx context.Context, system, user string) (string, error) {
-	req := openaiChatRequest{
-		Model:       p.model,
-		Temperature: 0.0,
-		MaxTokens:   1024,
-		Messages: []openaiMessage{
-			{Role: "system", Content: system},
-			{Role: "user", Content: user},
-		},
-		ResponseFormat: &openaiResponseFormat{
-			Type: "json_object",
-		},
+	formats := []*openaiResponseFormat{{Type: "json_object"}, nil}
+	var lastErr error
+
+	for i, format := range formats {
+		req := openaiChatRequest{
+			Model:       p.model,
+			Temperature: 0.0,
+			MaxTokens:   1024,
+			Messages: []openaiMessage{
+				{Role: "system", Content: system},
+				{Role: "user", Content: user},
+			},
+			ResponseFormat: format,
+		}
+
+		body, err := json.Marshal(req)
+		if err != nil {
+			return "", fmt.Errorf("failed to marshal request: %w", err)
+		}
+
+		httpReq, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodPost,
+			p.baseURL+"/v1/chat/completions",
+			bytes.NewReader(body),
+		)
+		if err != nil {
+			return "", fmt.Errorf("failed to create request: %w", err)
+		}
+
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+
+		resp, err := p.client.Do(httpReq)
+		if err != nil {
+			return "", fmt.Errorf("request failed: %w", err)
+		}
+
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("openai returned status %d: %s", resp.StatusCode, string(respBody))
+			// Some OpenAI-compatible backends (e.g. LM Studio) reject json_object.
+			// Retry once without response_format for compatibility.
+			if i == 0 && resp.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(string(respBody)), "response_format") {
+				continue
+			}
+			return "", lastErr
+		}
+
+		var chatResp openaiChatResponse
+		if err := json.Unmarshal(respBody, &chatResp); err != nil {
+			return "", fmt.Errorf("failed to parse response: %w", err)
+		}
+
+		if len(chatResp.Choices) == 0 {
+			return "", fmt.Errorf("openai response has no choices")
+		}
+
+		msg := chatResp.Choices[0].Message
+		if content := strings.TrimSpace(msg.Content); content != "" {
+			return content, nil
+		}
+		reasoning, err := reasoningPayload(msg.Reasoning)
+		if err != nil {
+			return "", fmt.Errorf("failed to parse openai reasoning payload: %w", err)
+		}
+		if reasoning != "" {
+			return reasoning, nil
+		}
+
+		return "", fmt.Errorf("openai response has no content or reasoning")
 	}
 
-	body, err := json.Marshal(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
+	if lastErr != nil {
+		return "", lastErr
 	}
-
-	httpReq, err := http.NewRequestWithContext(
-		ctx,
-		"POST",
-		p.baseURL+"/v1/chat/completions",
-		bytes.NewReader(body),
-	)
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
-
-	resp, err := p.client.Do(httpReq)
-	if err != nil {
-		return "", fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("openai returned status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	var chatResp openaiChatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&chatResp); err != nil {
-		return "", fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	if len(chatResp.Choices) == 0 {
-		return "", fmt.Errorf("openai response has no choices")
-	}
-
-	msg := chatResp.Choices[0].Message
-	if content := strings.TrimSpace(msg.Content); content != "" {
-		return content, nil
-	}
-	reasoning, err := reasoningPayload(msg.Reasoning)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse openai reasoning payload: %w", err)
-	}
-	if reasoning != "" {
-		return reasoning, nil
-	}
-
-	return "", fmt.Errorf("openai response has no content or reasoning")
+	return "", fmt.Errorf("openai completion failed")
 }
 
 func reasoningPayload(raw json.RawMessage) (string, error) {

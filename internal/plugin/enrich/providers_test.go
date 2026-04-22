@@ -233,6 +233,49 @@ func TestOpenAIProvider_Complete_UsesStructuredReasoningFallback(t *testing.T) {
 	}
 }
 
+func TestOpenAIProvider_Complete_RetriesWithoutResponseFormat(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var req openaiChatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if calls == 1 {
+			if req.ResponseFormat == nil {
+				t.Fatalf("expected first call to include response_format")
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"error":"'response_format.type' must be 'json_schema' or 'text'"}`))
+			return
+		}
+		if req.ResponseFormat != nil {
+			t.Fatalf("expected retry call without response_format")
+		}
+		resp := openaiChatResponse{Choices: []struct {
+			Message openaiMessage `json:"message"`
+		}{{Message: openaiMessage{Role: "assistant", Content: "ok"}}}}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	p := NewOpenAILLMProvider()
+	p.baseURL = srv.URL
+	p.model = "test-model"
+	p.apiKey = "test-key"
+
+	got, err := p.Complete(context.Background(), "system", "user")
+	if err != nil {
+		t.Fatalf("Complete failed: %v", err)
+	}
+	if got != "ok" {
+		t.Fatalf("expected 'ok', got %q", got)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", calls)
+	}
+}
+
 func TestOpenAIProvider_Complete_ErrorStatus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusTooManyRequests)
