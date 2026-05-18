@@ -218,6 +218,9 @@ func (w *TriggerWorker) handleCognitive(ctx context.Context, event CognitiveEven
 		return
 	}
 	meta := metas[0]
+	if meta == nil {
+		return
+	}
 
 	for _, sub := range subs {
 		sub.mu.Lock()

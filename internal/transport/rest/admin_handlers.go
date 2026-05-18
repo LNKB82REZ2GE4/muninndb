@@ -130,6 +130,10 @@ func (s *Server) handleCreateAPIKey(authStore *auth.Store) http.HandlerFunc {
 			"token": token, // shown once
 			"key":   key,
 		})
+		s.EmitAudit(r, "api_key.create", "api_key", key.ID, "ok", map[string]string{
+			"label": req.Label,
+			"vault": req.Vault,
+		})
 	}
 }
 
@@ -219,6 +223,7 @@ func (s *Server) handleRevokeAPIKey(authStore *auth.Store) http.HandlerFunc {
 			return
 		}
 		s.sendJSON(w, http.StatusOK, map[string]interface{}{"revoked": id})
+		s.EmitAudit(r, "api_key.revoke", "api_key", id, "ok", nil)
 	}
 }
 
@@ -245,6 +250,7 @@ func (s *Server) handleChangeAdminPassword(authStore *auth.Store) http.HandlerFu
 			return
 		}
 		s.sendJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		s.EmitAudit(r, "admin.password_change", "admin", req.Username, "ok", nil)
 	}
 }
 
@@ -284,6 +290,7 @@ func (s *Server) handleSetVaultConfig(authStore *auth.Store) http.HandlerFunc {
 			return
 		}
 		s.sendJSON(w, http.StatusOK, cfg)
+		s.EmitAudit(r, "vault.config_update", "vault", cfg.Name, "ok", nil)
 	}
 }
 
@@ -418,6 +425,7 @@ func (s *Server) handlePutVaultPlasticity(as *auth.Store) http.HandlerFunc {
 			"config":   &cfg,
 			"resolved": resolved,
 		})
+		s.EmitAudit(r, "vault.plasticity_update", "vault", name, "ok", nil)
 	}
 }
 
@@ -625,6 +633,7 @@ func (s *Server) handlePutPluginConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.sendJSON(w, http.StatusOK, cfg)
+	s.EmitAudit(r, "plugin.config_update", "plugin", "config", "ok", nil)
 }
 
 // handleProviderModels probes a provider's model list server-side to avoid browser CORS issues.
@@ -768,6 +777,7 @@ func (s *Server) handleRenameVault(w http.ResponseWriter, r *http.Request) {
 		"old_name": name,
 		"new_name": req.NewName,
 	})
+	s.EmitAudit(r, "vault.rename", "vault", name, "ok", map[string]string{"new_name": req.NewName})
 }
 
 // handleDeleteVault deletes a vault and all its data.
@@ -790,16 +800,38 @@ func (s *Server) handleDeleteVault(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.engine.DeleteVault(r.Context(), name); err != nil {
 		if errors.Is(err, engine.ErrVaultNotFound) {
+			// Vault may exist only in auth config (created via UI but no engrams written yet).
+			// Clean up the phantom vault so the UI can remove it cleanly.
+			if s.authStore != nil {
+				if cfgs, cfgErr := s.authStore.ListVaultConfigs(); cfgErr == nil {
+					for _, cfg := range cfgs {
+						if cfg.Name == name {
+							if delErr := s.authStore.DeleteVaultConfig(name); delErr != nil {
+								s.emitAuditErr(r, "vault.delete", "vault", name, delErr, nil)
+								s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, delErr.Error())
+								return
+							}
+							s.EmitAudit(r, "vault.delete", "vault", name, "ok", nil)
+							w.WriteHeader(http.StatusNoContent)
+							return
+						}
+					}
+				}
+			}
+			s.emitAuditErr(r, "vault.delete", "vault", name, err, nil)
 			s.sendError(r, w, http.StatusNotFound, ErrVaultNotFound, err.Error())
 			return
 		}
 		if errors.Is(err, engine.ErrVaultJobActive) {
+			s.emitAuditErr(r, "vault.delete", "vault", name, err, nil)
 			s.sendError(r, w, http.StatusConflict, ErrVaultForbidden, err.Error())
 			return
 		}
+		s.emitAuditErr(r, "vault.delete", "vault", name, err, nil)
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+	s.EmitAudit(r, "vault.delete", "vault", name, "ok", nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -829,6 +861,7 @@ func (s *Server) handleClearVault(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+	s.EmitAudit(r, "vault.clear", "vault", name, "ok", nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -870,6 +903,7 @@ func (s *Server) handleCloneVault(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+	s.EmitAudit(r, "vault.clone", "vault", name, "ok", map[string]string{"new_name": req.NewName})
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"job_id": job.ID})
@@ -910,6 +944,7 @@ func (s *Server) handleMergeVault(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+	s.EmitAudit(r, "vault.merge", "vault", source, "ok", map[string]string{"target": req.Target})
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"job_id": job.ID})
@@ -960,6 +995,7 @@ func (s *Server) handleExportVault(w http.ResponseWriter, r *http.Request) {
 		slog.Error("rest: export vault failed mid-stream; aborting connection", "vault", name, "err", err, "bytes_written", cw.n)
 		panic(http.ErrAbortHandler)
 	}
+	s.EmitAudit(r, "vault.export", "vault", name, "ok", nil)
 }
 
 // handleImportVault imports a .muninn archive into a new vault.
@@ -998,6 +1034,8 @@ func (s *Server) handleImportVault(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.EmitAudit(r, "vault.import", "vault", vaultName, "ok", nil)
+
 	// Stream body into the pipe. The import goroutine reads from pr concurrently.
 	// This keeps r.Body alive for the duration of the upload.
 	if _, copyErr := io.Copy(pw, r.Body); copyErr != nil {
@@ -1034,6 +1072,7 @@ func (s *Server) handleReindexFTSVault(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+	s.EmitAudit(r, "vault.reindex", "vault", name, "ok", nil)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]any{
@@ -1078,6 +1117,7 @@ func (s *Server) handleReembedVault(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 		return
 	}
+	s.EmitAudit(r, "vault.reembed", "vault", name, "ok", map[string]string{"model": model})
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]string{"job_id": job.ID})

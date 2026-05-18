@@ -290,6 +290,7 @@ func (ps *PebbleStore) UpdateMetadata(ctx context.Context, wsPrefix [8]byte, id 
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
+	ps.replicateBatch(batch)
 
 	// Update LastAccess index (best effort — index inconsistency is non-fatal).
 	if !meta.LastAccess.IsZero() {
@@ -363,6 +364,7 @@ func (ps *PebbleStore) UpdateRelevance(ctx context.Context, wsPrefix [8]byte, id
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
+	ps.replicateBatch(batch)
 
 	// Append provenance entry via persistent worker (best effort — drops if full).
 	ps.provWork.Submit(wsPrefix, id, provenance.ProvenanceEntry{
@@ -371,6 +373,49 @@ func (ps *PebbleStore) UpdateRelevance(ctx context.Context, wsPrefix [8]byte, id
 		AgentID:   "system:relevance-update",
 		Operation: "update-relevance",
 		Note:      "",
+	})
+
+	return nil
+}
+
+// UpdateTrust updates the trust label of an engram in-place using PatchTrust.
+// Invalidates the L1 and metadata caches. Appends a provenance entry.
+func (ps *PebbleStore) UpdateTrust(ctx context.Context, wsPrefix [8]byte, id ULID, trust TrustLevel) error {
+	engramKey := keys.EngramKey(wsPrefix, [16]byte(id))
+	rawBytes, err := Get(ps.db, engramKey)
+	if err != nil {
+		return fmt.Errorf("get engram raw: %w", err)
+	}
+	if rawBytes == nil {
+		return fmt.Errorf("engram not found")
+	}
+
+	if err := erf.PatchTrust(rawBytes, uint8(trust)); err != nil {
+		return fmt.Errorf("patch trust: %w", err)
+	}
+
+	batch := ps.db.NewBatch()
+	defer batch.Close()
+
+	batch.Set(engramKey, rawBytes, nil)
+	metaKey := keys.MetaKey(wsPrefix, [16]byte(id))
+	batch.Set(metaKey, erf.MetaKeySlice(rawBytes), nil)
+
+	// Invalidate L1 and metadata caches before commit — cached structs are stale.
+	ps.cache.Delete(wsPrefix, id)
+	ps.metaCache.Remove([16]byte(id))
+
+	if err := batch.Commit(pebble.NoSync); err != nil {
+		return fmt.Errorf("commit batch: %w", err)
+	}
+	ps.replicateBatch(batch)
+
+	ps.provWork.Submit(wsPrefix, id, provenance.ProvenanceEntry{
+		Timestamp: time.Now(),
+		Source:    provenance.SourceHuman,
+		AgentID:   "system:set-trust",
+		Operation: "update-trust",
+		Note:      trust.String(),
 	})
 
 	return nil
@@ -388,7 +433,11 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 		batch.Delete(keys.EngramKey(wsPrefix, [16]byte(id)), nil)
 		batch.Delete(keys.MetaKey(wsPrefix, [16]byte(id)), nil)
 		ps.cache.Delete(wsPrefix, id)
-		return batch.Commit(pebble.NoSync)
+		if err := batch.Commit(pebble.NoSync); err != nil {
+			return err
+		}
+		ps.replicateBatch(batch)
+		return nil
 	}
 
 	batch := ps.db.NewBatch()
@@ -514,6 +563,7 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("delete engram: %w", err)
 	}
+	ps.replicateBatch(batch)
 
 	ps.cache.Delete(wsPrefix, id)
 
@@ -610,6 +660,7 @@ func (ps *PebbleStore) SoftDelete(ctx context.Context, wsPrefix [8]byte, id ULID
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
+	ps.replicateBatch(batch)
 
 	// Update cache (vault-scoped) and invalidate the metadata-only cache
 	// so subsequent GetMetadata calls see the updated StateSoftDeleted state.
@@ -666,6 +717,7 @@ func (ps *PebbleStore) UpdateTags(ctx context.Context, wsPrefix [8]byte, id ULID
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
+	ps.replicateBatch(batch)
 
 	return nil
 }
@@ -745,6 +797,7 @@ func (ps *PebbleStore) UpdateConfidence(ctx context.Context, wsPrefix [8]byte, i
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
+	ps.replicateBatch(batch)
 
 	// Update cache (vault-scoped).
 	ps.cache.Set(wsPrefix, id, eng)
@@ -790,6 +843,7 @@ func toERFEngram(eng *Engram) *erf.Engram {
 		MemoryType:     uint8(eng.MemoryType),
 		TypeLabel:      eng.TypeLabel,
 		Classification: eng.Classification,
+		Trust:          uint8(eng.Trust),
 	}
 }
 
@@ -829,6 +883,7 @@ func fromERFEngram(e *erf.Engram) *Engram {
 		MemoryType:     MemoryType(e.MemoryType),
 		TypeLabel:      e.TypeLabel,
 		Classification: e.Classification,
+		Trust:          TrustLevel(e.Trust),
 	}
 }
 

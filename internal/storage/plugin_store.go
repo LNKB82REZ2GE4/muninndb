@@ -37,6 +37,17 @@ func (ps *PebbleStore) CountWithoutFlag(ctx context.Context, flag, skipFlags uin
 		var id [16]byte
 		copy(id[:], k[9:25])
 
+		// Skip soft-deleted and archived engrams — mirrors ScanWithoutFlag so
+		// CountWithoutFlag and the scan agree on what is actually pending.
+		val := make([]byte, len(iter.Value()))
+		copy(val, iter.Value())
+		if erfEng, decErr := erf.Decode(val); decErr == nil {
+			eng := fromERFEngram(erfEng)
+			if eng.State == StateSoftDeleted || eng.State == StateArchived {
+				continue
+			}
+		}
+
 		raw, err := ps.getDigestFlagsRaw(id)
 		if (err != nil || raw&flag == 0) && (skipFlags == 0 || raw&skipFlags == 0) {
 			count++
@@ -184,6 +195,7 @@ func (ps *PebbleStore) UpdateEmbedding(ctx context.Context, wsPrefix [8]byte, id
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return fmt.Errorf("update embedding: commit: %w", err)
 	}
+	ps.replicateBatch(batch)
 	return nil
 }
 

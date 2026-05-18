@@ -28,6 +28,17 @@ var ErrEngramArchived = errors.New("engram is archived")
 // that already exists. Use errors.Is to check for this error in callers.
 var ErrVaultNameCollision = errors.New("vault name already exists")
 
+// ErrInvalidID is returned when a caller passes an ID that cannot be parsed as
+// a valid ULID. Use errors.Is to check for this error in callers; REST handlers
+// map it to HTTP 400 Bad Request.
+var ErrInvalidID = errors.New("invalid engram id")
+
+// ErrInvalidRequest is returned when a caller passes a field value that is
+// syntactically valid but semantically out of range (e.g. a CreatedAt timestamp
+// that is before the project epoch or too far in the future). REST handlers map
+// it to HTTP 422 Unprocessable Entity.
+var ErrInvalidRequest = errors.New("invalid request")
+
 // ClearVault removes all memories from a vault. The vault name remains registered.
 // It evicts all in-memory state (HNSW, FTS IDF cache, novelty fingerprints, coherence
 // counters, activity tracking) and adjusts the global engramCount.

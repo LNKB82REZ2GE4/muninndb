@@ -81,7 +81,7 @@ func (f *fakeEngine) ListDeleted(ctx context.Context, vault string, limit int) (
 func (f *fakeEngine) RetryEnrich(ctx context.Context, vault string, id string) (*RetryEnrichResult, error) {
 	return &RetryEnrichResult{EngramID: id, PluginsQueued: []string{}, AlreadyComplete: []string{}}, nil
 }
-func (f *fakeEngine) GetEnrichmentCandidates(_ context.Context, _ string, stages []string, _ int) (*EnrichmentCandidatesResult, error) {
+func (f *fakeEngine) GetEnrichmentCandidates(_ context.Context, _ string, stages []string, _ string, _ int) (*EnrichmentCandidatesResult, error) {
 	if len(stages) == 0 {
 		stages = []string{"entities", "relationships", "classification", "summary"}
 	}
@@ -179,6 +179,11 @@ func (f *fakeEngine) ListEntities(_ context.Context, _ string, _ int, _ string) 
 }
 func (f *fakeEngine) GetVaultEmbedDim(_ context.Context, _ string) int {
 	return 0
+}
+func (f *fakeEngine) SetTrust(_ context.Context, _, _, _ string) error { return nil }
+
+func (f *fakeEngine) GetAnnotations(_ context.Context, _, _ string) (*engine.AnnotationData, error) {
+	return nil, nil
 }
 
 func newTestServer() *MCPServer {
@@ -278,8 +283,8 @@ func TestListTools(t *testing.T) {
 	var result map[string]any
 	json.NewDecoder(w.Body).Decode(&result)
 	tools, _ := result["tools"].([]any)
-	if len(tools) != 38 {
-		t.Errorf("expected 38 tools, got %d", len(tools))
+	if len(tools) != 39 {
+		t.Errorf("expected 39 tools, got %d", len(tools))
 	}
 }
 
