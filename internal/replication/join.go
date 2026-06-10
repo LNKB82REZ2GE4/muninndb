@@ -18,12 +18,12 @@ import (
 // JoinHandler handles incoming JoinRequests on the Cortex side.
 // It is safe for concurrent access.
 type JoinHandler struct {
-	localNodeID  string
+	localNodeID   string
 	clusterSecret string
-	epochStore   *EpochStore
-	repLog       *ReplicationLog
-	db           *pebble.DB // non-nil when snapshot streaming is supported
-	mgr          *ConnManager
+	epochStore    *EpochStore
+	repLog        *ReplicationLog
+	db            *pebble.DB // non-nil when snapshot streaming is supported
+	mgr           *ConnManager
 
 	members map[string]NodeInfo
 	mu      sync.RWMutex
@@ -55,7 +55,12 @@ func NewJoinHandlerWithDB(localNodeID, clusterSecret string, epochStore *EpochSt
 }
 
 // HandleJoinRequest processes a JoinRequest from a connecting Lobe.
-// On success: registers the Lobe in mgr, adds to members map, calls OnLobeJoined.
+// On success it adds the Lobe to the members map and returns an accepted
+// JoinResponse. It deliberately does NOT register the conn in mgr (the
+// coordinator already did so via RegisterConn before calling this) and does
+// NOT fire OnLobeJoined. The caller must invoke FireOnLobeJoined(req.NodeID)
+// only after the JoinResponse — and any post-join snapshot — has been written
+// to the wire. See FireOnLobeJoined for the handshake race this split avoids.
 //
 // Epoch validation: we reject a JoinRequest only when epoch == 0, meaning the
 // cluster has not yet elected a Cortex and cannot safely accept new members.
@@ -91,7 +96,7 @@ func (h *JoinHandler) HandleJoinRequest(req mbp.JoinRequest, conn *PeerConn) mbp
 	// Protocol version check
 	if req.ProtocolVersion > mbp.CurrentProtocolVersion {
 		return mbp.JoinResponse{
-			Accepted:    false,
+			Accepted: false,
 			RejectReason: fmt.Sprintf(
 				"protocol version %d is not supported by this Cortex (max supported: %d). "+
 					"This Lobe binary is newer than the Cortex — upgrade the Cortex first.",
@@ -103,7 +108,7 @@ func (h *JoinHandler) HandleJoinRequest(req mbp.JoinRequest, conn *PeerConn) mbp
 	}
 	if req.ProtocolVersion < mbp.MinSupportedProtocolVersion {
 		return mbp.JoinResponse{
-			Accepted:    false,
+			Accepted: false,
 			RejectReason: fmt.Sprintf(
 				"protocol version %d is no longer supported (minimum: %d, current: %d). "+
 					"Upgrade this Lobe to a binary that speaks protocol version >= %d.",
@@ -147,7 +152,6 @@ func (h *JoinHandler) HandleJoinRequest(req mbp.JoinRequest, conn *PeerConn) mbp
 
 	h.mu.Lock()
 	h.members[req.NodeID] = info
-	cb := h.OnLobeJoined
 	h.mu.Unlock()
 
 	// NOTE: do NOT call h.mgr.AddPeer here. The coordinator already called
@@ -156,10 +160,14 @@ func (h *JoinHandler) HandleJoinRequest(req mbp.JoinRequest, conn *PeerConn) mbp
 	// connection and replace it with a disconnected PeerConn{conn: nil},
 	// causing the immediately-following peer.Send(JoinResponse) to return
 	// ErrNotConnected.
-
-	if cb != nil {
-		cb(info)
-	}
+	//
+	// NOTE: OnLobeJoined is NOT fired here. Firing it inline would spawn the
+	// NetworkStreamer goroutine before the caller has sent the JoinResponse
+	// frame on the shared PeerConn — racing the streamer's first ReplEntry
+	// frame against the JoinResponse frame and corrupting the lobe-side
+	// handshake parser (issue: cortex join-race / #409 follow-up). The caller
+	// must invoke FireOnLobeJoined(nodeID) after JoinResponse (+ Snapshot)
+	// have been fully written to the wire.
 
 	resp := mbp.JoinResponse{
 		Accepted: true,
@@ -176,6 +184,32 @@ func (h *JoinHandler) HandleJoinRequest(req mbp.JoinRequest, conn *PeerConn) mbp
 	}
 
 	return resp
+}
+
+// FireOnLobeJoined invokes the OnLobeJoined callback for a previously-registered
+// lobe. Callers must invoke this only AFTER the JoinResponse (and, when
+// applicable, the post-join snapshot stream) has been fully written to the
+// shared PeerConn — otherwise the streamer's first ReplEntry frame can race
+// the JoinResponse frame and break the lobe-side handshake parser.
+func (h *JoinHandler) FireOnLobeJoined(nodeID string) {
+	h.mu.RLock()
+	info, ok := h.members[nodeID]
+	cb := h.OnLobeJoined
+	h.mu.RUnlock()
+	if !ok {
+		// The lobe is not (or no longer) a member. This means a mis-ordered or
+		// duplicate FireOnLobeJoined call — never legitimate. Warn so the bug
+		// surfaces instead of disappearing as a silent no-op.
+		slog.Warn("join: FireOnLobeJoined called for unregistered node; skipping callback",
+			"node", nodeID)
+		return
+	}
+	if cb == nil {
+		// No callback wired (e.g. handler used without a coordinator). Legitimate
+		// no-op — nothing to warn about.
+		return
+	}
+	cb(info)
 }
 
 // StreamSnapshot sends a full Pebble snapshot to the peer over conn.
@@ -235,13 +269,13 @@ type JoinResult struct {
 
 // JoinClient handles the Lobe-side join handshake.
 type JoinClient struct {
-	localNodeID  string
-	localAddr    string
+	localNodeID   string
+	localAddr     string
 	clusterSecret string
-	epochStore   *EpochStore
-	applier      *Applier
-	db           *pebble.DB // non-nil to enable snapshot reception
-	mgr          *ConnManager
+	epochStore    *EpochStore
+	applier       *Applier
+	db            *pebble.DB // non-nil to enable snapshot reception
+	mgr           *ConnManager
 }
 
 // NewJoinClient creates a JoinClient for a Lobe node.

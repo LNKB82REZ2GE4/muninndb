@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -42,6 +43,7 @@ import (
 	"github.com/scrypster/muninndb/internal/replication"
 	"github.com/scrypster/muninndb/internal/storage"
 	"github.com/scrypster/muninndb/internal/storage/migrate"
+	"github.com/scrypster/muninndb/internal/tlsutil"
 	grpcpkg "github.com/scrypster/muninndb/internal/transport/grpc"
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 	"github.com/scrypster/muninndb/internal/transport/rest"
@@ -51,6 +53,7 @@ import (
 )
 
 const defaultMCPPort = "8750"
+const defaultRESTPort = "8475"
 const defaultOpenAIEmbedProviderURL = "openai://text-embedding-3-small"
 
 const vaultUpgradeWarning = `
@@ -718,6 +721,30 @@ func parseListenHost(args []string, envVal string) string {
 	return host
 }
 
+// isLoopbackHost reports whether binding to host keeps the server reachable
+// only from the local machine. An empty host means Go binds all interfaces
+// (":port"), so it is treated as non-loopback. A non-IP hostname other than
+// "localhost" is treated as non-loopback since it can resolve anywhere.
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "":
+		return false
+	case "localhost":
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// shouldWarnDefaultPasswordExposure reports whether the server is reachable
+// off-host while the admin still has the default password — the combination
+// that warrants a prominent security warning at startup.
+func shouldWarnDefaultPasswordExposure(listenHost string, defaultPasswordInUse bool) bool {
+	return defaultPasswordInUse && !isLoopbackHost(listenHost)
+}
+
 func runServer() {
 	loadEnvFile()
 
@@ -783,14 +810,6 @@ func runServer() {
 	}
 	flag.Parse()
 
-	// Persist actual bound addresses so 'muninn status' and the startup health poll
-	// can probe the correct ports when non-default --*-addr flags are used.
-	_ = writeAddrsFile(*dataDir, daemonAddrs{
-		RestAddr: *restAddr,
-		MCPAddr:  *mcpAddr,
-		UIAddr:   *uiAddr,
-	})
-
 	// MCP token resolution order (highest to lowest priority):
 	//   1. --mcp-token flag  — explicit override for tests / container entrypoints
 	//   2. MUNINN_MCP_TOKEN env var — preferred for Docker / docker-compose deployments
@@ -809,6 +828,20 @@ func runServer() {
 	if *tlsKey == "" {
 		*tlsKey = os.Getenv("MUNINN_TLS_KEY")
 	}
+
+	// Persist actual bound addresses + scheme so 'muninn status' and the startup
+	// health poll can probe the correct ports and scheme when non-default
+	// --*-addr flags or TLS are in use. Written after the TLS env fallbacks so
+	// Scheme reflects both --tls-cert flags and MUNINN_TLS_CERT/_KEY env vars.
+	_ = writeAddrsFile(*dataDir, daemonAddrs{
+		Scheme:   schemeFor(*tlsCert, *tlsKey),
+		RestAddr: *restAddr,
+		MCPAddr:  *mcpAddr,
+		UIAddr:   *uiAddr,
+		// Best-effort parse of the cert's routable DNS SAN for the Web UI URL.
+		// "" on any error; the authoritative cert load + validation is below.
+		CertHost: certRoutableHost(*tlsCert, *tlsKey),
+	})
 
 	// Backup env fallbacks — flags take priority; env vars are the fallback.
 	if *backupInterval == "" {
@@ -854,11 +887,24 @@ func runServer() {
 			slog.Error("tls: failed to load certificate", "cert", *tlsCert, "err", err)
 			os.Exit(1)
 		}
+
+		logAttrs := []any{"cert", *tlsCert}
+		if leaf, perr := x509.ParseCertificate(cert.Certificate[0]); perr == nil {
+			remaining := tlsutil.CheckCertExpiry(slog.Default(), leaf, "client-facing")
+			logAttrs = append(logAttrs,
+				"subject", leaf.Subject.CommonName,
+				"not_after", leaf.NotAfter.UTC().Format(time.RFC3339),
+				"days_remaining", tlsutil.DaysRemaining(remaining))
+		} else {
+			slog.Warn("tls: failed to parse certificate leaf for expiry check",
+				"cert", *tlsCert, "err", perr)
+		}
+
 		clientTLS = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		}
-		slog.Info("tls: client-facing TLS enabled", "cert", *tlsCert)
+		slog.Info("tls: client-facing TLS enabled", logAttrs...)
 	}
 
 	// Validate address flags early so misconfigurations are caught before any
@@ -982,6 +1028,24 @@ func runServer() {
 	if err != nil {
 		slog.Error("auth bootstrap failed", "err", err)
 		os.Exit(1)
+	}
+
+	// Loud warning when the server is reachable off-host while the admin still
+	// has the default password — an open-server posture. We warn rather than
+	// refuse so the zero-config quickstart and the shipped docker-compose keep
+	// working; the message tells the operator exactly how to close the gap.
+	if shouldWarnDefaultPasswordExposure(listenHost, authStore.ValidateAdmin("root", "password") == nil) {
+		slog.Warn("SECURITY: bound to a non-loopback address with the default admin password still set",
+			"listen_host", listenHost)
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "  ⚠  SECURITY WARNING")
+		fmt.Fprintf(os.Stderr, "     muninn is listening on %s (reachable from other hosts) while the\n", listenHost)
+		fmt.Fprintln(os.Stderr, "     admin account still uses the default password 'password'.")
+		fmt.Fprintln(os.Stderr, "     Anyone who can reach this host can take over the server.")
+		fmt.Fprintln(os.Stderr, "     Fix now: log in to the Web UI and change the password, or set")
+		fmt.Fprintln(os.Stderr, "     MUNINN_ADMIN_PASSWORD before starting. Bind to 127.0.0.1 if you")
+		fmt.Fprintln(os.Stderr, "     only need local access.")
+		fmt.Fprintln(os.Stderr, "")
 	}
 
 	// Open MOL (Write-Ahead Log)

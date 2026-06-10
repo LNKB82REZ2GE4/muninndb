@@ -34,7 +34,7 @@ func buildEnvFileContent(embedProvider, enrichURL string) string {
 	allEmbed := []embedEntry{
 		{"ollama", "MUNINN_OLLAMA_URL", "ollama://localhost:11434/nomic-embed-text"},
 		{"openai", "MUNINN_OPENAI_KEY", "sk-..."},
-		{"openai", "MUNINN_OPENAI_URL", ""},  // optional, always commented
+		{"openai", "MUNINN_OPENAI_URL", ""}, // optional, always commented
 		{"voyage", "MUNINN_VOYAGE_KEY", "pa-..."},
 		{"cohere", "MUNINN_COHERE_KEY", "..."},
 		{"google", "MUNINN_GOOGLE_KEY", "..."},
@@ -79,7 +79,7 @@ func buildEnvFileContent(embedProvider, enrichURL string) string {
 	b.WriteString("# ── Network ──────────────────────────────────────────────\n")
 	b.WriteString("# MUNINN_LISTEN_HOST=127.0.0.1\n")
 	b.WriteString("# MUNINN_UI_ADDR=127.0.0.1:8476\n")
-	b.WriteString("# MUNINN_MCP_URL=http://127.0.0.1:8750/mcp\n")
+	fmt.Fprintf(&b, "# MUNINN_MCP_URL=%s://127.0.0.1:%s/mcp\n", tlsSchemeFromEnv(), defaultMCPPort)
 	b.WriteString("# MUNINN_CORS_ORIGINS=\n")
 	b.WriteString("\n")
 
@@ -125,35 +125,137 @@ func writeEnvFileTo(path, embedProvider, enrichURL string) (bool, error) {
 	if _, err := os.Lstat(path); err == nil {
 		return false, nil
 	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return false, err
-	}
-
-	content := buildEnvFileContent(embedProvider, enrichURL)
-
-	// Atomic write: temp file → chmod 0600 → rename.
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".muninn_env_*.tmp")
-	if err != nil {
-		return false, err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // clean up on failure
-
-	if _, err := tmp.WriteString(content); err != nil {
-		tmp.Close()
-		return false, err
-	}
-	if err := tmp.Close(); err != nil {
-		return false, err
-	}
-	if err := os.Chmod(tmpName, 0600); err != nil {
-		return false, err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := atomicWriteFile(path, buildEnvFileContent(embedProvider, enrichURL)); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// atomicWriteFile writes content to path via a temp file → chmod 0600 → rename,
+// creating the parent directory if needed. The 0600 mode matches mcp.token and
+// the env file (both may hold secrets/paths).
+func atomicWriteFile(path, content string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".muninn_env_*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // clean up on failure
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+// upsertEnvFileVar sets `key=value` as an active line in the env file at path.
+// See upsertEnvFileVars for the matching rules.
+func upsertEnvFileVar(path, key, value string) error {
+	return upsertEnvFileVars(path, [][2]string{{key, value}})
+}
+
+// envLineMatchesKey reports whether an env-file line is, or would activate to,
+// an assignment of key. It mirrors loadEnvFile's parsing exactly — optional
+// "export " prefix, whitespace around the key ("KEY = value") — plus one
+// leading "#" so a commented template line can be activated in place. Mirroring
+// the loader matters: any form the loader accepts that this misses would leave
+// a stale assignment behind that (first-active-line-wins) shadows the new one.
+func envLineMatchesKey(line, key string) bool {
+	t := strings.TrimSpace(line)
+	t = strings.TrimSpace(strings.TrimPrefix(t, "#"))
+	t = strings.TrimPrefix(t, "export ")
+	k, _, ok := strings.Cut(t, "=")
+	return ok && strings.TrimSpace(k) == key
+}
+
+// activeEnvLineMatchesKey is envLineMatchesKey restricted to active
+// (uncommented) assignments — the ones loadEnvFile would actually apply.
+func activeEnvLineMatchesKey(line, key string) bool {
+	t := strings.TrimSpace(line)
+	if strings.HasPrefix(t, "#") {
+		return false
+	}
+	t = strings.TrimPrefix(t, "export ")
+	k, _, ok := strings.Cut(t, "=")
+	return ok && strings.TrimSpace(k) == key
+}
+
+// upsertEnvFileVars applies the given key=value pairs to the env file at path
+// in ONE read + ONE atomic 0600 write, so related settings (a TLS cert/key
+// pair) can never be persisted half. For each key the first matching line —
+// commented or active, with or without an "export " prefix, with or without
+// spaces around the "=" — is replaced; keys with no match are appended. All
+// other lines are preserved (including their CRLF endings). The file is
+// created if absent. A symlinked or oversized file is refused: the loader
+// would reject both, so writing through them would persist settings the
+// daemon never sees (and destroy the symlink).
+func upsertEnvFileVars(path string, pairs [][2]string) error {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symlink — refusing to replace it (the daemon also refuses to load symlinked env files)", path)
+		}
+		if info.Size() > envFileMaxBytes {
+			return fmt.Errorf("%s exceeds the %d-byte limit the daemon will load — not writing", path, envFileMaxBytes)
+		}
+	}
+	content := ""
+	if b, err := os.ReadFile(path); err == nil {
+		content = string(b)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	lines := strings.Split(content, "\n")
+	var missing []string
+	for _, kv := range pairs {
+		key, value := kv[0], kv[1]
+		found := false
+		for i, line := range lines {
+			if !found && envLineMatchesKey(line, key) {
+				lines[i] = key + "=" + value
+				if strings.HasSuffix(line, "\r") {
+					lines[i] += "\r" // keep the file's CRLF endings intact
+				}
+				found = true
+				continue
+			}
+			// Neutralize any LATER active assignment of the same key: the loader
+			// is first-active-line-wins, so it would be dead anyway — but left
+			// active it reads as the effective config and traps future hand-edits.
+			if found && activeEnvLineMatchesKey(line, key) {
+				lines[i] = "# superseded by muninn init: " + line
+			}
+		}
+		if !found {
+			missing = append(missing, key+"="+kv[1])
+		}
+	}
+
+	out := strings.Join(lines, "\n")
+	if len(missing) > 0 {
+		// Append the rest, normalizing to exactly one trailing newline.
+		out = strings.TrimRight(out, "\n")
+		if out != "" {
+			out += "\n"
+		}
+		out += strings.Join(missing, "\n") + "\n"
+	}
+	// Guard the POST-write size too: the appended/neutralized lines could push a
+	// file that was just under the limit over it, after which the daemon would
+	// silently skip the whole file and the new setting would not survive a restart.
+	if int64(len(out)) > envFileMaxBytes {
+		return fmt.Errorf("%s would exceed the %d-byte limit the daemon will load — not writing", path, envFileMaxBytes)
+	}
+	return atomicWriteFile(path, out)
 }
 
 const envFileName = ".muninn/muninn.env"
