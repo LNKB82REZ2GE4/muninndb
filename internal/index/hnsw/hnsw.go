@@ -783,6 +783,47 @@ func (idx *Index) LoadFromPebble() error {
 		}
 	}
 
+	// Persisted neighbor lists are written asynchronously with NoSync and can be
+	// stale or degenerate (observed in production: an entry point whose every
+	// neighbor on every layer was itself — one such node at the graph apex makes
+	// the entire vault unreachable for vector search while the rest of the
+	// persisted graph looks healthy). Restoring structure we cannot trust is
+	// worse than rebuilding from the vectors, which ARE reliable (written once,
+	// validated on read). So: check connectivity from the restored entry point
+	// and rebuild the graph in memory from the vectors when the structure is
+	// broken, then re-persist the healthy neighbor lists.
+	reachable := bfsReachable(tempNodes, tempEntryPoint)
+	rebuilt := false
+	if vectorCount > 1 && reachable*2 < vectorCount {
+		slog.Warn("hnsw: restored graph is disconnected — rebuilding from vectors",
+			"vault", idx.ws,
+			"nodes", len(tempNodes),
+			"reachable_from_entry", reachable,
+		)
+		tmp := New(idx.db, idx.ws)
+		tmp.efConstruction = idx.efConstruction
+		tmp.efSearch = idx.efSearch
+		// Deterministic order: ULIDs ascending (map iteration is random).
+		ids := make([][16]byte, 0, len(tempNodes))
+		for id, n := range tempNodes {
+			if n.vec != nil {
+				ids = append(ids, id)
+			}
+		}
+		sort.Slice(ids, func(i, j int) bool { return string(ids[i][:]) < string(ids[j][:]) })
+		for _, id := range ids {
+			tmp.Insert(id, tempNodes[id].vec)
+		}
+		tmp.persistWg.Wait() // flush re-persisted (healthy) neighbor lists
+		tmp.mu.Lock()
+		tempNodes = tmp.nodes
+		tempMaxLevel = tmp.maxLevel
+		tempEntryPoint = tmp.entryPoint
+		tmp.mu.Unlock()
+		reachable = bfsReachable(tempNodes, tempEntryPoint)
+		rebuilt = true
+	}
+
 	// Only apply to index if load completed successfully
 	idx.mu.Lock()
 	idx.nodes = tempNodes
@@ -795,9 +836,37 @@ func (idx *Index) LoadFromPebble() error {
 		"nodes", len(tempNodes),
 		"vectors", vectorCount,
 		"duration", time.Since(start),
+		"reachable_from_entry", reachable,
+		"rebuilt", rebuilt,
 	)
 
 	return nil
+}
+
+// bfsReachable counts the nodes reachable from the entry point over layer-0
+// edges. A healthy graph reaches ~all nodes; a small count on a populated graph
+// indicates a disconnected (e.g. self-looped) entry point.
+func bfsReachable(nodes map[[16]byte]*HNSWNode, entry [16]byte) int {
+	if nodes[entry] == nil {
+		return 0
+	}
+	seen := map[[16]byte]bool{entry: true}
+	queue := [][16]byte{entry}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		n := nodes[cur]
+		if n == nil || len(n.layers) == 0 {
+			continue
+		}
+		for _, nb := range n.layers[0] {
+			if !seen[nb] && nodes[nb] != nil {
+				seen[nb] = true
+				queue = append(queue, nb)
+			}
+		}
+	}
+	return len(seen)
 }
 
 func min(a, b int) int {
