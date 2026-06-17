@@ -116,6 +116,54 @@ func (e *Election) UnregisterVoter(nodeID string) {
 	delete(e.voters, nodeID)
 }
 
+// IsVoter reports whether nodeID is a registered voter.
+func (e *Election) IsVoter(nodeID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, ok := e.voters[nodeID]
+	return ok
+}
+
+// ResetCandidate moves a stuck candidate back to Idle so a fresh election can be
+// started (used after a split vote that never reached quorum, #522 Step 4c).
+func (e *Election) ResetCandidate() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.state == ElectionCandidate {
+		e.state = ElectionIdle
+	}
+}
+
+// ClearLeader forgets currentLeader if it points at deadID (the known leader has
+// gone ODOWN), so the failover driver and followSeeds stop trusting it. A Follower
+// whose leader died returns to Idle so a fresh StartElection is unblocked (#531).
+func (e *Election) ClearLeader(deadID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.currentLeader == deadID {
+		e.currentLeader = ""
+	}
+	if e.state == ElectionFollower {
+		e.state = ElectionIdle
+	}
+}
+
+// StepDown relinquishes leadership without a successor (used by the pre-emptive
+// quorum-loss demotion, which has no claimant). state→Idle so a later
+// StartElection is not blocked by errAlreadyCandidate; currentLeader is cleared
+// only if it still points at us — a concurrent HandleCortexClaim that already
+// installed another leader wins (#522 Step 3).
+func (e *Election) StepDown() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.state == ElectionLeader {
+		e.state = ElectionIdle
+	}
+	if e.currentLeader == e.localNodeID {
+		e.currentLeader = ""
+	}
+}
+
 // StartElection initiates a new election from this node.
 // Returns an error if this node is already a candidate or leader.
 //
@@ -279,6 +327,14 @@ func (e *Election) HandleVoteResponse(resp mbp.VoteResponse) {
 		return
 	}
 
+	// Count votes only from registered voters, so the vote tally (numerator) is
+	// drawn from the same population as the quorum (denominator). A vote from an
+	// unknown/stale node must never help complete quorum (#522 Step 2).
+	if _, ok := e.voters[resp.VoterID]; !ok {
+		e.mu.Unlock()
+		return
+	}
+
 	// Record the vote.
 	if e.votes[resp.Epoch] == nil {
 		e.votes[resp.Epoch] = make(map[string]bool)
@@ -344,6 +400,17 @@ func (e *Election) tryPromote(epoch uint64) {
 	e.mu.Unlock()
 
 	// Broadcast CortexClaim to all peers.
+	e.broadcastClaim(epoch)
+
+	// Invoke callback without lock held.
+	if onPromoted != nil {
+		onPromoted(epoch)
+	}
+}
+
+// broadcastClaim marshals and broadcasts a CortexClaim for the given epoch to
+// all connected peers. Factored out so the equal-epoch tie-break can re-assert.
+func (e *Election) broadcastClaim(epoch uint64) {
 	claim := mbp.CortexClaim{
 		CortexID:     e.localNodeID,
 		Epoch:        epoch,
@@ -355,11 +422,6 @@ func (e *Election) tryPromote(epoch uint64) {
 		return
 	}
 	e.mgr.Broadcast(mbp.TypeCortexClaim, payload)
-
-	// Invoke callback without lock held.
-	if onPromoted != nil {
-		onPromoted(epoch)
-	}
 }
 
 // HandleCortexClaim processes an incoming CortexClaim from another node.
@@ -378,6 +440,22 @@ func (e *Election) HandleCortexClaim(claim mbp.CortexClaim) {
 	// Reject stale claims.
 	if claim.Epoch < currentEpoch {
 		e.mu.Unlock()
+		return
+	}
+
+	// Equal-epoch dueling-leaders tie-break (#519, #522 Step 4): two nodes both
+	// asserted leadership at the same epoch — only reachable when more than one is
+	// misconfigured role=primary (each force-promotes with a single self-vote).
+	// Resolve deterministically by lowest node-id: the lower id keeps leadership
+	// (ignores the conflicting claim and re-asserts), the higher id falls through
+	// to the demotion path below. Without this, two equal-epoch leaders mutually
+	// demote and the cluster can end up leaderless or flapping.
+	if claim.Epoch == currentEpoch && e.state == ElectionLeader &&
+		claim.CortexID != e.localNodeID && e.localNodeID < claim.CortexID {
+		e.mu.Unlock()
+		slog.Warn("cluster: equal-epoch CortexClaim from a higher node-id; keeping leadership (lowest id wins), re-asserting. Ensure exactly one node is configured role=primary.",
+			"claimant", claim.CortexID, "epoch", claim.Epoch, "self", e.localNodeID)
+		e.broadcastClaim(claim.Epoch)
 		return
 	}
 

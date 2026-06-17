@@ -678,12 +678,23 @@ func handleClusterConn(conn net.Conn, coord *replication.ClusterCoordinator) {
 	for {
 		frame, err := mbp.ReadFrame(conn)
 		if err != nil {
+			// The inbound conn died. If it had been adopted as a peer's registered
+			// conn, evict it (unless already replaced) so the peer's restart isn't
+			// blocked by a stale live-looking PeerConn (#534).
+			if joined {
+				coord.EvictConn(fromNodeID, conn)
+			}
 			return // connection closed or error
 		}
 		if frame.Type == mbp.TypeJoinRequest {
-			nodeID, err := coord.HandleIncomingJoin(conn, frame.Payload)
+			nodeID, adopted, err := coord.HandleIncomingJoin(conn, frame.Payload)
 			if err != nil {
 				log.Printf("[cluster] join error from %s: %v", fromNodeID, err)
+				return
+			}
+			if !adopted {
+				// Non-leader rejected the join with a redirect (already written to
+				// the raw conn). The conn was NOT registered, so close it here.
 				return
 			}
 			fromNodeID = nodeID
@@ -691,8 +702,23 @@ func handleClusterConn(conn net.Conn, coord *replication.ClusterCoordinator) {
 			connOwned = false // PeerConn now owns conn
 			continue
 		}
-		// Reject any frame that arrives before the join handshake completes.
-		// A well-behaved Lobe always sends TypeJoinRequest first.
+		// PeerHello discovery handshake (#522 Step 4) — an alternative first frame
+		// for peers that don't join (two primaries, sentinels, lobe↔lobe).
+		if frame.Type == mbp.TypePeerHello {
+			nodeID, adopted, err := coord.HandleIncomingHello(conn, frame.Payload)
+			if err != nil {
+				log.Printf("[cluster] hello error from %s: %v", fromNodeID, err)
+				return
+			}
+			if !adopted {
+				return // tie-break loser: conn deliberately closed in adoptHelloPeer
+			}
+			fromNodeID = nodeID
+			joined = true
+			connOwned = false // PeerConn now owns conn
+			continue
+		}
+		// Reject any frame that arrives before a join/hello handshake completes.
 		if !joined {
 			log.Printf("[cluster] unexpected frame type 0x%02x from %s before join; closing", frame.Type, fromNodeID)
 			return
@@ -1438,6 +1464,9 @@ func runServer() {
 	var retroProcessor *plugin.RetroactiveProcessor
 	if embedPlugin != nil {
 		retroProcessor = plugin.NewRetroactiveProcessor(pStore, embedPlugin, plugin.DigestEmbed)
+		// Re-evaluate push subscriptions once each engram's embedding lands (#512),
+		// so vector-scored matches on freshly-written engrams are not missed.
+		retroProcessor.SetOnEmbed(eng.ReevaluatePushOnEmbed)
 		retroProcessor.Start(ctx)
 		slog.Info("retroactive embed processor started")
 	}

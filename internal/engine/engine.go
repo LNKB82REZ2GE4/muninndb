@@ -250,6 +250,22 @@ func (e *Engine) SetLatencyTracker(t *latency.Tracker) {
 	e.latencyTracker = t
 }
 
+// ReevaluatePushOnEmbed re-evaluates push subscriptions for an engram whose
+// embedding just finished computing asynchronously (#512). It resolves the
+// engram's vault and forwards to the trigger system, which pushes the engram to
+// any subscription it now matches semantically but was not already delivered to
+// at write time. Wired to the embed retroactive processor's OnEmbed callback.
+func (e *Engine) ReevaluatePushOnEmbed(eng *storage.Engram, vec []float32) {
+	if e.triggers == nil || eng == nil || len(vec) == 0 {
+		return
+	}
+	ws, ok := e.store.FindVaultPrefix(eng.ID)
+	if !ok {
+		return
+	}
+	e.triggers.NotifyEmbed(wsVaultID(ws), eng, vec)
+}
+
 // SetRetroactiveProcessors registers background processors for observability.
 // Must be called before the engine starts serving requests (not safe for concurrent use with Observability).
 func (e *Engine) SetRetroactiveProcessors(procs ...*plugin.RetroactiveProcessor) {
@@ -2724,10 +2740,9 @@ type EngineSessionEntry struct {
 }
 
 // Evolve creates a new version of an existing engram and soft-deletes the old one.
-// It links the new engram to the old one with RelSupersedes and returns the new ID.
-// All three writes (new engram, supersedes association, old engram state) are committed
-// in a single atomic Pebble batch so a crash cannot leave the store in an inconsistent state.
-func (e *Engine) Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32) (storage.ULID, error) {
+// concept overrides the inherited concept label; empty string inherits verbatim (#483).
+// All three writes are committed in a single atomic Pebble batch.
+func (e *Engine) Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string) (storage.ULID, error) {
 	wsPrefix := e.store.ResolveVaultPrefix(vault)
 
 	// Parse the old ULID before any writes.
@@ -2749,9 +2764,12 @@ func (e *Engine) Evolve(ctx context.Context, vault, oldID, newContent, reason st
 	// supersedes association within the same batch.
 	newULID := storage.NewULID()
 	now := time.Now()
+	if concept == "" {
+		concept = oldEng.Concept
+	}
 	newEng := &storage.Engram{
 		ID:         newULID,
-		Concept:    oldEng.Concept,
+		Concept:    concept,
 		Content:    newContent,
 		Tags:       oldEng.Tags,
 		Confidence: 1.0,
