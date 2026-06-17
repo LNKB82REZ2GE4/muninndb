@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/scrypster/muninndb/internal/storage/keys"
@@ -76,6 +77,12 @@ type Index struct {
 	efConstruction int            // beam width during insert; 0 → uses EfConstruction constant
 	efSearch       int            // beam width during query; 0 → uses EfSearch constant
 	deleted        sync.Map       // key: [16]byte id → struct{} (tombstoned hard-deleted nodes)
+
+	// loadErrHook is a test-only seam: when non-nil, LoadFromPebble returns the
+	// hook's result immediately, allowing tests to exercise the failed-load path
+	// (e.g. the registry's no-cache-on-error behaviour) without corrupting Pebble.
+	// Always nil in production.
+	loadErrHook func() error
 }
 
 // Dim returns the vector dimension used by this index.
@@ -392,26 +399,32 @@ func (idx *Index) Insert(id [16]byte, vector []float32) {
 		return
 	}
 
-	if level > idx.maxLevel {
-		idx.entryPoint = id
-		idx.maxLevel = level
-	}
-
+	// Traverse from the EXISTING entry point and link the new node into the
+	// graph BEFORE any entry-point promotion. Promoting first would make
+	// ep == id below: searchLayer then sees only the new node itself, the node
+	// links to nothing (or to itself), and every promotion orphans the entire
+	// prior graph — fragmenting the index a little more on each maxLevel raise.
 	ep := idx.entryPoint
+	oldMaxLevel := idx.maxLevel
 	var epVec []float32
 	if epNode := idx.nodes[ep]; epNode != nil {
 		epVec = epNode.vec
 	}
 
-	// Phase 1: greedy descent from maxLevel to level+1 (only if epVec exists)
+	// Phase 1: greedy descent from oldMaxLevel to level+1 (only if epVec exists)
 	if epVec != nil {
-		for l := idx.maxLevel; l > level; l-- {
+		for l := oldMaxLevel; l > level; l-- {
 			epVec = idx.greedyDescend(ep, epVec, vector, l, &ep)
 		}
 	}
 
-	// Phase 2: insert at each layer from min(level, maxLevel) down to 0
-	for l := min(level, idx.maxLevel); l >= 0; l-- {
+	// Neighbors whose layer lists we mutate must be re-persisted, or the
+	// back-edges exist only in memory and every restart sheds them — leaving
+	// the on-disk graph forward-only and barely navigable after reload.
+	mutated := make(map[[16]byte]*HNSWNode)
+
+	// Phase 2: insert at each layer from min(level, oldMaxLevel) down to 0
+	for l := min(level, oldMaxLevel); l >= 0; l-- {
 		neighbors := idx.searchLayer(ep, vector, idx.efC(), l)
 		M := M
 		if l == 0 {
@@ -439,11 +452,15 @@ func (idx *Index) Insert(id [16]byte, vector []float32) {
 			nbNode.layers[l] = append(nbNode.layers[l], id)
 			maxConn := maxConnections(l)
 			if len(nbNode.layers[l]) > maxConn {
-				// Prune: keep strongest connections
-				// Simple pruning: truncate (production would use heuristic select)
-				nbNode.layers[l] = nbNode.layers[l][:maxConn]
+				// Prune: keep the maxConn NEAREST neighbors by distance to this
+				// node's vector. Plain truncation ([:maxConn]) would always drop
+				// the just-appended edge once the layer is full — late-inserted
+				// nodes then accumulate zero in-edges and become unreachable,
+				// silently degrading the graph as the vault grows.
+				nbNode.layers[l] = idx.pruneNeighbors(nbNode.vec, nbNode.layers[l], maxConn)
 			}
 			nbNode.mu.Unlock()
+			mutated[nb.id] = nbNode
 		}
 
 		if len(neighbors) > 0 {
@@ -451,8 +468,47 @@ func (idx *Index) Insert(id [16]byte, vector []float32) {
 		}
 	}
 
+	// Promote to entry point only after the node is linked into the graph.
+	if level > idx.maxLevel {
+		idx.entryPoint = id
+		idx.maxLevel = level
+	}
+
 	idx.persistWg.Add(1)
 	go idx.persistNode(id, node)
+	for nbID, nbNode := range mutated {
+		idx.persistWg.Add(1)
+		go idx.persistNode(nbID, nbNode)
+	}
+}
+
+// pruneNeighbors keeps the keep nearest neighbor ids to baseVec, measured by
+// cosine distance. Neighbors whose node or vector is missing sort last so they
+// are pruned first. Caller must hold the owning node's mutex; neighbor vectors
+// are immutable after insert, so reading them without their locks is safe.
+func (idx *Index) pruneNeighbors(baseVec []float32, ids [][16]byte, keep int) [][16]byte {
+	if len(ids) <= keep {
+		return ids
+	}
+	type nd struct {
+		id   [16]byte
+		dist float64
+	}
+	scored := make([]nd, 0, len(ids))
+	for _, nid := range ids {
+		n := idx.nodes[nid]
+		if n == nil || len(n.vec) == 0 || len(baseVec) == 0 {
+			scored = append(scored, nd{nid, 2.0}) // missing vector: prune first
+			continue
+		}
+		scored = append(scored, nd{nid, 1.0 - float64(CosineSimilarity(baseVec, n.vec))})
+	}
+	sort.Slice(scored, func(i, j int) bool { return scored[i].dist < scored[j].dist })
+	out := make([][16]byte, keep)
+	for i := 0; i < keep; i++ {
+		out[i] = scored[i].id
+	}
+	return out
 }
 
 func (idx *Index) greedyDescend(ep [16]byte, epVec, query []float32, l int, newEP *[16]byte) []float32 {
@@ -641,8 +697,21 @@ func decodeNeighbors(buf []byte) [][16]byte {
 // LoadFromPebble reads all HNSW nodes from Pebble into memory.
 // Loads into temporary structures first and only applies on success to maintain consistency.
 func (idx *Index) LoadFromPebble() error {
-	lowerBound := []byte{0x07}
+	if idx.loadErrHook != nil {
+		return idx.loadErrHook()
+	}
+
+	start := time.Now()
+
+	// Scope the iterator to this vault's keyspace. The 0x07 range is shared by
+	// all vaults; bounding it to 0x07‖ws … 0x07‖(ws+1) means Pebble only visits
+	// this vault's keys instead of scanning the whole 0x07 keyspace and skipping
+	// foreign keys per-key. The in-loop ws check below remains as a safety net.
+	lowerBound := append([]byte{0x07}, idx.ws[:]...)
 	upperBound := []byte{0x08}
+	if wsPlus, err := keys.IncrementWSPrefix(idx.ws); err == nil {
+		upperBound = append([]byte{0x07}, wsPlus[:]...)
+	}
 
 	iter, err := idx.db.NewIter(&pebble.IterOptions{
 		LowerBound: lowerBound,
@@ -661,6 +730,14 @@ func (idx *Index) LoadFromPebble() error {
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := iter.Key()
 		if len(key) < 26 {
+			continue
+		}
+
+		// Only load nodes belonging to this index's vault. The 0x07 range is
+		// shared by all vaults; without this filter every per-vault index loads
+		// every vault's nodes — bloating memory and surfacing cross-vault IDs
+		// that can never resolve in the querying vault.
+		if [8]byte(key[1:9]) != idx.ws {
 			continue
 		}
 
@@ -698,12 +775,27 @@ func (idx *Index) LoadFromPebble() error {
 		return fmt.Errorf("hnsw: LoadFromPebble incomplete read: %w", err)
 	}
 
+	// Count vectors that were actually restored (nodes carrying a 0xFF slot).
+	vectorCount := 0
+	for _, node := range tempNodes {
+		if node.vec != nil {
+			vectorCount++
+		}
+	}
+
 	// Only apply to index if load completed successfully
 	idx.mu.Lock()
-	defer idx.mu.Unlock()
 	idx.nodes = tempNodes
 	idx.maxLevel = tempMaxLevel
 	idx.entryPoint = tempEntryPoint
+	idx.mu.Unlock()
+
+	slog.Info("hnsw: loaded graph from pebble",
+		"vault", idx.ws,
+		"nodes", len(tempNodes),
+		"vectors", vectorCount,
+		"duration", time.Since(start),
+	)
 
 	return nil
 }

@@ -299,6 +299,9 @@ curl http://127.0.0.1:8750/mcp/health
 | `MUNINN_GC_PERCENT` | `200` | GOGC tuning |
 | `MUNINN_CORS_ORIGINS` | `""` | Comma-separated allowed CORS origins |
 | `MUNINN_MCP_URL` | `http://127.0.0.1:8750/mcp` | Override MCP endpoint used by `muninn mcp` proxy (OpenClaw) |
+| `MUNINNDB_ADMIN_URL` | auto-detected | Override the REST/admin base URL probed by `muninn status` & admin CLI (TLS deployments) |
+| `MUNINNDB_UI_URL` | auto-detected | Override the Web UI base URL probed by `muninn status` (TLS deployments) |
+| `MUNINNDB_MCP_URL` | auto-detected | Override the MCP base URL probed by `muninn status` / `muninn start` (TLS deployments) |
 
 ---
 
@@ -490,7 +493,7 @@ Ensure that path is on an encrypted filesystem before storing sensitive data.
 Encryption at rest protects data that is **stored on disk while the system is off or the volume is locked**. It does not protect:
 
 - **The running process.** Once MuninnDB starts and the volume is unlocked, data is decrypted in memory. Any process with sufficient OS privileges can read process memory.
-- **Network exposure.** Data in transit between clients and MuninnDB is not covered by disk encryption. Run MuninnDB behind a TLS-terminating reverse proxy in any networked deployment. See the [auth documentation](auth.md) for the transport security property.
+- **Network exposure.** Data in transit between clients and MuninnDB is not covered by disk encryption. In any networked deployment, serve TLS natively (see the [TLS guide](tls.md)) or run MuninnDB behind a TLS-terminating reverse proxy. See the [auth documentation](auth.md) for the transport security property.
 - **API key compromise.** A stolen API key grants access to vault data over the network regardless of disk encryption state. Rotate keys immediately if compromise is suspected.
 - **Backup files.** If you copy the `pebble/` directory or snapshot the volume without encryption, those copies are unprotected. Apply the same encryption controls to your backup destination.
 

@@ -41,8 +41,10 @@ func TestWALSyncer_SyncsAfterWrite(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	// Wait for at least one tick to pick up the WAL change.
-	deadline := time.Now().Add(10 * walSyncInterval)
+	// Wait for the syncer to pick up the WAL change. Generous fixed bound:
+	// time.Ticker guarantees a minimum tick interval, not a maximum, so a
+	// starved CI runner can tick late (see #482).
+	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if s.syncCount.Load() > 0 {
 			break
@@ -73,7 +75,8 @@ func TestWALSyncer_IdleThenWrite(t *testing.T) {
 	if err := db.Set([]byte("k1"), []byte("v1"), pebble.NoSync); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	deadline := time.Now().Add(10 * walSyncInterval)
+	// Generous fixed bound — see #482 (ticker can be starved on a loaded runner).
+	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if s.syncCount.Load() > 0 {
 			break
@@ -137,8 +140,9 @@ func TestWALSyncer_FinalSyncOnClose(t *testing.T) {
 
 	s := newWALSyncer(db)
 
-	// Wait for the syncer to observe the write and sync.
-	deadline := time.Now().Add(10 * walSyncInterval)
+	// Wait for the syncer to observe the write and sync. Generous fixed bound —
+	// see #482 (ticker can be starved on a loaded runner).
+	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if s.syncCount.Load() > 0 {
 			break
@@ -174,8 +178,14 @@ func TestWALSyncer_SyncCountAccurate(t *testing.T) {
 		if err := db.Set(key, key, pebble.NoSync); err != nil {
 			t.Fatalf("cycle %d write: %v", cycle, err)
 		}
-		// Wait for the sync to fire.
-		deadline := time.Now().Add(10 * walSyncInterval)
+		// Wait for the sync to fire. The deadline is a generous fixed wall-clock
+		// bound (not a small multiple of walSyncInterval): time.Ticker guarantees
+		// a *minimum* tick interval, not a maximum, so on a contended CI runner
+		// the syncer goroutine can be starved well past a few intervals. A tight
+		// 10×interval (100ms) deadline made this flake ("cycle 2: got 2"); 2s
+		// gives a heavily loaded runner ample room while a healthy run still
+		// passes in a couple of intervals.
+		deadline := time.Now().Add(2 * time.Second)
 		want := int64(cycle + 1)
 		for time.Now().Before(deadline) {
 			if s.syncCount.Load() >= want {

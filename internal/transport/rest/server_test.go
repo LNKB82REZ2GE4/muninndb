@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	_ "time/tzdata" // embed IANA tz data so LoadLocation works in the test binary
 
 	"github.com/cockroachdb/pebble"
 	"github.com/scrypster/muninndb/internal/auth"
@@ -33,8 +34,9 @@ const testEngramID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
 
 // MockEngine is a mock implementation of EngineAPI for testing.
 type MockEngine struct {
-	lastActivityReq  *ActivityCountsRequest
+	lastActivityReq   *ActivityCountsRequest
 	activityCountsErr error
+	lastSubscribeReq  *mbp.SubscribeRequest
 }
 
 func (m *MockEngine) Hello(ctx context.Context, req *HelloRequest) (*HelloResponse, error) {
@@ -168,6 +170,7 @@ func (m *MockEngine) WorkerStats() cognitive.EngineWorkerStats {
 }
 
 func (m *MockEngine) SubscribeWithDeliver(ctx context.Context, req *mbp.SubscribeRequest, deliver trigger.DeliverFunc) (string, error) {
+	m.lastSubscribeReq = req
 	return "mock-sub", nil
 }
 
@@ -538,7 +541,7 @@ func TestGetEngramLinks(t *testing.T) {
 	engine := &MockEngine{}
 	server := NewServer("localhost:8080", engine, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	req := httptest.NewRequest("GET", "/api/engrams/" + testEngramID + "/links", nil)
+	req := httptest.NewRequest("GET", "/api/engrams/"+testEngramID+"/links", nil)
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
 
@@ -688,7 +691,7 @@ func TestGetSessionEngineError(t *testing.T) {
 
 func TestGetEngramLinksEngineError(t *testing.T) {
 	server := NewServer("localhost:8080", &errorEngine{}, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
-	req := httptest.NewRequest("GET", "/api/engrams/" + testEngramID + "/links", nil)
+	req := httptest.NewRequest("GET", "/api/engrams/"+testEngramID+"/links", nil)
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
 
@@ -1166,7 +1169,7 @@ func TestEvolveEndpoint(t *testing.T) {
 	server := NewServer("localhost:8080", engine, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
 	body := `{"new_content":"updated content","reason":"correction"}`
-	req := httptest.NewRequest("POST", "/api/engrams/" + testEngramID + "/evolve", strings.NewReader(body))
+	req := httptest.NewRequest("POST", "/api/engrams/"+testEngramID+"/evolve", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
@@ -1189,7 +1192,7 @@ func TestEvolveEndpoint_MissingFields(t *testing.T) {
 	server := NewServer("localhost:8080", engine, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
 	body := `{}`
-	req := httptest.NewRequest("POST", "/api/engrams/" + testEngramID + "/evolve", strings.NewReader(body))
+	req := httptest.NewRequest("POST", "/api/engrams/"+testEngramID+"/evolve", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
@@ -1282,7 +1285,7 @@ func TestRestoreEndpoint(t *testing.T) {
 	engine := &MockEngine{}
 	server := NewServer("localhost:8080", engine, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	req := httptest.NewRequest("POST", "/api/engrams/" + testEngramID + "/restore", nil)
+	req := httptest.NewRequest("POST", "/api/engrams/"+testEngramID+"/restore", nil)
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
 
@@ -1389,7 +1392,7 @@ func TestSetStateEndpoint(t *testing.T) {
 	server := NewServer("localhost:8080", engine, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
 	body := `{"state":"active","reason":"resuming work"}`
-	req := httptest.NewRequest("PUT", "/api/engrams/" + testEngramID + "/state", strings.NewReader(body))
+	req := httptest.NewRequest("PUT", "/api/engrams/"+testEngramID+"/state", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
@@ -1415,7 +1418,7 @@ func TestSetStateEndpoint_InvalidState(t *testing.T) {
 	server := NewServer("localhost:8080", engine, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
 	body := `{"state":"invalid"}`
-	req := httptest.NewRequest("PUT", "/api/engrams/" + testEngramID + "/state", strings.NewReader(body))
+	req := httptest.NewRequest("PUT", "/api/engrams/"+testEngramID+"/state", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
@@ -1453,7 +1456,7 @@ func TestRetryEnrichEndpoint(t *testing.T) {
 	engine := &MockEngine{}
 	server := NewServer("localhost:8080", engine, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	req := httptest.NewRequest("POST", "/api/engrams/" + testEngramID + "/retry-enrich", nil)
+	req := httptest.NewRequest("POST", "/api/engrams/"+testEngramID+"/retry-enrich", nil)
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
 
@@ -1798,7 +1801,7 @@ func TestGetEngram_HappyPath(t *testing.T) {
 	eng := &MockEngine{}
 	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	req := httptest.NewRequest("GET", "/api/engrams/" + testEngramID + "?vault=default", nil)
+	req := httptest.NewRequest("GET", "/api/engrams/"+testEngramID+"?vault=default", nil)
 	w := httptest.NewRecorder()
 	server.mux.ServeHTTP(w, req)
 
@@ -2314,6 +2317,71 @@ func TestHandleActivityCounts_WithUntilDate(t *testing.T) {
 	}
 	if resp.Counts[6].Date != "2026-03-15" {
 		t.Errorf("last date = %s, want 2026-03-15", resp.Counts[6].Date)
+	}
+}
+
+func TestHandleActivityCounts_Timezone(t *testing.T) {
+	eng := &MockEngine{}
+	server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
+	req := httptest.NewRequest("GET", "/api/activity-counts?vault=default&days=7&until=2026-03-15&tz=America/Los_Angeles", nil)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if eng.lastActivityReq == nil {
+		t.Fatal("expected engine to receive request")
+	}
+	// since/until must be expressed in the requested location, not UTC, so the
+	// downstream layers bucket by the viewer's local calendar day.
+	if got := eng.lastActivityReq.Since.Location().String(); got != "America/Los_Angeles" {
+		t.Errorf("Since location = %q, want America/Los_Angeles", got)
+	}
+	if got := eng.lastActivityReq.Until.Location().String(); got != "America/Los_Angeles" {
+		t.Errorf("Until location = %q, want America/Los_Angeles", got)
+	}
+	wantSince := time.Date(2026, 3, 9, 0, 0, 0, 0, eng.lastActivityReq.Since.Location())
+	if !eng.lastActivityReq.Since.Equal(wantSince) {
+		t.Errorf("Since = %v, want %v", eng.lastActivityReq.Since, wantSince)
+	}
+	var resp ActivityCountsResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Counts) != 7 {
+		t.Fatalf("expected 7 counts, got %d", len(resp.Counts))
+	}
+	if resp.Counts[0].Date != "2026-03-09" || resp.Counts[6].Date != "2026-03-15" {
+		t.Errorf("date range = %s..%s, want 2026-03-09..2026-03-15", resp.Counts[0].Date, resp.Counts[6].Date)
+	}
+}
+
+func TestHandleActivityCounts_InvalidTimezoneFallsBackToUTC(t *testing.T) {
+	tests := []struct {
+		name string
+		tz   string
+	}{
+		{"unknown zone", "Not/AZone"},
+		{"overlong", strings.Repeat("a", maxTimezoneNameLen+1)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eng := &MockEngine{}
+			server := NewServer("localhost:8080", eng, nil, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
+			req := httptest.NewRequest("GET", "/api/activity-counts?vault=default&tz="+tt.tz, nil)
+			w := httptest.NewRecorder()
+			server.mux.ServeHTTP(w, req)
+			// An invalid tz must not error — it silently falls back to UTC.
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200 for invalid tz, got %d: %s", w.Code, w.Body.String())
+			}
+			if eng.lastActivityReq == nil {
+				t.Fatal("expected engine to receive request")
+			}
+			if eng.lastActivityReq.Since.Location() != time.UTC {
+				t.Errorf("expected UTC fallback, got %v", eng.lastActivityReq.Since.Location())
+			}
+		})
 	}
 }
 

@@ -3,10 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +18,8 @@ import (
 	"time"
 
 	"golang.org/x/term"
+
+	"github.com/scrypster/muninndb/internal/tlsutil"
 )
 
 // version is set at build time via -ldflags "-X main.version=vX.Y.Z"
@@ -69,6 +75,8 @@ func runInit() {
 	noToken := fs.Bool("no-token", false, "Disable token authentication (open MCP endpoint)")
 	noStart := fs.Bool("no-start", false, "Skip starting the server")
 	yes := fs.Bool("yes", false, "Accept all defaults non-interactively")
+	tlsCert := fs.String("tls-cert", "", "Path to TLS certificate (PEM) — serve clients over https")
+	tlsKey := fs.String("tls-key", "", "Path to TLS private key (PEM)")
 	fs.Usage = func() { subcommandHelp["init"]() }
 
 	var args []string
@@ -77,7 +85,11 @@ func runInit() {
 	}
 	fs.Parse(args)
 
-	mcpURL := "http://127.0.0.1:8750/mcp"
+	// Honor ~/.muninn/muninn.env like the daemon does (shell env still wins):
+	// a persisted MUNINN_TLS_CERT/KEY or MUNINN_MCP_URL must shape the configs
+	// this run generates, or a re-run on a TLS install would write http URLs.
+	loadEnvFile()
+
 	isInteractive := term.IsTerminal(int(os.Stdin.Fd()))
 
 	if !isInteractive && !*yes && *toolFlag == "" {
@@ -86,25 +98,308 @@ For non-interactive setup, use flags:
 
   muninn init --tool claude --yes
   muninn init --tool cursor,claude --no-token --yes
+  muninn init --tool claude --tls-cert cert.pem --tls-key key.pem --yes
   muninn init --yes   (manual instructions only)
 
-  --tool <tools>   Comma-separated: claude, cursor, openclaw, windsurf, codex, vscode, manual
+  --tool <tools>   Comma-separated: claude, claude-code, cursor, openclaw, windsurf, codex, opencode, vscode, manual
   --token <tok>    Use specific token
   --no-token       Open MCP (no auth)
   --no-start       Skip starting server
+  --tls-cert <p>   TLS certificate (PEM) — serve clients over https
+  --tls-key <p>    TLS private key (PEM)
   --yes            Accept defaults, non-interactive`)
 		os.Exit(1)
 	}
 
 	if isInteractive && *toolFlag == "" && !*yes {
-		runInteractiveInit(mcpURL, tokenFlag, noToken, noStart)
+		runInteractiveInit(tokenFlag, noToken, noStart, *tlsCert, *tlsKey)
 		return
 	}
 
-	runNonInteractiveInit(mcpURL, *toolFlag, *tokenFlag, *noToken, *noStart, *yes)
+	runNonInteractiveInit(*toolFlag, *tokenFlag, *noToken, *noStart, *yes, *tlsCert, *tlsKey)
 }
 
-func runInteractiveInit(mcpURL string, tokenFlag *string, noToken *bool, noStart *bool) {
+// validateTLSPair reports whether a cert/key pair is usable. Both empty is valid
+// (no TLS); exactly one set is an error; both set must load as a key pair.
+func validateTLSPair(cert, key string) error {
+	if (cert == "") != (key == "") {
+		return fmt.Errorf("--tls-cert and --tls-key must both be set (or neither)")
+	}
+	if cert == "" {
+		return nil
+	}
+	if _, err := tls.LoadX509KeyPair(cert, key); err != nil {
+		return fmt.Errorf("invalid TLS cert/key: %w", err)
+	}
+	return nil
+}
+
+// tlsSchemeFromEnv reports "https" when both TLS env vars are set, else "http".
+func tlsSchemeFromEnv() string {
+	return schemeFor(os.Getenv("MUNINN_TLS_CERT"), os.Getenv("MUNINN_TLS_KEY"))
+}
+
+// daemonRunning reports whether a muninn daemon is currently running, going by
+// the PID file in the data directory.
+func daemonRunning() bool {
+	pid, err := readPID(filepath.Join(defaultDataDir(), "muninn.pid"))
+	return err == nil && isProcessRunning(pid)
+}
+
+// clientScheme is the scheme written into generated client configs and printed
+// URLs: https when this process's TLS env says so (a TLS setup happening right
+// now — runInit loads muninn.env, so persisted TLS counts too); otherwise the
+// scheme the RUNNING daemon recorded in the muninn.addrs sidecar, so re-running
+// init against an already-TLS daemon never downgrades configs to http. The
+// sidecar is consulted only while the daemon is alive — a stale file left by a
+// crash must not make a fresh plaintext daemon advertise https.
+func clientScheme() string {
+	if s := tlsSchemeFromEnv(); s == "https" {
+		return s
+	}
+	if daemonRunning() {
+		if addrs, err := readAddrsFile(defaultDataDir()); err == nil && addrs.Scheme != "" {
+			return addrs.Scheme
+		}
+	}
+	return "http"
+}
+
+// normalizeTLSPath expands a leading "~/" and makes the path absolute, so the
+// value survives being handed to the forked daemon and persisted into
+// muninn.env — a relative path would only resolve from init's cwd and would
+// break every later 'muninn start' from anywhere else. Best-effort: on any
+// resolution error the input is returned unchanged.
+func normalizeTLSPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			p = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(p, "~"), "/"))
+		}
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return abs
+	}
+	return p
+}
+
+// clientMCPURL is the MCP endpoint written into generated AI-tool configs.
+// MUNINN_MCP_URL (an operator-advertised, e.g. routable/remote, URL) wins;
+// otherwise the scheme follows clientScheme so a TLS deployment gets https.
+func clientMCPURL() string {
+	if v := os.Getenv("MUNINN_MCP_URL"); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return clientScheme() + "://127.0.0.1:" + defaultMCPPort + "/mcp"
+}
+
+// clientUIURL is the Web UI URL shown to the operator, scheme-aware.
+func clientUIURL() string {
+	return clientScheme() + "://127.0.0.1:8476"
+}
+
+// clientRESTURL is the REST API base written into generated AI-tool guides
+// (e.g. the OpenClaw SKILL.md curl examples), scheme-aware.
+func clientRESTURL() string {
+	return clientScheme() + "://127.0.0.1:8475"
+}
+
+// configTokenOverride returns the token to embed in generated tool configs
+// WITHOUT touching the mcp.token file: an explicit --token flag, else
+// MUNINN_MCP_TOKEN from the environment (now visible since runInit loads
+// muninn.env). This mirrors the daemon's own precedence — --mcp-token flag >
+// MUNINN_MCP_TOKEN env > ~/.muninn/mcp.token file (server.go) — so the configs
+// authenticate against the token the daemon actually uses, instead of the file
+// token the daemon would ignore when MUNINN_MCP_TOKEN is set. Returns "" when
+// neither is set, so the caller falls back to loadOrGenerateToken (the file).
+func configTokenOverride(tokenFlag string) string {
+	if tokenFlag != "" {
+		return tokenFlag
+	}
+	return os.Getenv("MUNINN_MCP_TOKEN")
+}
+
+// ambientTLSPair returns the env-configured TLS pair when it is set and valid,
+// else ("",""). Used so a pair inherited from the shell or muninn.env enables
+// the same persistence and messaging as explicit flags — without it, an
+// ambient-TLS init produced https configs and an https daemon but never
+// persisted the pair, so the next clean-shell start silently served http.
+// An invalid ambient pair is left alone: the daemon validates it fatally
+// itself, and init must not turn an operator's env into a hard error.
+func ambientTLSPair() (cert, key string) {
+	cert, key = os.Getenv("MUNINN_TLS_CERT"), os.Getenv("MUNINN_TLS_KEY")
+	if cert == "" || key == "" || validateTLSPair(cert, key) != nil {
+		return "", ""
+	}
+	return cert, key
+}
+
+// enableTLSFromFlagsOrPrompt resolves TLS for the interactive wizard. Explicit
+// flags are validated strictly — a bad --tls-cert/--tls-key pair is fatal,
+// matching the non-interactive path and the daemon, so an explicit TLS request
+// is never silently downgraded to plaintext http. With no flags, a valid
+// ambient env pair is adopted; otherwise it prompts (which may be declined).
+// On success it sets the TLS env (paths normalized to absolute) so the
+// upcoming runStart's forked daemon serves https. Returns the resolved
+// cert/key paths, or ("","") when TLS is not enabled.
+func enableTLSFromFlagsOrPrompt(certFlag, keyFlag string) (cert, key string) {
+	cert, key = certFlag, keyFlag
+	if cert == "" && key == "" {
+		if cert, key = ambientTLSPair(); cert != "" {
+			fmt.Println()
+			fmt.Println("  Using the TLS certificate from MUNINN_TLS_CERT / MUNINN_TLS_KEY.")
+		} else {
+			cert, key = promptTLS()
+		}
+	} else {
+		// Normalize before validating so "~/cert.pem" and relative flag paths
+		// resolve the same way the prompt path does, rather than fatally failing.
+		cert, key = normalizeTLSPath(cert), normalizeTLSPath(key)
+		if err := validateTLSPair(cert, key); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	if cert == "" {
+		return "", ""
+	}
+	cert, key = normalizeTLSPath(cert), normalizeTLSPath(key)
+	os.Setenv("MUNINN_TLS_CERT", cert)
+	os.Setenv("MUNINN_TLS_KEY", key)
+	fmt.Println("  ✓ TLS enabled — clients will connect over https")
+	warnIfCertNotLoopback(cert)
+	warnIfCertExpiring(cert)
+	return cert, key
+}
+
+// parseLeafCert reads a PEM file and returns its first parseable CERTIFICATE
+// block (the leaf), skipping any leading private-key block in a combined PEM.
+// Returns nil on any read/parse failure.
+func parseLeafCert(certPath string) *x509.Certificate {
+	b, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil
+	}
+	for {
+		var block *pem.Block
+		block, b = pem.Decode(b)
+		if block == nil {
+			return nil
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		if c, err := x509.ParseCertificate(block.Bytes); err == nil {
+			return c
+		}
+	}
+}
+
+// warnIfCertExpiring notes an expired, not-yet-valid, or soon-to-expire cert at
+// init time, so the operator is not handed a "✓ TLS enabled" banner over a cert
+// clients will reject. Non-fatal: the daemon decides whether to serve (and #456
+// warns at startup); init must simply not present silent success. Neither
+// validateTLSPair (tls.LoadX509KeyPair) nor VerifyHostname inspects validity.
+func warnIfCertExpiring(certPath string) {
+	c := parseLeafCert(certPath)
+	if c == nil {
+		return
+	}
+	now := time.Now()
+	switch {
+	case now.After(c.NotAfter):
+		fmt.Printf("  ⚠  The TLS certificate expired on %s — clients will reject it.\n",
+			c.NotAfter.UTC().Format("2006-01-02"))
+	case now.Before(c.NotBefore):
+		fmt.Printf("  ⚠  The TLS certificate is not valid until %s.\n",
+			c.NotBefore.UTC().Format("2006-01-02"))
+	case c.NotAfter.Sub(now) < tlsutil.ExpiryWarnWindow:
+		fmt.Printf("  ⚠  The TLS certificate expires in %d day(s), on %s.\n",
+			tlsutil.DaysRemaining(c.NotAfter.Sub(now)), c.NotAfter.UTC().Format("2006-01-02"))
+	}
+}
+
+// warnIfCertNotLoopback notes when the certificate covers neither 127.0.0.1
+// nor localhost. This CLI skips verification on loopback, but the generated
+// tool configs point external MCP/REST clients at https://127.0.0.1 — and
+// those clients DO verify, so they would reject the connection.
+func warnIfCertNotLoopback(certPath string) {
+	c := parseLeafCert(certPath)
+	if c == nil {
+		return
+	}
+	if c.VerifyHostname("127.0.0.1") == nil || c.VerifyHostname("localhost") == nil {
+		return
+	}
+	fmt.Println("  ⚠  The certificate covers neither 127.0.0.1 nor localhost.")
+	fmt.Println("     Generated client configs use https://127.0.0.1 — clients that verify")
+	fmt.Println("     certificates will reject it. Reissue the cert with an IP SAN for")
+	fmt.Println("     127.0.0.1, or set MUNINN_MCP_URL to a URL the cert does cover.")
+}
+
+// promptTLS asks whether to serve TLS and, if so, collects and validates a
+// cert/key pair (one retry; "~/" is expanded). Returns ("","") when TLS is
+// declined or the pair can't be validated — always saying so, since the user
+// answered yes and would otherwise believe TLS is on.
+func promptTLS() (cert, key string) {
+	r := bufio.NewReader(os.Stdin)
+	fmt.Println()
+	fmt.Print("  Serve clients over TLS (https)? [y/N]: ")
+	ans, _ := r.ReadString('\n')
+	if a := strings.ToLower(strings.TrimSpace(ans)); a != "y" && a != "yes" {
+		return "", ""
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		fmt.Print("    TLS certificate path (PEM): ")
+		c, _ := r.ReadString('\n')
+		fmt.Print("    TLS private key path (PEM): ")
+		k, _ := r.ReadString('\n')
+		c, k = strings.TrimSpace(c), strings.TrimSpace(k)
+		if c == "" && k == "" {
+			break // fall through to the explicit not-enabled warning
+		}
+		c, k = normalizeTLSPath(c), normalizeTLSPath(k)
+		if err := validateTLSPair(c, k); err != nil {
+			fmt.Printf("    ⚠  %v\n", err)
+			continue
+		}
+		return c, k
+	}
+	fmt.Println("    ⚠  TLS not enabled — the server will use plaintext http.")
+	fmt.Println("       Configure later: muninn init --tls-cert <cert> --tls-key <key>")
+	return "", ""
+}
+
+// persistTLSEnv writes the TLS cert/key paths into muninn.env as active lines
+// so future restarts keep https. Both vars go in one atomic write — the pair
+// can never be persisted half, which would make every later daemon start fail
+// its exactly-one-of check. Best-effort: a failure leaves the current daemon's
+// TLS intact (it came from the inherited env), but is reported loudly because
+// it means TLS will not survive a restart. A no-op on empty input, so an empty
+// pair can never be written as active.
+func persistTLSEnv(cert, key string) {
+	if cert == "" || key == "" {
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		slog.Warn("init: could not resolve home for muninn.env TLS persistence", "error", err)
+		return
+	}
+	path := filepath.Join(home, envFileName)
+	err = upsertEnvFileVars(path, [][2]string{
+		{"MUNINN_TLS_CERT", cert},
+		{"MUNINN_TLS_KEY", key},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  ⚠  could not persist TLS settings to %s: %v\n", path, err)
+		fmt.Fprintln(os.Stderr, "     TLS will NOT survive a restart — add MUNINN_TLS_CERT and MUNINN_TLS_KEY there manually.")
+	}
+}
+
+func runInteractiveInit(tokenFlag *string, noToken *bool, noStart *bool, tlsCert, tlsKey string) {
 	printWelcomeBanner()
 
 	// Step 1: Tool detection + multi-select
@@ -157,11 +452,17 @@ func runInteractiveInit(mcpURL string, tokenFlag *string, noToken *bool, noStart
 	}
 	printBehaviorNote(behaviorMode, customInstructions)
 
+	// Step 4: TLS. Flags pre-fill (and skip) the prompt; otherwise ask. The env
+	// must be set here — before configuring tool URLs and before runStart, whose
+	// forked daemon inherits it.
+	tlsCertPath, tlsKeyPath := enableTLSFromFlagsOrPrompt(tlsCert, tlsKey)
+	tlsEnabled := tlsCertPath != ""
+
 	// Auto: generate token (no prompt)
 	var token string
 	if !*noToken {
-		if *tokenFlag != "" {
-			token = *tokenFlag
+		if override := configTokenOverride(*tokenFlag); override != "" {
+			token = override
 		} else {
 			dataDir := defaultDataDir()
 			var isNew bool
@@ -176,7 +477,8 @@ func runInteractiveInit(mcpURL string, tokenFlag *string, noToken *bool, noStart
 		}
 	}
 
-	// Configure selected tools
+	// Configure selected tools. Derive the URL now that TLS env (if any) is set.
+	mcpURL := clientMCPURL()
 	if len(selectedTools) > 0 {
 		fmt.Println()
 		toolErrs := configureNamedTools(selectedTools, mcpURL, token, behaviorMode)
@@ -197,6 +499,14 @@ func runInteractiveInit(mcpURL string, tokenFlag *string, noToken *bool, noStart
 		if err := runStart(true); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: daemon did not start cleanly: %v\n", err)
 		}
+		// runStart is a no-op on an already-running daemon — if that daemon's
+		// scheme doesn't match what we just configured, say so instead of
+		// printing a success summary for a TLS setup that isn't serving yet.
+		warnIfDaemonSchemeMismatch()
+		// Point our admin/UI base URLs at the daemon we just started (scheme + port
+		// from muninn.addrs) so the loopback login + plasticity calls below reach it
+		// under TLS or a non-default port instead of failing against http://:8475.
+		alignLocalAdminBasesToDaemon()
 		// Persist the behavior choice to the default vault now that the server is up.
 		// Retries once on failure; falls back to printing the manual command.
 		applyBehaviorToVault(behaviorMode, customInstructions)
@@ -215,6 +525,11 @@ func runInteractiveInit(mcpURL string, tokenFlag *string, noToken *bool, noStart
 		fmt.Printf("  ✓ Config template written to %s\n", filepath.Join(home, ".muninn", "muninn.env"))
 		fmt.Println("  Edit this file to configure MuninnDB without shell exports.")
 	}
+	// Persist TLS into muninn.env (active) so future restarts keep https. After
+	// writeEnvFile so the template exists with the user's embedder, not clobbered.
+	if tlsEnabled {
+		persistTLSEnv(tlsCertPath, tlsKeyPath)
+	}
 
 	// Success message
 	fmt.Println()
@@ -225,7 +540,13 @@ func runInteractiveInit(mcpURL string, tokenFlag *string, noToken *bool, noStart
 	fmt.Println("  Try it → open Claude Code or Cursor and ask:")
 	fmt.Println(`    "What do you remember about me?"`)
 	fmt.Println()
-	fmt.Println("  Browse memories → http://127.0.0.1:8476")
+	fmt.Printf("  Browse memories → %s\n", clientUIURL())
+	if tlsEnabled {
+		fmt.Printf("  MCP endpoint    → %s\n", mcpURL)
+		fmt.Println("  Remote clients  → set MUNINN_MCP_URL to this server's routable https URL before 'muninn init'")
+		fmt.Println("  Client trust    → MCP/REST clients verify this certificate; distribute your CA")
+		fmt.Println("                    file to them (curl: --cacert <ca.crt>; GUI tools: OS trust store)")
+	}
 	fmt.Println()
 	fmt.Println("  ────────────────────────────────────────────────────")
 	fmt.Println()
@@ -579,13 +900,37 @@ func printEmbedderNote(choice string) {
 	}
 }
 
-func runNonInteractiveInit(mcpURL, toolStr, tokenStr string, noToken, noStart, yes bool) {
+func runNonInteractiveInit(toolStr, tokenStr string, noToken, noStart, yes bool, tlsCert, tlsKey string) {
 	printWelcomeBanner()
+
+	// TLS must be decided before runStart — the forked daemon inherits the env.
+	// Normalize before validating so "~/cert.pem" / relative flag paths resolve
+	// instead of fatally failing (and so the persisted path is absolute).
+	if tlsCert != "" || tlsKey != "" {
+		tlsCert, tlsKey = normalizeTLSPath(tlsCert), normalizeTLSPath(tlsKey)
+	}
+	if err := validateTLSPair(tlsCert, tlsKey); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if tlsCert == "" {
+		// No flags: adopt a valid ambient env pair (shell or muninn.env) so it
+		// gets the same persistence and messaging as an explicit one.
+		tlsCert, tlsKey = ambientTLSPair()
+		tlsCert, tlsKey = normalizeTLSPath(tlsCert), normalizeTLSPath(tlsKey)
+	}
+	tlsEnabled := tlsCert != ""
+	if tlsEnabled {
+		os.Setenv("MUNINN_TLS_CERT", tlsCert)
+		os.Setenv("MUNINN_TLS_KEY", tlsKey)
+		warnIfCertNotLoopback(tlsCert)
+		warnIfCertExpiring(tlsCert)
+	}
 
 	var token string
 	if !noToken {
-		if tokenStr != "" {
-			token = tokenStr
+		if override := configTokenOverride(tokenStr); override != "" {
+			token = override
 		} else {
 			dataDir := defaultDataDir()
 			var err error
@@ -600,6 +945,9 @@ func runNonInteractiveInit(mcpURL, toolStr, tokenStr string, noToken, noStart, y
 		if err := runStart(true); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: daemon did not start cleanly: %v\n", err)
 		}
+		// runStart is a no-op on an already-running daemon — flag a scheme
+		// mismatch instead of printing a success summary it doesn't serve yet.
+		warnIfDaemonSchemeMismatch()
 		fmt.Println()
 	}
 
@@ -610,6 +958,7 @@ func runNonInteractiveInit(mcpURL, toolStr, tokenStr string, noToken, noStart, y
 		}
 	}
 
+	mcpURL := clientMCPURL()
 	if len(tools) > 0 {
 		fmt.Println("Configuring AI tools:")
 		toolErrs := configureNamedTools(tools, mcpURL, token, "")
@@ -632,14 +981,22 @@ func runNonInteractiveInit(mcpURL, toolStr, tokenStr string, noToken, noStart, y
 	if _, envErr := writeEnvFile("local", ""); envErr != nil {
 		slog.Warn("init: could not write muninn.env", "error", envErr)
 	}
+	if tlsEnabled {
+		persistTLSEnv(tlsCert, tlsKey)
+	}
 
 	fmt.Println()
 	fmt.Println("muninn is running.")
-	fmt.Println("  MCP endpoint:   http://127.0.0.1:8750/mcp")
+	fmt.Printf("  MCP endpoint:   %s\n", mcpURL)
 	if token != "" {
 		fmt.Println("  Token:          ~/.muninn/mcp.token")
 	}
-	fmt.Println("  Web UI:         http://127.0.0.1:8476")
+	fmt.Printf("  Web UI:         %s\n", clientUIURL())
+	if tlsEnabled {
+		fmt.Println("  Remote clients: set MUNINN_MCP_URL to this server's routable https URL before 'muninn init'")
+		fmt.Println("  Client trust:   MCP/REST clients verify this certificate; distribute your CA")
+		fmt.Println("                  file to them (curl: --cacert <ca.crt>; GUI tools: OS trust store)")
+	}
 	fmt.Println()
 }
 
@@ -799,6 +1156,62 @@ func printBehaviorNote(mode, customInstructions string) {
 	}
 }
 
+// warnIfDaemonSchemeMismatch tells the operator to restart when this run just
+// enabled TLS but the already-running daemon is still serving plaintext http.
+// runStart returns early on a live daemon, so enabling TLS on a running http
+// daemon (a flow promptTLS's own fallback hint recommends) would otherwise
+// print a success summary while the daemon keeps serving http.
+//
+// Only the https-wanted / http-served direction warrants a warning: the
+// reverse (a running https daemon we didn't reconfigure) is exactly what
+// clientScheme adopts from the sidecar, so the generated configs already match
+// the daemon — telling the operator to "restart" there would push them toward
+// the http the configs are NOT using.
+func warnIfDaemonSchemeMismatch() {
+	if tlsSchemeFromEnv() != "https" || !daemonRunning() {
+		return
+	}
+	addrs, err := readAddrsFile(defaultDataDir())
+	if err != nil {
+		return
+	}
+	have := addrs.Scheme
+	if have == "" {
+		have = "http"
+	}
+	if have != "https" {
+		fmt.Println()
+		fmt.Printf("  ⚠  The daemon is already running and serves %s, but TLS was just enabled.\n", have)
+		fmt.Println("     Restart it to serve https: muninn restart")
+	}
+}
+
+// alignLocalAdminBasesToDaemon points the package-level admin/UI base URLs at the
+// running daemon's actual scheme + port (from the muninn.addrs sidecar) so the
+// wizard's own loopback admin calls (loginAdmin, plasticity) reach a daemon it
+// just started with TLS or on a non-default port. Operator overrides
+// (MUNINNDB_ADMIN_URL / MUNINNDB_UI_URL) are respected and left untouched.
+func alignLocalAdminBasesToDaemon() {
+	addrs, err := readAddrsFile(defaultDataDir())
+	if err != nil {
+		return // sidecar unreadable — keep the compiled-in http defaults
+	}
+	scheme := addrs.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	if os.Getenv("MUNINNDB_ADMIN_URL") == "" {
+		if _, port, err := net.SplitHostPort(addrs.RestAddr); err == nil && port != "" {
+			vaultAdminBase = scheme + "://127.0.0.1:" + port
+		}
+	}
+	if os.Getenv("MUNINNDB_UI_URL") == "" {
+		if _, port, err := net.SplitHostPort(addrs.UIAddr); err == nil && port != "" {
+			vaultUIBase = scheme + "://127.0.0.1:" + port
+		}
+	}
+}
+
 // applyBehaviorToVault persists the chosen behavior mode to the default vault's
 // plasticity config via the admin API. Called after runStart so the server is up.
 //
@@ -817,6 +1230,16 @@ func applyBehaviorToVault(mode, customInstructions string) {
 
 		plasticityURL := fmt.Sprintf("%s/api/admin/vault/default/plasticity", vaultAdminBase)
 		client := &http.Client{Timeout: 5 * time.Second}
+		// ToLower: the scheme is case-insensitive; keep this consistent with
+		// isLoopbackURL (which lowercases via url.Parse).
+		if strings.HasPrefix(strings.ToLower(plasticityURL), "https://") && isLoopbackURL(plasticityURL) {
+			// Loopback https: skip cert verification — the connection never leaves
+			// this machine. Off-host stays verified. Unifies to httpClientForURL
+			// once #468 lands.
+			client.Transport = &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+			}
+		}
 
 		// GET current config so we merge rather than overwrite.
 		getReq, err := http.NewRequest("GET", plasticityURL, nil)

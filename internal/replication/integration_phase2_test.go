@@ -264,6 +264,99 @@ func TestP2Integration_SnapshotJoin(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Test 1b: Wire order -- JoinResponse must precede any ReplEntry on the wire
+// ---------------------------------------------------------------------------
+
+// TestP2Integration_JoinResponseBeforeReplEntry is an end-to-end check of the
+// wire-ordering invariant the deferred-callback fix protects: on a real
+// connection the TypeJoinResponse frame must reach the lobe before any
+// TypeReplEntry frame from the streamer. If FireOnLobeJoined fired inline inside
+// HandleJoinRequest, the streamer's first ReplEntry could overtake the
+// JoinResponse and corrupt the lobe-side handshake parser (#409 follow-up).
+//
+// Scope note: this test observes the wire only, so it cannot *deterministically*
+// fail a hypothetical inline-fire regression — there the streamer goroutine and
+// the coordinator's JoinResponse send would race for PeerConn's send mutex, and
+// the test would catch the bug only on schedules where ReplEntry wins. The
+// deterministic guard against reintroducing the inline fire is the unit test
+// TestJoinHandler_HandleJoinRequest_DoesNotFireCallback, which asserts the
+// callback is not invoked inside HandleJoinRequest at all. This test complements
+// it by proving the assembled coordinator path (HandleIncomingJoin +
+// NetworkStreamer) actually puts JoinResponse on the wire first, with a real
+// streamer producing ReplEntry frames behind it.
+func TestP2Integration_JoinResponseBeforeReplEntry(t *testing.T) {
+	cortex := newTestNode(t, "cortex-wo", "primary")
+	if err := cortex.epochStore.ForceSet(4); err != nil {
+		t.Fatalf("ForceSet: %v", err)
+	}
+	// Pre-populate the replication log so the streamer has entries to drain and
+	// send the instant it starts (NetworkStreamer.Stream drains from seq 0).
+	appendEntries(t, cortex, "wo", 20)
+
+	// Cancel streamers/conns on teardown to avoid a leaked streamer goroutine.
+	t.Cleanup(func() { _ = cortex.coord.Stop() })
+
+	// net.Pipe stands in for the inbound lobe connection.
+	cortexConn, lobeConn := net.Pipe()
+	t.Cleanup(func() { cortexConn.Close(); lobeConn.Close() })
+
+	// Lobe side: record the type of every frame in arrival order until the first
+	// ReplEntry is seen (or the pipe closes).
+	orderCh := make(chan []uint8, 1)
+	go func() {
+		var order []uint8
+		for {
+			frame, err := mbp.ReadFrame(lobeConn)
+			if err != nil {
+				break
+			}
+			order = append(order, frame.Type)
+			if frame.Type == mbp.TypeReplEntry {
+				break // enough to assert ordering
+			}
+		}
+		orderCh <- order
+	}()
+
+	req := mbp.JoinRequest{
+		NodeID:          "lobe-wo",
+		Addr:            "127.0.0.1:9700",
+		ProtocolVersion: mbp.CurrentProtocolVersion,
+	}
+	payload, err := msgpack.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal JoinRequest: %v", err)
+	}
+
+	if _, err := cortex.coord.HandleIncomingJoin(cortexConn, payload); err != nil {
+		t.Fatalf("HandleIncomingJoin: %v", err)
+	}
+
+	var order []uint8
+	select {
+	case order = <-orderCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for frames on lobe side")
+	}
+
+	if len(order) == 0 {
+		t.Fatal("no frames received on lobe side")
+	}
+	// The very first frame on the wire must be the JoinResponse.
+	if order[0] != mbp.TypeJoinResponse {
+		t.Fatalf("first frame = 0x%02x, want TypeJoinResponse 0x%02x", order[0], mbp.TypeJoinResponse)
+	}
+	// The reader loop stops at the first ReplEntry, so the last recorded frame
+	// must be one. Asserting it confirms the streamer actually ran and produced
+	// a ReplEntry *after* the JoinResponse — otherwise the test could pass
+	// trivially against a coordinator that never starts the streamer at all.
+	if order[len(order)-1] != mbp.TypeReplEntry {
+		t.Fatalf("expected a TypeReplEntry to follow JoinResponse, got frame sequence %v", order)
+	}
+	t.Logf("wire order ok: %d frames, first=JoinResponse, ReplEntry seen after", len(order))
+}
+
+// ---------------------------------------------------------------------------
 // Test 2: Cognitive Forwarding -- Lobe side effects reach Cortex HebbianWorker
 // ---------------------------------------------------------------------------
 

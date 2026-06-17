@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/scrypster/muninndb/internal/config"
+	"github.com/scrypster/muninndb/internal/tlsutil"
 )
 
 // ClusterTLS manages TLS certificates for inter-node communication.
@@ -89,6 +91,12 @@ func (ct *ClusterTLS) Bootstrap(nodeID, dataDir string) error {
 		if err != nil {
 			return fmt.Errorf("cluster-tls: load node cert: %w", err)
 		}
+		if leaf, perr := x509.ParseCertificate(cert.Certificate[0]); perr == nil {
+			tlsutil.CheckCertExpiry(slog.Default(), leaf, "cluster-node")
+		} else {
+			slog.Warn("cluster-tls: failed to parse node cert leaf for expiry check",
+				"cert", certFile, "err", perr)
+		}
 		ct.mu.Lock()
 		ct.nodeCert = &cert
 		ct.mu.Unlock()
@@ -121,12 +129,12 @@ func (ct *ClusterTLS) bootstrapCA(certPath, keyPath string) error {
 	}
 
 	template := &x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "muninndb-cluster-ca"},
-		NotBefore:    time.Now().Add(-1 * time.Minute),
-		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years
-		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		IsCA:         true,
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "muninndb-cluster-ca"},
+		NotBefore:             time.Now().Add(-1 * time.Minute),
+		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		IsCA:                  true,
 		BasicConstraintsValid: true,
 		MaxPathLen:            1,
 	}
@@ -260,6 +268,8 @@ func (ct *ClusterTLS) generateNodeCert(nodeID, certPath, keyPath string) error {
 	ct.mu.Lock()
 	ct.nodeCert = &tlsCert
 	ct.mu.Unlock()
+
+	tlsutil.CheckCertExpiry(slog.Default(), template, "cluster-node-generated")
 	return nil
 }
 

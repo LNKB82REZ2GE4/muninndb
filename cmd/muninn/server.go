@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -42,6 +43,7 @@ import (
 	"github.com/scrypster/muninndb/internal/replication"
 	"github.com/scrypster/muninndb/internal/storage"
 	"github.com/scrypster/muninndb/internal/storage/migrate"
+	"github.com/scrypster/muninndb/internal/tlsutil"
 	grpcpkg "github.com/scrypster/muninndb/internal/transport/grpc"
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 	"github.com/scrypster/muninndb/internal/transport/rest"
@@ -51,6 +53,7 @@ import (
 )
 
 const defaultMCPPort = "8750"
+const defaultRESTPort = "8475"
 const defaultOpenAIEmbedProviderURL = "openai://text-embedding-3-small"
 
 const vaultUpgradeWarning = `
@@ -425,7 +428,7 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 		case "local":
 			if os.Getenv(localEmbed) != "0" && embedpkg.LocalAvailable() {
 				slog.Info("initializing bundled local ONNX embedder from saved config", "data_dir", dataDir)
-				if svc := tryEmbedService("local://all-MiniLM-L6-v2", plugin.PluginConfig{DataDir: dataDir}); svc != nil {
+				if svc := tryEmbedService("local://bge-small-en-v1.5", plugin.PluginConfig{DataDir: dataDir}); svc != nil {
 					return embedpkg.NewEmbedServiceAdapter(svc), svc, nil
 				}
 				slog.Warn("bundled local embedder init failed (saved config), falling back")
@@ -492,7 +495,7 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 	// "none" as their provider.
 	if cfg.EmbedProvider != "none" && os.Getenv(localEmbed) != "0" && embedpkg.LocalAvailable() {
 		slog.Info("initializing bundled local ONNX embedder", "data_dir", dataDir)
-		if svc := tryEmbedService("local://all-MiniLM-L6-v2", plugin.PluginConfig{DataDir: dataDir}); svc != nil {
+		if svc := tryEmbedService("local://bge-small-en-v1.5", plugin.PluginConfig{DataDir: dataDir}); svc != nil {
 			return embedpkg.NewEmbedServiceAdapter(svc), svc, nil
 		}
 		slog.Warn("bundled local embedder init failed, falling back to noop")
@@ -520,12 +523,24 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 // Returns nil without error if MUNINN_ENRICH_URL is not set — LLM enrichment
 // is optional. Logs a warning on init failure so the server starts without
 // enrichment rather than refusing to start.
+// enrichInitFailure carries the details of an enrich plugin that was configured
+// but failed to initialize. It is recorded in the plugin registry so the status
+// endpoint (and the UI) can surface the real error instead of collapsing the
+// case to "Not configured" (issue #453).
+type enrichInitFailure struct {
+	name string // plugin name (e.g. "enrich-google"); falls back to "enrich" if unknown
+	err  error  // the init/parse error
+}
+
 // buildEnricher constructs an EnrichService. Priority:
 //  1. MUNINN_ENRICH_URL env var
 //  2. Saved plugin_config.json (cfg parameter)
 //
-// Returns nil (no error) if neither is set — LLM enrichment is optional.
-func buildEnricher(ctx context.Context, cfg plugincfg.PluginConfig) plugin.EnrichPlugin {
+// Returns (nil, nil) if neither is set — LLM enrichment is optional. If an
+// enrich URL is configured but the provider fails to parse or initialize,
+// returns (nil, *enrichInitFailure) so the caller can record the failure in
+// the plugin registry; LLM enrichment stays disabled either way.
+func buildEnricher(ctx context.Context, cfg plugincfg.PluginConfig) (plugin.EnrichPlugin, *enrichInitFailure) {
 	enrichURL := os.Getenv("MUNINN_ENRICH_URL")
 
 	// Fall back to saved config if env var is not set.
@@ -535,7 +550,7 @@ func buildEnricher(ctx context.Context, cfg plugincfg.PluginConfig) plugin.Enric
 
 	if enrichURL == "" {
 		slog.Info("no enrich plugin configured, LLM enrichment disabled")
-		return nil
+		return nil, nil
 	}
 
 	enrichURL = injectOpenAIBaseURL(enrichURL, strings.TrimSpace(os.Getenv("MUNINN_OPENAI_URL")))
@@ -543,7 +558,7 @@ func buildEnricher(ctx context.Context, cfg plugincfg.PluginConfig) plugin.Enric
 	svc, err := enrichpkg.NewEnrichService(enrichURL)
 	if err != nil {
 		slog.Warn("enrich plugin URL parse failed, LLM enrichment disabled", "err", err)
-		return nil
+		return nil, &enrichInitFailure{name: enrichFailureName(enrichURL), err: err}
 	}
 
 	// MUNINN_ANTHROPIC_KEY is an alias for MUNINN_ENRICH_API_KEY when using Anthropic.
@@ -559,11 +574,22 @@ func buildEnricher(ctx context.Context, cfg plugincfg.PluginConfig) plugin.Enric
 	}
 	if err := svc.Init(ctx, plugin.PluginConfig{APIKey: apiKey}); err != nil {
 		slog.Warn("enrich plugin init failed (LLM provider may be down), LLM enrichment disabled", "err", err)
-		return nil
+		return nil, &enrichInitFailure{name: svc.Name(), err: err}
 	}
 
 	slog.Info("enrich plugin initialized", "url", enrichURL)
-	return svc
+	return svc, nil
+}
+
+// enrichFailureName derives a stable plugin name from an enrich URL for the
+// case where the service could not be constructed (so svc.Name() is unavailable).
+// Mirrors the "enrich-<scheme>" naming used by the enrich providers; falls back
+// to "enrich" when the scheme cannot be parsed.
+func enrichFailureName(enrichURL string) string {
+	if provCfg, err := plugin.ParseProviderURL(enrichURL); err == nil && provCfg.Scheme != "" {
+		return "enrich-" + string(provCfg.Scheme)
+	}
+	return "enrich"
 }
 
 // parseCORSOrigins splits a comma-separated MUNINN_CORS_ORIGINS env var into a slice.
@@ -719,6 +745,30 @@ func parseListenHost(args []string, envVal string) string {
 	return host
 }
 
+// isLoopbackHost reports whether binding to host keeps the server reachable
+// only from the local machine. An empty host means Go binds all interfaces
+// (":port"), so it is treated as non-loopback. A non-IP hostname other than
+// "localhost" is treated as non-loopback since it can resolve anywhere.
+func isLoopbackHost(host string) bool {
+	switch host {
+	case "":
+		return false
+	case "localhost":
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// shouldWarnDefaultPasswordExposure reports whether the server is reachable
+// off-host while the admin still has the default password — the combination
+// that warrants a prominent security warning at startup.
+func shouldWarnDefaultPasswordExposure(listenHost string, defaultPasswordInUse bool) bool {
+	return defaultPasswordInUse && !isLoopbackHost(listenHost)
+}
+
 func runServer() {
 	loadEnvFile()
 
@@ -784,14 +834,6 @@ func runServer() {
 	}
 	flag.Parse()
 
-	// Persist actual bound addresses so 'muninn status' and the startup health poll
-	// can probe the correct ports when non-default --*-addr flags are used.
-	_ = writeAddrsFile(*dataDir, daemonAddrs{
-		RestAddr: *restAddr,
-		MCPAddr:  *mcpAddr,
-		UIAddr:   *uiAddr,
-	})
-
 	// MCP token resolution order (highest to lowest priority):
 	//   1. --mcp-token flag  — explicit override for tests / container entrypoints
 	//   2. MUNINN_MCP_TOKEN env var — preferred for Docker / docker-compose deployments
@@ -810,6 +852,20 @@ func runServer() {
 	if *tlsKey == "" {
 		*tlsKey = os.Getenv("MUNINN_TLS_KEY")
 	}
+
+	// Persist actual bound addresses + scheme so 'muninn status' and the startup
+	// health poll can probe the correct ports and scheme when non-default
+	// --*-addr flags or TLS are in use. Written after the TLS env fallbacks so
+	// Scheme reflects both --tls-cert flags and MUNINN_TLS_CERT/_KEY env vars.
+	_ = writeAddrsFile(*dataDir, daemonAddrs{
+		Scheme:   schemeFor(*tlsCert, *tlsKey),
+		RestAddr: *restAddr,
+		MCPAddr:  *mcpAddr,
+		UIAddr:   *uiAddr,
+		// Best-effort parse of the cert's routable DNS SAN for the Web UI URL.
+		// "" on any error; the authoritative cert load + validation is below.
+		CertHost: certRoutableHost(*tlsCert, *tlsKey),
+	})
 
 	// Backup env fallbacks — flags take priority; env vars are the fallback.
 	if *backupInterval == "" {
@@ -855,11 +911,24 @@ func runServer() {
 			slog.Error("tls: failed to load certificate", "cert", *tlsCert, "err", err)
 			os.Exit(1)
 		}
+
+		logAttrs := []any{"cert", *tlsCert}
+		if leaf, perr := x509.ParseCertificate(cert.Certificate[0]); perr == nil {
+			remaining := tlsutil.CheckCertExpiry(slog.Default(), leaf, "client-facing")
+			logAttrs = append(logAttrs,
+				"subject", leaf.Subject.CommonName,
+				"not_after", leaf.NotAfter.UTC().Format(time.RFC3339),
+				"days_remaining", tlsutil.DaysRemaining(remaining))
+		} else {
+			slog.Warn("tls: failed to parse certificate leaf for expiry check",
+				"cert", *tlsCert, "err", perr)
+		}
+
 		clientTLS = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		}
-		slog.Info("tls: client-facing TLS enabled", "cert", *tlsCert)
+		slog.Info("tls: client-facing TLS enabled", logAttrs...)
 	}
 
 	// Validate address flags early so misconfigurations are caught before any
@@ -985,6 +1054,24 @@ func runServer() {
 		os.Exit(1)
 	}
 
+	// Loud warning when the server is reachable off-host while the admin still
+	// has the default password — an open-server posture. We warn rather than
+	// refuse so the zero-config quickstart and the shipped docker-compose keep
+	// working; the message tells the operator exactly how to close the gap.
+	if shouldWarnDefaultPasswordExposure(listenHost, authStore.ValidateAdmin("root", "password") == nil) {
+		slog.Warn("SECURITY: bound to a non-loopback address with the default admin password still set",
+			"listen_host", listenHost)
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "  ⚠  SECURITY WARNING")
+		fmt.Fprintf(os.Stderr, "     muninn is listening on %s (reachable from other hosts) while the\n", listenHost)
+		fmt.Fprintln(os.Stderr, "     admin account still uses the default password 'password'.")
+		fmt.Fprintln(os.Stderr, "     Anyone who can reach this host can take over the server.")
+		fmt.Fprintln(os.Stderr, "     Fix now: log in to the Web UI and change the password, or set")
+		fmt.Fprintln(os.Stderr, "     MUNINN_ADMIN_PASSWORD before starting. Bind to 127.0.0.1 if you")
+		fmt.Fprintln(os.Stderr, "     only need local access.")
+		fmt.Fprintln(os.Stderr, "")
+	}
+
 	// Open MOL (Write-Ahead Log)
 	walPath := filepath.Join(*dataDir, "wal")
 	mol, err := wal.Open(walPath)
@@ -1068,7 +1155,7 @@ func runServer() {
 
 	// Build enrich plugin (optional): env vars → saved config.
 	enrichCtx, enrichCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	enrichPlugin := buildEnricher(enrichCtx, savedPluginCfg)
+	enrichPlugin, enrichInitErr := buildEnricher(enrichCtx, savedPluginCfg)
 	enrichCancel()
 
 	// Build HNSW registry (multi-vault, lazy-loading)
@@ -1188,6 +1275,12 @@ func runServer() {
 		if err := pluginRegistry.Register(embedPlugin); err != nil {
 			slog.Warn("failed to register embed plugin in registry", "err", err)
 		}
+	}
+	// Surface a configured-but-failed enrich plugin in the registry so the status
+	// endpoint reports the init error instead of the plugin being silently absent
+	// (which the UI reads as "Not configured"). See issue #453.
+	if enrichInitErr != nil {
+		pluginRegistry.RegisterFailed(enrichInitErr.name, plugin.TierEnrich, enrichInitErr.err)
 	}
 	if enrichPlugin != nil {
 		if err := pluginRegistry.Register(enrichPlugin); err != nil {

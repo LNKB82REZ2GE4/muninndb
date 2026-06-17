@@ -61,14 +61,14 @@ type WriteResult struct {
 type Memory struct {
 	ID          string    `json:"id"`
 	Concept     string    `json:"concept"`
-	Content     string    `json:"content"` // recall: summary or 500-char preview; read: full content
+	Content     string    `json:"content"` // recall: real content (truncated); read: full content
 	Summary     string    `json:"summary,omitempty"`
 	Score       float64   `json:"score,omitempty"`
 	VectorScore float64   `json:"vector_score,omitempty"`
 	Confidence  float32   `json:"confidence"`
 	Why         string    `json:"why,omitempty"`
 	Tags        []string  `json:"tags,omitempty"`
-	State       string    `json:"state"`
+	State       string    `json:"state,omitempty"`
 	CreatedAt   time.Time `json:"created_at"`
 	LastAccess  time.Time `json:"last_access"`
 	AccessCount uint32    `json:"access_count,omitempty"`
@@ -279,15 +279,15 @@ type ApplyEnrichmentRelationship struct {
 
 // ApplyEnrichmentRequest contains explicit enrichment output from an MCP agent.
 type ApplyEnrichmentRequest struct {
-	ID               string                      `json:"id"`
-	ExpectedUpdatedAt string                     `json:"expected_updated_at"`
-	Summary          string                      `json:"summary,omitempty"`
-	MemoryType       string                      `json:"memory_type,omitempty"`
-	TypeLabel        string                      `json:"type_label,omitempty"`
-	Entities         []ApplyEnrichmentEntity     `json:"entities,omitempty"`
-	Relationships    []ApplyEnrichmentRelationship `json:"relationships,omitempty"`
-	StagesCompleted  []string                    `json:"stages_completed,omitempty"`
-	Source           string                      `json:"source,omitempty"`
+	ID                string                        `json:"id"`
+	ExpectedUpdatedAt string                        `json:"expected_updated_at"`
+	Summary           string                        `json:"summary,omitempty"`
+	MemoryType        string                        `json:"memory_type,omitempty"`
+	TypeLabel         string                        `json:"type_label,omitempty"`
+	Entities          []ApplyEnrichmentEntity       `json:"entities,omitempty"`
+	Relationships     []ApplyEnrichmentRelationship `json:"relationships,omitempty"`
+	StagesCompleted   []string                      `json:"stages_completed,omitempty"`
+	Source            string                        `json:"source,omitempty"`
 }
 
 // ApplyEnrichmentResult is returned by muninn_apply_enrichment.
@@ -437,8 +437,8 @@ type EntityAggregate struct {
 	Confidence    float32               `json:"confidence"`
 	State         string                `json:"state"`
 	MentionCount  int32                 `json:"mention_count"`
-	FirstSeen     string                `json:"first_seen,omitempty"`  // RFC3339
-	UpdatedAt     string                `json:"updated_at,omitempty"`  // RFC3339
+	FirstSeen     string                `json:"first_seen,omitempty"` // RFC3339
+	UpdatedAt     string                `json:"updated_at,omitempty"` // RFC3339
 	MergedInto    string                `json:"merged_into,omitempty"`
 	Engrams       []EntityEngramSummary `json:"engrams"`
 	Relationships []EntityRelSummary    `json:"relationships"`

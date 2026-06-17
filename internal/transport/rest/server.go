@@ -69,6 +69,15 @@ func (r *statusRecorder) Flush() {
 	}
 }
 
+// Unwrap exposes the underlying http.ResponseWriter so that
+// http.NewResponseController can reach the network connection. Without this,
+// the SetWriteDeadline call in handleSubscribe (which clears the REST server's
+// 15s WriteTimeout for long-lived SSE streams) silently fails and SSE
+// connections on the REST port are killed after 15 seconds. See issue #437.
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
 // Server is an HTTP REST server for the MuninnDB engine.
 type Server struct {
 	addr          string
@@ -1390,6 +1399,11 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	s.sendJSON(w, http.StatusOK, resp)
 }
 
+// maxTimezoneNameLen bounds the accepted length of the tz query parameter.
+// IANA timezone names are well under this; the cap keeps untrusted input from
+// reaching time.LoadLocation with an unreasonably long string.
+const maxTimezoneNameLen = 64
+
 func (s *Server) handleGetActivityCounts(w http.ResponseWriter, r *http.Request) {
 	vault := ctxVault(r)
 
@@ -1409,7 +1423,19 @@ func (s *Server) handleGetActivityCounts(w http.ResponseWriter, r *http.Request)
 		days = d
 	}
 
-	// Validate until parameter — reject malformed input, normalize to UTC end-of-day.
+	// Resolve the timezone used for day bucketing. Clients send their IANA
+	// name (e.g. "America/Los_Angeles") so the chart groups activity by the
+	// viewer's local calendar day. A missing, overlong, or unrecognized value
+	// falls back to UTC rather than erroring, so a bad client value can never
+	// break the chart and the default behavior is unchanged.
+	loc := time.UTC
+	if tzStr := r.URL.Query().Get("tz"); tzStr != "" && len(tzStr) <= maxTimezoneNameLen {
+		if l, err := time.LoadLocation(tzStr); err == nil {
+			loc = l
+		}
+	}
+
+	// Validate until parameter — reject malformed input, normalize to end-of-day in loc.
 	untilStr := r.URL.Query().Get("until")
 	var until time.Time
 	if untilStr != "" {
@@ -1418,16 +1444,16 @@ func (s *Server) handleGetActivityCounts(w http.ResponseWriter, r *http.Request)
 			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid 'until' parameter: expected YYYY-MM-DD format")
 			return
 		}
-		// End of that UTC day (ms-precision to match ULID granularity).
-		until = time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 999000000, time.UTC)
+		// End of that day in loc (ms-precision to match ULID granularity).
+		until = time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 999000000, loc)
 	} else {
-		// Default: end of today in UTC.
-		now := time.Now().UTC()
-		until = time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 999000000, time.UTC)
+		// Default: end of today in loc.
+		now := time.Now().In(loc)
+		until = time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 999000000, loc)
 	}
 
-	// since = start of the first day in the window (UTC 00:00:00.000).
-	since := time.Date(until.Year(), until.Month(), until.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, -(days - 1))
+	// since = start of the first day in the window (00:00:00.000 in loc).
+	since := time.Date(until.Year(), until.Month(), until.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, -(days - 1))
 
 	resp, err := s.engine.GetActivityCounts(r.Context(), &ActivityCountsRequest{Vault: vault, Since: since, Until: until})
 	if err != nil {
@@ -1759,6 +1785,7 @@ func (s *Server) handleGuide(w http.ResponseWriter, r *http.Request) {
 //	context   — (repeatable) subscription context strings for semantic matching
 //	threshold — float32 score threshold, default 0.5
 //	on_write  — "true"|"1" to receive a push on every qualifying write
+//	            (alias: "push_on_write", which is what the SDKs send)
 //	ttl       — subscription TTL in seconds, 0 = no expiry
 //	rate      — max pushes/sec, default 10
 func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
@@ -1796,7 +1823,14 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	} else if rateLimit > 1000 {
 		rateLimit = 1000
 	}
-	pushOnWrite := q.Get("on_write") == "true" || q.Get("on_write") == "1"
+	// Accept both "on_write" (original server param) and "push_on_write" (the name
+	// all three SDKs — Python, Node, Swift — actually send). Accepting both keeps
+	// existing SDK clients working without a breaking rename. See issue #437.
+	pushOnWriteParam := func(name string) bool {
+		v := q.Get(name)
+		return v == "true" || v == "1"
+	}
+	pushOnWrite := pushOnWriteParam("on_write") || pushOnWriteParam("push_on_write")
 
 	// Set SSE headers before any write to the body.
 	w.Header().Set("Content-Type", "text/event-stream")
