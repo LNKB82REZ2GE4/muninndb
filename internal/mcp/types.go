@@ -282,8 +282,10 @@ type ApplyEnrichmentRequest struct {
 	ID                string                        `json:"id"`
 	ExpectedUpdatedAt string                        `json:"expected_updated_at"`
 	Summary           string                        `json:"summary,omitempty"`
+	KeyPoints         []string                      `json:"key_points,omitempty"`
 	MemoryType        string                        `json:"memory_type,omitempty"`
 	TypeLabel         string                        `json:"type_label,omitempty"`
+	Classification    string                        `json:"classification,omitempty"`
 	Entities          []ApplyEnrichmentEntity       `json:"entities,omitempty"`
 	Relationships     []ApplyEnrichmentRelationship `json:"relationships,omitempty"`
 	StagesCompleted   []string                      `json:"stages_completed,omitempty"`

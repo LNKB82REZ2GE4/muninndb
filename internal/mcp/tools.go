@@ -464,8 +464,10 @@ func allToolDefinitions() []ToolDefinition {
 					"id":                  map[string]any{"type": "string", "description": "ID of the memory to update."},
 					"expected_updated_at": map[string]any{"type": "string", "description": "RFC3339Nano timestamp from the candidate response. Prevents stale overwrites."},
 					"summary":             map[string]any{"type": "string", "description": "Optional generated summary."},
+					"key_points":           map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional semantic key points (self-contained facts/decisions)."},
 					"memory_type":         map[string]any{"type": "string", "description": "Optional generated memory type."},
 					"type_label":          map[string]any{"type": "string", "description": "Optional generated free-form type label."},
+					"classification":      map[string]any{"type": "string", "description": "Optional topic taxonomy as 'category/subcategory' (e.g. 'machine_learning/model_configuration')."},
 					"entities": map[string]any{
 						"type":        "array",
 						"description": "Optional extracted entities to persist.",

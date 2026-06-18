@@ -1604,8 +1604,16 @@ func (s *MCPServer) handleApplyEnrichment(ctx context.Context, w http.ResponseWr
 		Summary:           stringArg(args, "summary"),
 		MemoryType:        stringArg(args, "memory_type"),
 		TypeLabel:         stringArg(args, "type_label"),
+		Classification:    stringArg(args, "classification"),
 		StagesCompleted:   stages,
 		Source:            stringArg(args, "source"),
+	}
+	if kpAny, ok := args["key_points"].([]any); ok {
+		for _, raw := range kpAny {
+			if s, ok := raw.(string); ok && strings.TrimSpace(s) != "" {
+				req.KeyPoints = append(req.KeyPoints, strings.TrimSpace(s))
+			}
+		}
 	}
 	if entitiesAny, ok := args["entities"].([]any); ok {
 		req.Entities = make([]ApplyEnrichmentEntity, 0, len(entitiesAny))

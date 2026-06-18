@@ -65,8 +65,10 @@ type EnrichmentApplyRequest struct {
 	ID                string
 	ExpectedUpdatedAt time.Time
 	Summary           string
+	KeyPoints         []string
 	MemoryType        string
 	TypeLabel         string
+	Classification    string // "category/subcategory" topic taxonomy
 	Entities          []EnrichmentApplyEntity
 	Relationships     []EnrichmentApplyRelationship
 	StagesCompleted   []string
@@ -480,7 +482,7 @@ func (e *Engine) ApplyEnrichment(ctx context.Context, vault string, req *Enrichm
 	if req.Summary != "" {
 		completedSet["summary"] = true
 	}
-	if req.MemoryType != "" || req.TypeLabel != "" {
+	if req.MemoryType != "" || req.TypeLabel != "" || req.Classification != "" {
 		completedSet["classification"] = true
 	}
 	if len(req.Entities) > 0 {
@@ -495,7 +497,7 @@ func (e *Engine) ApplyEnrichment(ctx context.Context, vault string, req *Enrichm
 	}
 
 	if req.Summary != "" || req.MemoryType != "" || req.TypeLabel != "" {
-		if err := e.store.UpdateDigest(ctx, id, req.Summary, nil, req.MemoryType, req.TypeLabel); err != nil {
+		if err := e.store.UpdateDigest(ctx, id, req.Summary, req.KeyPoints, req.MemoryType, req.TypeLabel); err != nil {
 			return nil, fmt.Errorf("apply enrichment: update digest: %w", err)
 		}
 	}

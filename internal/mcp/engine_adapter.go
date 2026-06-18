@@ -478,8 +478,10 @@ func (a *mcpEngineAdapter) ApplyEnrichment(ctx context.Context, vault string, re
 		ID:                req.ID,
 		ExpectedUpdatedAt: expectedUpdatedAt,
 		Summary:           req.Summary,
+		KeyPoints:         req.KeyPoints,
 		MemoryType:        req.MemoryType,
 		TypeLabel:         req.TypeLabel,
+		Classification:    req.Classification,
 		StagesCompleted:   req.StagesCompleted,
 		Source:            req.Source,
 	}
