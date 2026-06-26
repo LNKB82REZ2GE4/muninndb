@@ -529,11 +529,19 @@ func Hash(s string) uint32 {
 	return h
 }
 
+// NormalizeEntityName returns the canonical identity form of an entity name:
+// NFKC-normalized, lowercased, and trimmed. This is the single source of truth
+// for entity identity. EntityNameHash hashes it for the 0x1F record key, and any
+// caller that deduplicates entity names (e.g. ScanVaultEntityNames) must key on it
+// so that case/whitespace/NFKC variants collapse onto the one record they share.
+func NormalizeEntityName(name string) string {
+	return strings.ToLower(strings.TrimSpace(norm.NFKC.String(name)))
+}
+
 // EntityNameHash computes the 8-byte SipHash of a NFKC-normalized, lowercased,
 // trimmed entity name. Used for the 0x1F entity key and 0x20 link key.
 func EntityNameHash(name string) [8]byte {
-	normalized := strings.ToLower(strings.TrimSpace(norm.NFKC.String(name)))
-	hashVal := siphash.Hash(sipKey0, sipKey1, []byte(normalized))
+	hashVal := siphash.Hash(sipKey0, sipKey1, []byte(NormalizeEntityName(name)))
 	var h [8]byte
 	binary.BigEndian.PutUint64(h[:], hashVal)
 	return h
