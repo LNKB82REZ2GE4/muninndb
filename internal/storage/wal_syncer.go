@@ -60,6 +60,7 @@ type walSyncer struct {
 	stopped      atomic.Bool   // set true before signalling the goroutine to stop
 	lastWALBytes atomic.Uint64 // WAL bytes written at the last sync; used to detect idle
 	syncCount    atomic.Int64  // total doSync() calls; exposed for tests
+	onSync       func()        // optional hook called after each doSync(); nil in production, used by tests
 }
 
 func newWALSyncer(db *pebble.DB) *walSyncer {
@@ -135,6 +136,9 @@ func (s *walSyncer) doSync() {
 			return // expected during shutdown
 		}
 		slog.Error("storage: WAL sync failed", "component", "wal_syncer", "err", err)
+	}
+	if s.onSync != nil {
+		s.onSync()
 	}
 }
 

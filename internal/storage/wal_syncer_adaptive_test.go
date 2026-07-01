@@ -167,10 +167,19 @@ func TestWALSyncer_FinalSyncOnClose(t *testing.T) {
 
 // TestWALSyncer_SyncCountAccurate verifies that syncCount accurately reflects
 // the number of times doSync was called across a sequence of write/idle cycles.
+//
+// Uses the onSync hook to receive an immediate channel notification when doSync
+// fires, avoiding reliance on wall-clock polling. Under the -race flag with
+// parallel crash-recovery tests on a loaded CI runner, the syncer goroutine can
+// be starved for seconds, making a fixed-deadline poll unreliable.
 func TestWALSyncer_SyncCountAccurate(t *testing.T) {
 	db := openTestPebble(t)
 	s := newWALSyncer(db)
 	defer s.Close()
+
+	// syncFired is buffered so the hook never blocks the syncer goroutine.
+	syncFired := make(chan struct{}, 16)
+	s.onSync = func() { syncFired <- struct{}{} }
 
 	for cycle := range 3 {
 		// Write a key to trigger a sync.
@@ -178,29 +187,30 @@ func TestWALSyncer_SyncCountAccurate(t *testing.T) {
 		if err := db.Set(key, key, pebble.NoSync); err != nil {
 			t.Fatalf("cycle %d write: %v", cycle, err)
 		}
-		// Wait for the sync to fire. The deadline is a generous fixed wall-clock
-		// bound (not a small multiple of walSyncInterval): time.Ticker guarantees
-		// a *minimum* tick interval, not a maximum, so on a contended CI runner
-		// the syncer goroutine can be starved well past a few intervals. A tight
-		// 10×interval (100ms) deadline made this flake ("cycle 2: got 2"); 2s
-		// gives a heavily loaded runner ample room while a healthy run still
-		// passes in a couple of intervals.
-		deadline := time.Now().Add(2 * time.Second)
-		want := int64(cycle + 1)
-		for time.Now().Before(deadline) {
-			if s.syncCount.Load() >= want {
-				break
-			}
-			time.Sleep(walSyncInterval / 2)
+
+		// Block until the hook fires or we time out. The timeout is generous
+		// (5s) to accommodate the race detector on loaded CI runners, but in
+		// practice the hook fires within one or two 10ms ticks.
+		select {
+		case <-syncFired:
+		case <-time.After(5 * time.Second):
+			t.Errorf("cycle %d: timed out waiting for WAL sync (syncCount=%d)", cycle, s.syncCount.Load())
+			continue
 		}
+
+		want := int64(cycle + 1)
 		if got := s.syncCount.Load(); got < want {
 			t.Errorf("cycle %d: expected syncCount ≥ %d, got %d", cycle, want, got)
 		}
-		// Idle between cycles — count must not grow.
-		snapshot := s.syncCount.Load()
+
+		// Idle between cycles — drain any buffered notifications, then confirm
+		// no new sync fires for several intervals.
+		for len(syncFired) > 0 {
+			<-syncFired
+		}
 		time.Sleep(4 * walSyncInterval)
-		if after := s.syncCount.Load(); after != snapshot {
-			t.Errorf("cycle %d idle: sync count grew from %d to %d with no writes", cycle, snapshot, after)
+		if len(syncFired) > 0 {
+			t.Errorf("cycle %d idle: unexpected WAL sync fired with no writes", cycle)
 		}
 	}
 }
