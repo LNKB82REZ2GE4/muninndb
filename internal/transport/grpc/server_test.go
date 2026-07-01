@@ -93,6 +93,14 @@ func (m *mockEngine) Forget(ctx context.Context, req *pb.ForgetRequest) (*pb.For
 	return &pb.ForgetResponse{OK: true}, nil
 }
 
+func (m *mockEngine) BatchForget(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error) {
+	results := make([]*pb.BatchForgetItemResult, len(req.Requests))
+	for i := range req.Requests {
+		results[i] = &pb.BatchForgetItemResult{Index: int32(i), Ok: true}
+	}
+	return &pb.BatchForgetResponse{Results: results}, nil
+}
+
 func (m *mockEngine) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error) {
 	if m.statFn != nil {
 		return m.statFn(ctx, req)

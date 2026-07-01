@@ -29,6 +29,7 @@ type EngineAPI interface {
 	Activate(ctx context.Context, req *pb.ActivateRequest) (*pb.ActivateResponse, error)
 	Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkResponse, error)
 	Forget(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetResponse, error)
+	BatchForget(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error)
 	Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error)
 	Subscribe(ctx context.Context, req *pb.SubscribeRequest) (*pb.SubscribeResponse, error)
 	SubscribeWithDeliver(ctx context.Context, req *pb.SubscribeRequest, deliver trigger.DeliverFunc) (string, error)
@@ -353,6 +354,14 @@ func (s *Server) Forget(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetR
 		return nil, err
 	}
 	return resp, nil
+}
+
+// BatchForget implements the BatchForget RPC.
+func (s *Server) BatchForget(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error) {
+	if err := denyReadOnlyMutation(ctx); err != nil {
+		return nil, err
+	}
+	return s.engine.BatchForget(ctx, req)
 }
 
 // Stat implements the Stat RPC.

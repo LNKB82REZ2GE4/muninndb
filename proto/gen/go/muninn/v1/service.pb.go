@@ -111,6 +111,23 @@ type ForgetResponse struct {
 	OK bool `protobuf:"varint,1,opt,name=ok"`
 }
 
+// BatchForgetRequest wraps multiple ForgetRequests into a single RPC.
+type BatchForgetRequest struct {
+	Requests []*ForgetRequest `protobuf:"bytes,1,rep,name=requests"`
+}
+
+// BatchForgetItemResult is the per-item result in a BatchForgetResponse.
+type BatchForgetItemResult struct {
+	Index int32  `protobuf:"varint,1,opt,name=index"`
+	Ok    bool   `protobuf:"varint,2,opt,name=ok"`
+	Error string `protobuf:"bytes,3,opt,name=error"`
+}
+
+// BatchForgetResponse returns per-item results for a batch forget.
+type BatchForgetResponse struct {
+	Results []*BatchForgetItemResult `protobuf:"bytes,1,rep,name=results"`
+}
+
 // StatRequest message
 type StatRequest struct {
 	Vault string `protobuf:"bytes,1,opt,name=vault"`
