@@ -103,7 +103,7 @@ func (p *GoogleLLMProvider) Complete(ctx context.Context, system, user string) (
 		},
 		GenerationConfig: googleGenerationConfig{
 			Temperature:      0.0,
-			MaxOutputTokens:  1024,
+			MaxOutputTokens:  8192,
 			ResponseMimeType: "application/json",
 		},
 	}
