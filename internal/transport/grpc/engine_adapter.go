@@ -158,6 +158,14 @@ func (a *grpcEngineAdapter) Stat(ctx context.Context, req *pb.StatRequest) (*pb.
 	}, nil
 }
 
+func (a *grpcEngineAdapter) ListVaults(ctx context.Context, _ *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error) {
+	vaults, err := a.eng.ListVaults(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.ListVaultsResponse{Vaults: vaults}, nil
+}
+
 func (a *grpcEngineAdapter) Subscribe(ctx context.Context, req *pb.SubscribeRequest) (*pb.SubscribeResponse, error) {
 	resp, err := a.eng.Subscribe(ctx, &mbp.SubscribeRequest{
 		SubscriptionID: req.SubscriptionID, Context: req.Context,

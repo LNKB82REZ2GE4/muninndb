@@ -231,6 +231,14 @@ type SubscribeResponse struct {
 	Status string `protobuf:"bytes,2,opt,name=status"`
 }
 
+// ListVaultsRequest message
+type ListVaultsRequest struct{}
+
+// ListVaultsResponse message
+type ListVaultsResponse struct {
+	Vaults []string `protobuf:"bytes,1,rep,name=vaults"`
+}
+
 // ActivationPush message
 type ActivationPush struct {
 	SubscriptionID string         `protobuf:"bytes,1,opt,name=subscription_id"`
