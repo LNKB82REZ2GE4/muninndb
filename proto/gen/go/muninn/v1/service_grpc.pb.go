@@ -18,6 +18,7 @@ type MuninnDBClient interface {
 	Forget(ctx context.Context, in *ForgetRequest, opts ...grpc.CallOption) (*ForgetResponse, error)
 	Stat(ctx context.Context, in *StatRequest, opts ...grpc.CallOption) (*StatResponse, error)
 	Link(ctx context.Context, in *LinkRequest, opts ...grpc.CallOption) (*LinkResponse, error)
+	ListVaults(ctx context.Context, in *ListVaultsRequest, opts ...grpc.CallOption) (*ListVaultsResponse, error)
 	Activate(ctx context.Context, in *ActivateRequest, opts ...grpc.CallOption) (MuninnDB_ActivateClient, error)
 	Subscribe(ctx context.Context, opts ...grpc.CallOption) (MuninnDB_SubscribeClient, error)
 }
@@ -87,6 +88,15 @@ func (c *muninnDBClient) Stat(ctx context.Context, in *StatRequest, opts ...grpc
 func (c *muninnDBClient) Link(ctx context.Context, in *LinkRequest, opts ...grpc.CallOption) (*LinkResponse, error) {
 	out := new(LinkResponse)
 	err := c.cc.Invoke(ctx, "/muninn.v1.MuninnDB/Link", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *muninnDBClient) ListVaults(ctx context.Context, in *ListVaultsRequest, opts ...grpc.CallOption) (*ListVaultsResponse, error) {
+	out := new(ListVaultsResponse)
+	err := c.cc.Invoke(ctx, "/muninn.v1.MuninnDB/ListVaults", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -165,6 +175,7 @@ type MuninnDBServer interface {
 	Forget(context.Context, *ForgetRequest) (*ForgetResponse, error)
 	Stat(context.Context, *StatRequest) (*StatResponse, error)
 	Link(context.Context, *LinkRequest) (*LinkResponse, error)
+	ListVaults(context.Context, *ListVaultsRequest) (*ListVaultsResponse, error)
 	Activate(*ActivateRequest, MuninnDB_ActivateServer) error
 	Subscribe(MuninnDB_SubscribeServer) error
 }
@@ -197,6 +208,10 @@ func (UnimplementedMuninnDBServer) Stat(context.Context, *StatRequest) (*StatRes
 }
 
 func (UnimplementedMuninnDBServer) Link(context.Context, *LinkRequest) (*LinkResponse, error) {
+	return nil, nil
+}
+
+func (UnimplementedMuninnDBServer) ListVaults(context.Context, *ListVaultsRequest) (*ListVaultsResponse, error) {
 	return nil, nil
 }
 
@@ -367,6 +382,26 @@ var MuninnDB_ServiceDesc = grpc.ServiceDesc{
 				}
 				handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 					return srv.(MuninnDBServer).Link(ctx, req.(*LinkRequest))
+				}
+				return interceptor(ctx, in, info, handler)
+			},
+		},
+		{
+			MethodName: "ListVaults",
+			Handler: func(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+				in := new(ListVaultsRequest)
+				if err := dec(in); err != nil {
+					return nil, err
+				}
+				if interceptor == nil {
+					return srv.(MuninnDBServer).ListVaults(ctx, in)
+				}
+				info := &grpc.UnaryServerInfo{
+					Server:     srv,
+					FullMethod: "/muninn.v1.MuninnDB/ListVaults",
+				}
+				handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+					return srv.(MuninnDBServer).ListVaults(ctx, req.(*ListVaultsRequest))
 				}
 				return interceptor(ctx, in, info, handler)
 			},

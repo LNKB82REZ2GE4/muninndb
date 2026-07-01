@@ -32,6 +32,7 @@ type mockEngine struct {
 	linkFn                 func(ctx context.Context, req *pb.LinkRequest) (*pb.LinkResponse, error)
 	forgetFn               func(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetResponse, error)
 	statFn                 func(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error)
+	listVaultsFn           func(ctx context.Context, req *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error)
 	subscribeFn            func(ctx context.Context, req *pb.SubscribeRequest) (*pb.SubscribeResponse, error)
 	subscribeWithDeliverFn func(ctx context.Context, req *pb.SubscribeRequest, deliver trigger.DeliverFunc) (string, error)
 	unsubscribeFn          func(ctx context.Context, subID string) error
@@ -98,6 +99,13 @@ func (m *mockEngine) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatRes
 		return m.statFn(ctx, req)
 	}
 	return &pb.StatResponse{}, nil
+}
+
+func (m *mockEngine) ListVaults(ctx context.Context, req *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error) {
+	if m.listVaultsFn != nil {
+		return m.listVaultsFn(ctx, req)
+	}
+	return &pb.ListVaultsResponse{Vaults: []string{}}, nil
 }
 
 func (m *mockEngine) Subscribe(ctx context.Context, req *pb.SubscribeRequest) (*pb.SubscribeResponse, error) {
@@ -1398,5 +1406,51 @@ func TestShutdown_ContextTimeout(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Shutdown error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestListVaults_Success(t *testing.T) {
+	eng := &mockEngine{}
+	eng.listVaultsFn = func(_ context.Context, _ *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error) {
+		return &pb.ListVaultsResponse{Vaults: []string{"default", "work"}}, nil
+	}
+	srv := newPublicTestServer(t, eng)
+
+	// ListVaults requires an authenticated caller — inject a key into the context.
+	ctx := context.WithValue(context.Background(), auth.ContextAPIKey, &auth.APIKey{Vault: "default", Mode: auth.ModeFull})
+	resp, err := srv.ListVaults(ctx, &pb.ListVaultsRequest{})
+	if err != nil {
+		t.Fatalf("ListVaults: %v", err)
+	}
+	if len(resp.Vaults) != 2 {
+		t.Errorf("len(Vaults) = %d, want 2", len(resp.Vaults))
+	}
+	if resp.Vaults[0] != "default" || resp.Vaults[1] != "work" {
+		t.Errorf("Vaults = %v, want [default work]", resp.Vaults)
+	}
+}
+
+func TestListVaults_UnauthenticatedRejected(t *testing.T) {
+	eng := &mockEngine{}
+	srv := newPublicTestServer(t, eng)
+
+	// Anonymous caller (no ContextAPIKey in context) must be rejected.
+	_, err := srv.ListVaults(context.Background(), &pb.ListVaultsRequest{})
+	if err == nil {
+		t.Fatal("expected Unauthenticated error for anonymous caller, got nil")
+	}
+}
+
+func TestListVaults_Error(t *testing.T) {
+	eng := &mockEngine{}
+	eng.listVaultsFn = func(_ context.Context, _ *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error) {
+		return nil, errors.New("storage unavailable")
+	}
+	srv := newPublicTestServer(t, eng)
+
+	ctx := context.WithValue(context.Background(), auth.ContextAPIKey, &auth.APIKey{Vault: "default", Mode: auth.ModeFull})
+	_, err := srv.ListVaults(ctx, &pb.ListVaultsRequest{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
 	}
 }

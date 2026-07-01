@@ -30,6 +30,7 @@ type EngineAPI interface {
 	Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkResponse, error)
 	Forget(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetResponse, error)
 	Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error)
+	ListVaults(ctx context.Context, req *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error)
 	Subscribe(ctx context.Context, req *pb.SubscribeRequest) (*pb.SubscribeResponse, error)
 	SubscribeWithDeliver(ctx context.Context, req *pb.SubscribeRequest, deliver trigger.DeliverFunc) (string, error)
 	Unsubscribe(ctx context.Context, subID string) error
@@ -365,6 +366,21 @@ func (s *Server) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatRespons
 	resp, err := s.engine.Stat(ctx, req)
 	if err != nil {
 		slog.Error("stat failed", "error", err)
+		return nil, err
+	}
+	return resp, nil
+}
+
+// ListVaults implements the ListVaults RPC.
+// Requires a valid API key — anonymous/public-vault callers are rejected to
+// prevent cross-vault name enumeration by unauthenticated clients.
+func (s *Server) ListVaults(ctx context.Context, req *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error) {
+	if ctx.Value(auth.ContextAPIKey) == nil {
+		return nil, status.Error(codes.Unauthenticated, "ListVaults requires an API key")
+	}
+	resp, err := s.engine.ListVaults(ctx, req)
+	if err != nil {
+		slog.Error("list vaults failed", "error", err)
 		return nil, err
 	}
 	return resp, nil
