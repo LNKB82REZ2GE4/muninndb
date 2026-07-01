@@ -683,6 +683,138 @@ func TestDeleteVault_VaultMuEntryRemoved(t *testing.T) {
 	}
 }
 
+// TestEnsureVaultRegistered_AuthStoreOnly verifies that ensureVaultRegistered
+// returns true for a vault that exists only in the auth store (created via
+// `muninn vault create` before any engrams are written), and that the vault is
+// automatically written into the Pebble 0x0E name index so subsequent admin
+// operations can find it without a full lookup cycle.
+func TestEnsureVaultRegistered_AuthStoreOnly(t *testing.T) {
+	eng, as, _, cleanup := testEnvWithAuth(t)
+	defer cleanup()
+	ctx := context.Background()
+	_ = ctx
+
+	const vaultName = "auth-only-vault"
+	if err := as.SetVaultConfig(auth.VaultConfig{Name: vaultName, Public: false}); err != nil {
+		t.Fatalf("SetVaultConfig: %v", err)
+	}
+
+	// Vault is NOT in the Pebble index yet — ListVaultNames should miss it.
+	names, err := eng.store.ListVaultNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range names {
+		if n == vaultName {
+			t.Fatal("vault should not be in Pebble index before ensureVaultRegistered")
+		}
+	}
+
+	// ensureVaultRegistered must return true and repair the index.
+	found, err := eng.ensureVaultRegistered(vaultName)
+	if err != nil {
+		t.Fatalf("ensureVaultRegistered: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true for vault in auth store")
+	}
+
+	// The vault must now appear in ListVaultNames.
+	names, err = eng.store.ListVaultNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found = false
+	for _, n := range names {
+		if n == vaultName {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected vault to be registered in Pebble index after ensureVaultRegistered")
+	}
+}
+
+// TestEnsureVaultRegistered_Missing verifies that ensureVaultRegistered returns
+// false for a vault that exists in neither the Pebble index nor the auth store.
+func TestEnsureVaultRegistered_Missing(t *testing.T) {
+	eng, _, _, cleanup := testEnvWithAuth(t)
+	defer cleanup()
+
+	found, err := eng.ensureVaultRegistered("does-not-exist")
+	if err != nil {
+		t.Fatalf("ensureVaultRegistered: %v", err)
+	}
+	if found {
+		t.Error("expected found=false for unknown vault")
+	}
+}
+
+// TestRegisterVaultName verifies that RegisterVaultName writes the vault into
+// the Pebble name index so ListVaultNames returns it immediately.
+func TestRegisterVaultName(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const vaultName = "registered-vault"
+	if err := eng.RegisterVaultName(vaultName); err != nil {
+		t.Fatalf("RegisterVaultName: %v", err)
+	}
+
+	vaults, err := eng.ListVaults(ctx)
+	if err != nil {
+		t.Fatalf("ListVaults: %v", err)
+	}
+	found := false
+	for _, v := range vaults {
+		if v == vaultName {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected vault to appear in ListVaults after RegisterVaultName")
+	}
+}
+
+// TestReindexFTSVault_AuthOnlyVault verifies that reindex-fts succeeds on a
+// vault that was created via `vault create` (auth-store only, no engrams yet).
+func TestReindexFTSVault_AuthOnlyVault(t *testing.T) {
+	eng, as, _, cleanup := testEnvWithAuth(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	const vaultName = "fts-auth-only"
+	if err := as.SetVaultConfig(auth.VaultConfig{Name: vaultName, Public: false}); err != nil {
+		t.Fatalf("SetVaultConfig: %v", err)
+	}
+
+	// reindex-fts on an empty auth-only vault should succeed (0 engrams indexed).
+	n, err := eng.ReindexFTSVault(ctx, vaultName)
+	if err != nil {
+		t.Fatalf("ReindexFTSVault on auth-only vault: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 engrams indexed, got %d", n)
+	}
+}
+
+// TestReindexFTSVault_NotFound verifies that reindex-fts returns ErrVaultNotFound
+// for a vault absent from both the Pebble index and the auth store.
+func TestReindexFTSVault_NotFound(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	_, err := eng.ReindexFTSVault(ctx, "ghost-vault")
+	if err == nil {
+		t.Fatal("expected ErrVaultNotFound, got nil")
+	}
+	if !strings.Contains(err.Error(), "vault not found") {
+		t.Errorf("expected vault not found error, got: %v", err)
+	}
+}
+
 // TestEngineRenameVault_JobActive verifies that renaming a vault with an
 // active clone/merge job targeting it returns ErrVaultJobActive.
 func TestEngineRenameVault_JobActive(t *testing.T) {

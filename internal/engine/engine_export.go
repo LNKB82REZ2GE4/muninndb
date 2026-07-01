@@ -23,16 +23,9 @@ func (e *Engine) ExportVault(ctx context.Context, vaultName, embedderModel strin
 	opCtx, stop := e.vaultOpContext(ctx)
 	defer stop()
 
-	names, err := e.store.ListVaultNames()
+	found, err := e.ensureVaultRegistered(vaultName)
 	if err != nil {
-		return nil, fmt.Errorf("export vault: list vaults: %w", err)
-	}
-	found := false
-	for _, n := range names {
-		if n == vaultName {
-			found = true
-			break
-		}
+		return nil, fmt.Errorf("export vault: vault lookup: %w", err)
 	}
 	if !found {
 		return nil, fmt.Errorf("export vault %q: %w", vaultName, ErrVaultNotFound)
