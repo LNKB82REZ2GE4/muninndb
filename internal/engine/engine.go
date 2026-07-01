@@ -223,9 +223,22 @@ type Engine struct {
 	// sequence per (vault, content-hash) stripe, preventing TOCTOU duplicates under
 	// concurrent REST writes. Uses contentHashStripes FNV-32a stripes for constant memory overhead.
 	contentHashLocks [contentHashStripes]sync.Mutex
+
+	// idempotencyLocks provides per-op_id mutexes to prevent TOCTOU races in the
+	// idempotency check → write → store-receipt window. Mirrors the pattern used by
+	// MCPServer.idempotencyLocks but lives on the engine so gRPC and REST callers
+	// get the same protection.
+	idempotencyLocks sync.Map
 }
 
 const contentHashStripes = 256
+
+// getIdempotencyLock returns (or lazily creates) a per-op_id mutex. Prevents TOCTOU
+// races in the check → write → store-receipt window for concurrent calls sharing an op_id.
+func (e *Engine) getIdempotencyLock(opID string) *sync.Mutex {
+	v, _ := e.idempotencyLocks.LoadOrStore(opID, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
 
 // contentHashLock returns the stripe mutex for the given (vault prefix, content hash) pair.
 // Uses FNV-32a to spread locks across contentHashStripes stripes.
@@ -829,6 +842,19 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
 	e.activity.Record(wsPrefix)
 
+	// ── Idempotency check: op_id dedup (must run before content-hash dedup) ──
+	// If the caller set idempotent_id, return the existing engram ID immediately.
+	// This runs first so that a re-submission with changed content still returns
+	// the original — correct idempotency semantics regardless of content drift.
+	if req.IdempotentID != "" {
+		mu := e.getIdempotencyLock(req.IdempotentID)
+		mu.Lock()
+		defer mu.Unlock()
+		if receipt, err := e.store.CheckIdempotency(ctx, req.IdempotentID); err == nil && receipt != nil {
+			return &mbp.WriteResponse{ID: receipt.EngramID, Hint: "idempotent"}, nil
+		}
+	}
+
 	// ── Content-hash dedup: O(1) exact-duplicate check ──────────────
 	// Locked per (vault, content-hash) stripe to prevent TOCTOU duplicates under
 	// concurrent REST writes: two goroutines with identical content must not both
@@ -952,6 +978,13 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		slog.Warn("engine: failed to store content hash", "id", id.String(), "err", err)
 	}
 	unlockContentHash() // release stripe lock — PutContentHash is done
+
+	// Store idempotency receipt so future calls with the same op_id short-circuit.
+	if req.IdempotentID != "" {
+		if err := e.store.WriteIdempotency(ctx, req.IdempotentID, id.String()); err != nil {
+			slog.Warn("engine: failed to store idempotency receipt", "op_id", req.IdempotentID, "id", id.String(), "err", err)
+		}
+	}
 
 	// When the caller provided an embedding, mark DigestEmbed so the retroactive
 	// processor does not overwrite it, then insert into HNSW inline so the vector
@@ -1265,6 +1298,14 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 		wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
 		e.activity.Record(wsPrefix)
 
+		// ── Idempotency check (must precede content-hash dedup) ──────
+		if req.IdempotentID != "" {
+			if receipt, err := e.store.CheckIdempotency(ctx, req.IdempotentID); err == nil && receipt != nil {
+				responses[i] = &mbp.WriteResponse{ID: receipt.EngramID, Hint: "idempotent"}
+				continue
+			}
+		}
+
 		// ── Content-hash dedup: same O(1) check as single Write ──────
 		// NOTE: Intra-batch dedup is not performed — items within the same batch
 		// cannot see each other's hashes during Phase 1. This is a known limitation.
@@ -1403,6 +1444,12 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 		// Store content hash → engram ID mapping for future dedup lookups.
 		if err := e.store.PutContentHash(ctx, prepared[origIdx].wsPrefix, prepared[origIdx].contentHash, batchIDs[fi]); err != nil {
 			slog.Warn("engine: batch: failed to store content hash", "id", batchIDs[fi].String(), "err", err)
+		}
+		// Store idempotency receipt if caller provided an op_id.
+		if reqs[origIdx].IdempotentID != "" {
+			if err := e.store.WriteIdempotency(ctx, reqs[origIdx].IdempotentID, batchIDs[fi].String()); err != nil {
+				slog.Warn("engine: batch: failed to store idempotency receipt", "op_id", reqs[origIdx].IdempotentID, "id", batchIDs[fi].String(), "err", err)
+			}
 		}
 	}
 
