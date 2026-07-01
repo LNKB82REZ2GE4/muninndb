@@ -1294,16 +1294,34 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 	prepared := make([]preparedBatchItem, n)
 	validCount := 0
 
+	// Track idempotency keys seen within this batch to prevent intra-batch duplicates.
+	// If two items share an op_id, the second is recorded here and resolved after Phase 2
+	// using the first item's committed ID. Cross-request TOCTOU is bounded to concurrent
+	// batches — the same known limitation as content-hash intra-batch dedup above.
+	seenOpIDs := make(map[string]int)      // op_id → original index of first occurrence
+	pendingDuplicates := make(map[int]int) // duplicate item index → first-occurrence index
+
 	for i, req := range reqs {
 		wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
 		e.activity.Record(wsPrefix)
 
 		// ── Idempotency check (must precede content-hash dedup) ──────
 		if req.IdempotentID != "" {
+			// Check store for a receipt from a prior request.
 			if receipt, err := e.store.CheckIdempotency(ctx, req.IdempotentID); err == nil && receipt != nil {
 				responses[i] = &mbp.WriteResponse{ID: receipt.EngramID, Hint: "idempotent"}
 				continue
 			}
+			// Check for intra-batch duplicate: if this op_id was already queued in
+			// this batch, set a placeholder response now (to exclude the item from
+			// filteredItems / WriteEngramBatch) and record it for resolution after
+			// Phase 2 when the first occurrence's committed ID is known.
+			if firstIdx, seen := seenOpIDs[req.IdempotentID]; seen {
+				pendingDuplicates[i] = firstIdx
+				responses[i] = &mbp.WriteResponse{Hint: "pending_duplicate"}
+				continue
+			}
+			seenOpIDs[req.IdempotentID] = i
 		}
 
 		// ── Content-hash dedup: same O(1) check as single Write ──────
@@ -1453,13 +1471,23 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 		}
 	}
 
+	// Resolve intra-batch duplicates: fill in the committed ID from the first occurrence.
+	for dupIdx, firstIdx := range pendingDuplicates {
+		if responses[firstIdx] != nil {
+			responses[dupIdx] = &mbp.WriteResponse{ID: responses[firstIdx].ID, Hint: "idempotent"}
+		} else {
+			// First occurrence failed to write; propagate its error.
+			errs[dupIdx] = errs[firstIdx]
+		}
+	}
+
 	// Phase 3: Post-commit async work for each successfully written engram.
 	for i := range reqs {
 		if errs[i] != nil || responses[i] == nil {
 			continue
 		}
 		// Skip dedup'd items (they have no new engram to process).
-		if responses[i].Hint == "duplicate_content" {
+		if responses[i].Hint == "duplicate_content" || responses[i].Hint == "idempotent" {
 			continue
 		}
 		p := &prepared[i]
