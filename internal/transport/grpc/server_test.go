@@ -1416,7 +1416,9 @@ func TestListVaults_Success(t *testing.T) {
 	}
 	srv := newPublicTestServer(t, eng)
 
-	resp, err := srv.ListVaults(context.Background(), &pb.ListVaultsRequest{})
+	// ListVaults requires an authenticated caller — inject a key into the context.
+	ctx := context.WithValue(context.Background(), auth.ContextAPIKey, &auth.APIKey{Vault: "default", Mode: auth.ModeFull})
+	resp, err := srv.ListVaults(ctx, &pb.ListVaultsRequest{})
 	if err != nil {
 		t.Fatalf("ListVaults: %v", err)
 	}
@@ -1428,6 +1430,17 @@ func TestListVaults_Success(t *testing.T) {
 	}
 }
 
+func TestListVaults_UnauthenticatedRejected(t *testing.T) {
+	eng := &mockEngine{}
+	srv := newPublicTestServer(t, eng)
+
+	// Anonymous caller (no ContextAPIKey in context) must be rejected.
+	_, err := srv.ListVaults(context.Background(), &pb.ListVaultsRequest{})
+	if err == nil {
+		t.Fatal("expected Unauthenticated error for anonymous caller, got nil")
+	}
+}
+
 func TestListVaults_Error(t *testing.T) {
 	eng := &mockEngine{}
 	eng.listVaultsFn = func(_ context.Context, _ *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error) {
@@ -1435,7 +1448,8 @@ func TestListVaults_Error(t *testing.T) {
 	}
 	srv := newPublicTestServer(t, eng)
 
-	_, err := srv.ListVaults(context.Background(), &pb.ListVaultsRequest{})
+	ctx := context.WithValue(context.Background(), auth.ContextAPIKey, &auth.APIKey{Vault: "default", Mode: auth.ModeFull})
+	_, err := srv.ListVaults(ctx, &pb.ListVaultsRequest{})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

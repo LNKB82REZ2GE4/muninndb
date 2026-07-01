@@ -206,6 +206,12 @@ message ActivationPush {
   int64 at = 5;
 }
 
+message ListVaultsRequest {}
+
+message ListVaultsResponse {
+  repeated string vaults = 1;
+}
+
 service MuninnDB {
   rpc Hello(HelloRequest) returns (HelloResponse);
   rpc Write(WriteRequest) returns (WriteResponse);
@@ -215,5 +221,6 @@ service MuninnDB {
   rpc Stat(StatRequest) returns (StatResponse);
   rpc Link(LinkRequest) returns (LinkResponse);
   rpc Activate(ActivateRequest) returns (stream ActivateResponse);
+  rpc ListVaults(ListVaultsRequest) returns (ListVaultsResponse);
   rpc Subscribe(stream SubscribeRequest) returns (stream ActivationPush);
 }

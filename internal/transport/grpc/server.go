@@ -302,7 +302,12 @@ func (s *Server) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatRespons
 }
 
 // ListVaults implements the ListVaults RPC.
+// Requires a valid API key — anonymous/public-vault callers are rejected to
+// prevent cross-vault name enumeration by unauthenticated clients.
 func (s *Server) ListVaults(ctx context.Context, req *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error) {
+	if ctx.Value(auth.ContextAPIKey) == nil {
+		return nil, status.Error(codes.Unauthenticated, "ListVaults requires an API key")
+	}
 	resp, err := s.engine.ListVaults(ctx, req)
 	if err != nil {
 		slog.Error("list vaults failed", "error", err)
