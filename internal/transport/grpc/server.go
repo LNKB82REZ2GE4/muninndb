@@ -361,6 +361,13 @@ func (s *Server) BatchForget(ctx context.Context, req *pb.BatchForgetRequest) (*
 	if err := denyReadOnlyMutation(ctx); err != nil {
 		return nil, err
 	}
+	for _, r := range req.Requests {
+		vault, err := s.resolveRequestVault(ctx, r.Vault)
+		if err != nil {
+			return nil, err
+		}
+		r.Vault = vault
+	}
 	return s.engine.BatchForget(ctx, req)
 }
 
