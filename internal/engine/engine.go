@@ -224,9 +224,22 @@ type Engine struct {
 	// sequence per (vault, content-hash) stripe, preventing TOCTOU duplicates under
 	// concurrent REST writes. Uses contentHashStripes FNV-32a stripes for constant memory overhead.
 	contentHashLocks [contentHashStripes]sync.Mutex
+
+	// idempotencyLocks provides per-op_id mutexes to prevent TOCTOU races in the
+	// idempotency check → write → store-receipt window. Mirrors the pattern used by
+	// MCPServer.idempotencyLocks but lives on the engine so gRPC and REST callers
+	// get the same protection.
+	idempotencyLocks sync.Map
 }
 
 const contentHashStripes = 256
+
+// getIdempotencyLock returns (or lazily creates) a per-op_id mutex. Prevents TOCTOU
+// races in the check → write → store-receipt window for concurrent calls sharing an op_id.
+func (e *Engine) getIdempotencyLock(opID string) *sync.Mutex {
+	v, _ := e.idempotencyLocks.LoadOrStore(opID, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
 
 // contentHashLock returns the stripe mutex for the given (vault prefix, content hash) pair.
 // Uses FNV-32a to spread locks across contentHashStripes stripes.
@@ -846,6 +859,19 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 	wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
 	e.activity.Record(wsPrefix)
 
+	// ── Idempotency check: op_id dedup (must run before content-hash dedup) ──
+	// If the caller set idempotent_id, return the existing engram ID immediately.
+	// This runs first so that a re-submission with changed content still returns
+	// the original — correct idempotency semantics regardless of content drift.
+	if req.IdempotentID != "" {
+		mu := e.getIdempotencyLock(req.IdempotentID)
+		mu.Lock()
+		defer mu.Unlock()
+		if receipt, err := e.store.CheckIdempotency(ctx, req.IdempotentID); err == nil && receipt != nil {
+			return &mbp.WriteResponse{ID: receipt.EngramID, Hint: "idempotent"}, nil
+		}
+	}
+
 	// ── Content-hash dedup: O(1) exact-duplicate check ──────────────
 	// Locked per (vault, content-hash) stripe to prevent TOCTOU duplicates under
 	// concurrent REST writes: two goroutines with identical content must not both
@@ -969,6 +995,13 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		slog.Warn("engine: failed to store content hash", "id", id.String(), "err", err)
 	}
 	unlockContentHash() // release stripe lock — PutContentHash is done
+
+	// Store idempotency receipt so future calls with the same op_id short-circuit.
+	if req.IdempotentID != "" {
+		if err := e.store.WriteIdempotency(ctx, req.IdempotentID, id.String()); err != nil {
+			slog.Warn("engine: failed to store idempotency receipt", "op_id", req.IdempotentID, "id", id.String(), "err", err)
+		}
+	}
 
 	// When the caller provided an embedding, mark DigestEmbed so the retroactive
 	// processor does not overwrite it, then insert into HNSW inline so the vector
@@ -1306,9 +1339,35 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 	prepared := make([]preparedBatchItem, n)
 	validCount := 0
 
+	// Track idempotency keys seen within this batch to prevent intra-batch duplicates.
+	// If two items share an op_id, the second is recorded here and resolved after Phase 2
+	// using the first item's committed ID. Cross-request TOCTOU is bounded to concurrent
+	// batches — the same known limitation as content-hash intra-batch dedup above.
+	seenOpIDs := make(map[string]int)      // op_id → original index of first occurrence
+	pendingDuplicates := make(map[int]int) // duplicate item index → first-occurrence index
+
 	for i, req := range reqs {
 		wsPrefix := e.store.ResolveVaultPrefix(req.Vault)
 		e.activity.Record(wsPrefix)
+
+		// ── Idempotency check (must precede content-hash dedup) ──────
+		if req.IdempotentID != "" {
+			// Check store for a receipt from a prior request.
+			if receipt, err := e.store.CheckIdempotency(ctx, req.IdempotentID); err == nil && receipt != nil {
+				responses[i] = &mbp.WriteResponse{ID: receipt.EngramID, Hint: "idempotent"}
+				continue
+			}
+			// Check for intra-batch duplicate: if this op_id was already queued in
+			// this batch, set a placeholder response now (to exclude the item from
+			// filteredItems / WriteEngramBatch) and record it for resolution after
+			// Phase 2 when the first occurrence's committed ID is known.
+			if firstIdx, seen := seenOpIDs[req.IdempotentID]; seen {
+				pendingDuplicates[i] = firstIdx
+				responses[i] = &mbp.WriteResponse{Hint: "pending_duplicate"}
+				continue
+			}
+			seenOpIDs[req.IdempotentID] = i
+		}
 
 		// ── Content-hash dedup: same O(1) check as single Write ──────
 		// NOTE: Intra-batch dedup is not performed — items within the same batch
@@ -1449,6 +1508,22 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 		if err := e.store.PutContentHash(ctx, prepared[origIdx].wsPrefix, prepared[origIdx].contentHash, batchIDs[fi]); err != nil {
 			slog.Warn("engine: batch: failed to store content hash", "id", batchIDs[fi].String(), "err", err)
 		}
+		// Store idempotency receipt if caller provided an op_id.
+		if reqs[origIdx].IdempotentID != "" {
+			if err := e.store.WriteIdempotency(ctx, reqs[origIdx].IdempotentID, batchIDs[fi].String()); err != nil {
+				slog.Warn("engine: batch: failed to store idempotency receipt", "op_id", reqs[origIdx].IdempotentID, "id", batchIDs[fi].String(), "err", err)
+			}
+		}
+	}
+
+	// Resolve intra-batch duplicates: fill in the committed ID from the first occurrence.
+	for dupIdx, firstIdx := range pendingDuplicates {
+		if responses[firstIdx] != nil {
+			responses[dupIdx] = &mbp.WriteResponse{ID: responses[firstIdx].ID, Hint: "idempotent"}
+		} else {
+			// First occurrence failed to write; propagate its error.
+			errs[dupIdx] = errs[firstIdx]
+		}
 	}
 
 	// Phase 3: Post-commit async work for each successfully written engram.
@@ -1457,7 +1532,7 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 			continue
 		}
 		// Skip dedup'd items (they have no new engram to process).
-		if responses[i].Hint == "duplicate_content" {
+		if responses[i].Hint == "duplicate_content" || responses[i].Hint == "idempotent" {
 			continue
 		}
 		p := &prepared[i]
