@@ -91,6 +91,20 @@ message ForgetResponse {
   bool ok = 1;
 }
 
+message BatchForgetRequest {
+  repeated ForgetRequest requests = 1;
+}
+
+message BatchForgetItemResult {
+  int32  index = 1;
+  bool   ok    = 2;
+  string error = 3;
+}
+
+message BatchForgetResponse {
+  repeated BatchForgetItemResult results = 1;
+}
+
 message StatRequest {
   string vault = 1;
 }
@@ -218,6 +232,7 @@ service MuninnDB {
   rpc BatchWrite(BatchWriteRequest) returns (BatchWriteResponse);
   rpc Read(ReadRequest) returns (ReadResponse);
   rpc Forget(ForgetRequest) returns (ForgetResponse);
+  rpc BatchForget(BatchForgetRequest) returns (BatchForgetResponse);
   rpc Stat(StatRequest) returns (StatResponse);
   rpc Link(LinkRequest) returns (LinkResponse);
   rpc Activate(ActivateRequest) returns (stream ActivateResponse);

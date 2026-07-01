@@ -29,6 +29,7 @@ type EngineAPI interface {
 	Activate(ctx context.Context, req *pb.ActivateRequest) (*pb.ActivateResponse, error)
 	Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkResponse, error)
 	Forget(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetResponse, error)
+	BatchForget(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error)
 	Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error)
 	ListVaults(ctx context.Context, req *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error)
 	Subscribe(ctx context.Context, req *pb.SubscribeRequest) (*pb.SubscribeResponse, error)
@@ -354,6 +355,21 @@ func (s *Server) Forget(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetR
 		return nil, err
 	}
 	return resp, nil
+}
+
+// BatchForget implements the BatchForget RPC.
+func (s *Server) BatchForget(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error) {
+	if err := denyReadOnlyMutation(ctx); err != nil {
+		return nil, err
+	}
+	for _, r := range req.Requests {
+		vault, err := s.resolveRequestVault(ctx, r.Vault)
+		if err != nil {
+			return nil, err
+		}
+		r.Vault = vault
+	}
+	return s.engine.BatchForget(ctx, req)
 }
 
 // Stat implements the Stat RPC.

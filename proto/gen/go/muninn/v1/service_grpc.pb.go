@@ -16,6 +16,7 @@ type MuninnDBClient interface {
 	BatchWrite(ctx context.Context, in *BatchWriteRequest, opts ...grpc.CallOption) (*BatchWriteResponse, error)
 	Read(ctx context.Context, in *ReadRequest, opts ...grpc.CallOption) (*ReadResponse, error)
 	Forget(ctx context.Context, in *ForgetRequest, opts ...grpc.CallOption) (*ForgetResponse, error)
+	BatchForget(ctx context.Context, in *BatchForgetRequest, opts ...grpc.CallOption) (*BatchForgetResponse, error)
 	Stat(ctx context.Context, in *StatRequest, opts ...grpc.CallOption) (*StatResponse, error)
 	Link(ctx context.Context, in *LinkRequest, opts ...grpc.CallOption) (*LinkResponse, error)
 	ListVaults(ctx context.Context, in *ListVaultsRequest, opts ...grpc.CallOption) (*ListVaultsResponse, error)
@@ -70,6 +71,15 @@ func (c *muninnDBClient) Read(ctx context.Context, in *ReadRequest, opts ...grpc
 func (c *muninnDBClient) Forget(ctx context.Context, in *ForgetRequest, opts ...grpc.CallOption) (*ForgetResponse, error) {
 	out := new(ForgetResponse)
 	err := c.cc.Invoke(ctx, "/muninn.v1.MuninnDB/Forget", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *muninnDBClient) BatchForget(ctx context.Context, in *BatchForgetRequest, opts ...grpc.CallOption) (*BatchForgetResponse, error) {
+	out := new(BatchForgetResponse)
+	err := c.cc.Invoke(ctx, "/muninn.v1.MuninnDB/BatchForget", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -173,6 +183,7 @@ type MuninnDBServer interface {
 	BatchWrite(context.Context, *BatchWriteRequest) (*BatchWriteResponse, error)
 	Read(context.Context, *ReadRequest) (*ReadResponse, error)
 	Forget(context.Context, *ForgetRequest) (*ForgetResponse, error)
+	BatchForget(context.Context, *BatchForgetRequest) (*BatchForgetResponse, error)
 	Stat(context.Context, *StatRequest) (*StatResponse, error)
 	Link(context.Context, *LinkRequest) (*LinkResponse, error)
 	ListVaults(context.Context, *ListVaultsRequest) (*ListVaultsResponse, error)
@@ -200,6 +211,10 @@ func (UnimplementedMuninnDBServer) Read(context.Context, *ReadRequest) (*ReadRes
 }
 
 func (UnimplementedMuninnDBServer) Forget(context.Context, *ForgetRequest) (*ForgetResponse, error) {
+	return nil, nil
+}
+
+func (UnimplementedMuninnDBServer) BatchForget(context.Context, *BatchForgetRequest) (*BatchForgetResponse, error) {
 	return nil, nil
 }
 
@@ -342,6 +357,26 @@ var MuninnDB_ServiceDesc = grpc.ServiceDesc{
 				}
 				handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 					return srv.(MuninnDBServer).Forget(ctx, req.(*ForgetRequest))
+				}
+				return interceptor(ctx, in, info, handler)
+			},
+		},
+		{
+			MethodName: "BatchForget",
+			Handler: func(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+				in := new(BatchForgetRequest)
+				if err := dec(in); err != nil {
+					return nil, err
+				}
+				if interceptor == nil {
+					return srv.(MuninnDBServer).BatchForget(ctx, in)
+				}
+				info := &grpc.UnaryServerInfo{
+					Server:     srv,
+					FullMethod: "/muninn.v1.MuninnDB/BatchForget",
+				}
+				handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+					return srv.(MuninnDBServer).BatchForget(ctx, req.(*BatchForgetRequest))
 				}
 				return interceptor(ctx, in, info, handler)
 			},
