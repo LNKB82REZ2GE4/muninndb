@@ -60,6 +60,24 @@ func (p *EnrichmentPipeline) verboseLogsFlag() *bool {
 	return p.cfg.LLMVerboseLogs
 }
 
+// recordParseError increments TotalErrors when a provider call succeeded but the
+// structured-output parse failed. It does not touch TotalCalls or TotalLatencyMs
+// since those were already recorded by recordComplete.
+func (p *EnrichmentPipeline) recordParseError(ctx context.Context, callType string, err error) {
+	if err == nil {
+		return
+	}
+	p.stats.TotalErrors.Add(1)
+	if llmstats.VerboseEnabled(p.verboseLogsFlag()) {
+		slog.InfoContext(ctx, "llm.parse_error",
+			"source", "llm",
+			"subsystem", "enrich",
+			"call_type", callType,
+			"error", err.Error(),
+		)
+	}
+}
+
 // recordComplete updates aggregate stats and emits a verbose log entry when enabled.
 func (p *EnrichmentPipeline) recordComplete(ctx context.Context, callType string, latMs int64, err error) {
 	p.stats.TotalCalls.Add(1)
@@ -242,7 +260,9 @@ func (p *EnrichmentPipeline) extractEntities(ctx context.Context, eng *storage.E
 		return nil, err
 	}
 
-	return ParseEntityResponse(resp)
+	entities, parseErr := ParseEntityResponse(resp)
+	p.recordParseError(ctx, "entities", parseErr)
+	return entities, parseErr
 }
 
 // extractRelationships executes Call 2: relationship extraction.
@@ -270,7 +290,9 @@ func (p *EnrichmentPipeline) extractRelationships(ctx context.Context, eng *stor
 		return nil, err
 	}
 
-	return ParseRelationshipResponse(resp)
+	rels, parseErr := ParseRelationshipResponse(resp)
+	p.recordParseError(ctx, "relationships", parseErr)
+	return rels, parseErr
 }
 
 // classify executes Call 3: classification.
@@ -287,7 +309,9 @@ func (p *EnrichmentPipeline) classify(ctx context.Context, eng *storage.Engram) 
 		return "", "", "", "", nil, err
 	}
 
-	return ParseClassificationResponse(resp)
+	mt, tl, cat, sub, tags, parseErr := ParseClassificationResponse(resp)
+	p.recordParseError(ctx, "classification", parseErr)
+	return mt, tl, cat, sub, tags, parseErr
 }
 
 // summarize executes Call 4: summarization.
@@ -304,5 +328,7 @@ func (p *EnrichmentPipeline) summarize(ctx context.Context, eng *storage.Engram)
 		return "", nil, err
 	}
 
-	return ParseSummarizeResponse(resp)
+	summary, keyPoints, parseErr := ParseSummarizeResponse(resp)
+	p.recordParseError(ctx, "summary", parseErr)
+	return summary, keyPoints, parseErr
 }

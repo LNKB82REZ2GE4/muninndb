@@ -529,11 +529,19 @@ func Hash(s string) uint32 {
 	return h
 }
 
+// NormalizeEntityName returns the canonical identity form of an entity name:
+// NFKC-normalized, lowercased, and trimmed. This is the single source of truth
+// for entity identity. EntityNameHash hashes it for the 0x1F record key, and any
+// caller that deduplicates entity names (e.g. ScanVaultEntityNames) must key on it
+// so that case/whitespace/NFKC variants collapse onto the one record they share.
+func NormalizeEntityName(name string) string {
+	return strings.ToLower(strings.TrimSpace(norm.NFKC.String(name)))
+}
+
 // EntityNameHash computes the 8-byte SipHash of a NFKC-normalized, lowercased,
 // trimmed entity name. Used for the 0x1F entity key and 0x20 link key.
 func EntityNameHash(name string) [8]byte {
-	normalized := strings.ToLower(strings.TrimSpace(norm.NFKC.String(name)))
-	hashVal := siphash.Hash(sipKey0, sipKey1, []byte(normalized))
+	hashVal := siphash.Hash(sipKey0, sipKey1, []byte(NormalizeEntityName(name)))
 	var h [8]byte
 	binary.BigEndian.PutUint64(h[:], hashVal)
 	return h
@@ -773,5 +781,18 @@ func ContentHashKey(ws [8]byte, hash [32]byte) []byte {
 	key[0] = 0x28
 	copy(key[1:9], ws[:])
 	copy(key[9:41], hash[:])
+	return key
+}
+
+// LeaseKey constructs the ownership-lease sidecar key (0x2A prefix) for an engram.
+// The lease is a work-queue checkout attribute stored next to the engram it
+// guards, not a separate lock object.
+// Key: 0x2A | wsPrefix(8) | ulid(16) = 25 bytes
+// Value: JSON-encoded lease {owner, heartbeat, ttl}.
+func LeaseKey(ws [8]byte, id [16]byte) []byte {
+	key := make([]byte, 1+8+16)
+	key[0] = 0x2A
+	copy(key[1:9], ws[:])
+	copy(key[9:25], id[:])
 	return key
 }

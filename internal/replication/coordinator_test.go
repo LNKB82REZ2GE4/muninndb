@@ -149,7 +149,7 @@ func TestClusterCoordinator_Role_ThreadSafe(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for j := 0; j < 50; j++ {
-			coord.handleDemotion()
+			coord.handleDemotion(causeClaim)
 		}
 	}()
 
@@ -170,7 +170,7 @@ func TestClusterCoordinator_IsLeader(t *testing.T) {
 	}
 
 	// Simulate demotion
-	coord.handleDemotion()
+	coord.handleDemotion(causeClaim)
 	if coord.IsLeader() {
 		t.Error("expected IsLeader=false after demotion")
 	}
@@ -419,7 +419,7 @@ func TestClusterCoordinator_ReplicationLag(t *testing.T) {
 	}
 
 	// As Lobe (replica), lag = currentSeq - lastApplied
-	coord.handleDemotion()
+	coord.handleDemotion(causeClaim)
 
 	// Append some entries to the log
 	coord.repLog.Append(OpSet, []byte("k1"), []byte("v1"))
@@ -478,15 +478,21 @@ func TestClusterCoordinator_OnBecameCortex_Callback(t *testing.T) {
 func TestClusterCoordinator_OnBecameLobe_Callback(t *testing.T) {
 	coord, _ := newTestCoordinator(t, "auto")
 
-	var called bool
+	called := make(chan struct{}, 1)
 	coord.OnBecameLobe = func() {
-		called = true
+		select {
+		case called <- struct{}{}:
+		default:
+		}
 	}
 
 	simulatePromotion(coord, 1)
-	coord.handleDemotion()
+	coord.handleDemotion(causeClaim)
 
-	if !called {
+	// OnBecameLobe fires asynchronously (it must not block the MSP tick goroutine).
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
 		t.Error("expected OnBecameLobe to be called")
 	}
 	if coord.Role() != RoleReplica {
@@ -502,7 +508,7 @@ func TestClusterCoordinator_NilCallbacksSafe(t *testing.T) {
 	coord.OnBecameLobe = nil
 
 	simulatePromotion(coord, 1)
-	coord.handleDemotion()
+	coord.handleDemotion(causeClaim)
 }
 
 func TestClusterCoordinator_Accessors(t *testing.T) {
@@ -574,17 +580,23 @@ func TestClusterCoordinator_QuorumLoss_PreemptiveDemotion(t *testing.T) {
 		t.Fatal("expected to be leader after promotion")
 	}
 
-	// Register 2 voters (self + peer-1) so quorum=2, but peer-1 is SDOWN
+	// Register 2 voters (self + peer-1) so quorum=2.
 	coord.election.RegisterVoter(coord.cfg.NodeID)
 	coord.election.RegisterVoter("peer-1")
 	coord.msp.AddPeer("peer-1", "127.0.0.1:9020", RoleReplica)
+
+	// Establish a live quorum first (peer-1 alive) — pre-emptive demotion only
+	// applies once a live quorum has been held this term (#522 Step 3 hadQuorum gate).
+	coord.checkQuorumHealth()
+
+	// Now peer-1 goes SDOWN → quorum lost.
 	coord.msp.mu.Lock()
 	if p, ok := coord.msp.peers["peer-1"]; ok {
 		p.SDown = true
 	}
 	coord.msp.mu.Unlock()
 
-	// First call: sets quorumLostSince
+	// First call after loss: sets quorumLostSince
 	coord.checkQuorumHealth()
 	if coord.IsLeader() {
 		// Should still be leader — timeout hasn't elapsed
@@ -1443,6 +1455,10 @@ func TestClusterCoordinator_HandleIncomingJoin_SnapshotFails_NoCallback(t *testi
 	if err := coord.epochStore.ForceSet(2); err != nil {
 		t.Fatalf("ForceSet: %v", err)
 	}
+	// Only the leader accepts joins (#533); mark this cortex as leader.
+	coord.roleMu.Lock()
+	coord.role = RolePrimary
+	coord.roleMu.Unlock()
 
 	// Upgrade the join handler to a DB-aware one so the JoinResponse signals
 	// NeedsSnapshot=true and HandleIncomingJoin takes the snapshot path.
@@ -1475,7 +1491,7 @@ func TestClusterCoordinator_HandleIncomingJoin_SnapshotFails_NoCallback(t *testi
 		t.Fatalf("marshal JoinRequest: %v", err)
 	}
 
-	nodeID, err := coord.HandleIncomingJoin(cortexConn, payload)
+	nodeID, _, err := coord.HandleIncomingJoin(cortexConn, payload)
 	if err != nil {
 		t.Fatalf("HandleIncomingJoin: %v", err)
 	}

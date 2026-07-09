@@ -1973,6 +1973,10 @@ document.addEventListener('alpine:init', () => {
                 '/api/admin/vault/' + encodeURIComponent(this.vault) + '/plasticity'
             );
             const cfg = data.config || {};
+            // Keep the raw stored config: savePlasticity merges it into the PUT
+            // payload so fields this panel does not edit (multi_user,
+            // behavior_mode, …) survive a save (the PUT replaces the whole config).
+            this.plasticityRawConfig = cfg;
             this.plasticityForm.preset         = cfg.preset || 'default';
             this.plasticityForm.hebbianEnabled = data.resolved?.hebbian_enabled ?? true;
             this.plasticityForm.temporalEnabled   = data.resolved?.temporal_enabled   ?? true;
@@ -2092,7 +2096,7 @@ document.addEventListener('alpine:init', () => {
         this.plasticitySaveOk = false;
         this.plasticitySaveErr = '';
         try {
-            const payload = { version: 1, preset: this.plasticityForm.preset };
+            const payload = { ...(this.plasticityRawConfig || {}), version: 1, preset: this.plasticityForm.preset };
             payload.recall_mode = this.plasticityForm.recallMode;
             if (this.plasticityForm.showAdvanced) {
                 if (this.plasticityForm.hopDepth       !== null) payload.hop_depth       = this.plasticityForm.hopDepth;
@@ -2102,6 +2106,17 @@ document.addEventListener('alpine:init', () => {
                 if (this.plasticityForm.temporalHalflife !== null) payload.temporal_halflife = this.plasticityForm.temporalHalflife;
                 payload.hebbian_enabled = this.plasticityForm.hebbianEnabled;
                 payload.temporal_enabled   = this.plasticityForm.temporalEnabled;
+            } else {
+                // Advanced panel is collapsed: reset any overrides carried over from
+                // plasticityRawConfig so the preset's defaults apply, matching the
+                // form (which shows no override in this state).
+                delete payload.hop_depth;
+                delete payload.semantic_weight;
+                delete payload.fts_weight;
+                delete payload.relevance_floor;
+                delete payload.temporal_halflife;
+                delete payload.hebbian_enabled;
+                delete payload.temporal_enabled;
             }
             await this.apiCall(
                 '/api/admin/vault/' + encodeURIComponent(this.vault) + '/plasticity',

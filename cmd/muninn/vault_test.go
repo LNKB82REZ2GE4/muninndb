@@ -610,3 +610,133 @@ func TestVaultRename_ConnectionRefused(t *testing.T) {
 		t.Errorf("expected connection error message, got: %q", out)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// vault plasticity tests
+// ---------------------------------------------------------------------------
+
+func TestRunVaultPlasticity_NoName(t *testing.T) {
+	out := captureStdout(func() {
+		runVaultPlasticity([]string{})
+	})
+	if !strings.Contains(out, "Usage:") {
+		t.Errorf("expected usage message, got: %q", out)
+	}
+}
+
+func TestRunVaultPlasticity_GetPrintsResolved(t *testing.T) {
+	cleanup := withMockVaultServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %q", r.Method)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"config":{"preset":"knowledge-graph"},"resolved":{"hop_depth":4,"actr_heb_scale":8}}`))
+	})
+	defer cleanup()
+
+	out := captureStdout(func() {
+		runVaultPlasticity([]string{"research"})
+	})
+	if !strings.Contains(out, "preset: knowledge-graph") {
+		t.Errorf("expected resolved preset in output, got: %q", out)
+	}
+	if !strings.Contains(out, "hop_depth") {
+		t.Errorf("expected resolved config fields in output, got: %q", out)
+	}
+}
+
+func TestRunVaultPlasticity_SetPresetMergePUT(t *testing.T) {
+	var putBody map[string]any
+	cleanup := withMockVaultServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case "GET":
+			// Existing config carries an unrelated override that must survive the merge.
+			w.Write([]byte(`{"config":{"preset":"default","recall_mode":"deep"},"resolved":{}}`))
+		case "PUT":
+			body, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body, &putBody)
+			w.Write([]byte(`{"config":{},"resolved":{}}`))
+		default:
+			t.Errorf("unexpected method %q", r.Method)
+		}
+	})
+	defer cleanup()
+
+	out := captureStdout(func() {
+		runVaultPlasticity([]string{"research", "--preset", "knowledge-graph"})
+	})
+	if putBody["preset"] != "knowledge-graph" {
+		t.Errorf("expected preset set to knowledge-graph in PUT body, got: %v", putBody)
+	}
+	if putBody["recall_mode"] != "deep" {
+		t.Errorf("expected pre-existing recall_mode preserved (non-destructive merge), got: %v", putBody)
+	}
+	if !strings.Contains(out, "updated") {
+		t.Errorf("expected confirmation message, got: %q", out)
+	}
+}
+
+func TestRunVaultPlasticity_SetFieldsCoercion(t *testing.T) {
+	var putBody map[string]any
+	cleanup := withMockVaultServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == "GET" {
+			w.Write([]byte(`{"config":{},"resolved":{}}`))
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &putBody)
+		w.Write([]byte(`{"config":{},"resolved":{}}`))
+	})
+	defer cleanup()
+
+	captureStdout(func() {
+		runVaultPlasticity([]string{"research",
+			"--set", "hop_depth=4",
+			"--set", "hebbian_enabled=false",
+			"--set", "actr_heb_scale=8.0",
+			"--set", "traversal_profile=causal",
+		})
+	})
+	// JSON numbers decode to float64; bools to bool; strings to string.
+	if v, ok := putBody["hop_depth"].(float64); !ok || v != 4 {
+		t.Errorf("expected hop_depth=4 (number), got: %v (%T)", putBody["hop_depth"], putBody["hop_depth"])
+	}
+	if v, ok := putBody["hebbian_enabled"].(bool); !ok || v != false {
+		t.Errorf("expected hebbian_enabled=false (bool), got: %v (%T)", putBody["hebbian_enabled"], putBody["hebbian_enabled"])
+	}
+	if v, ok := putBody["actr_heb_scale"].(float64); !ok || v != 8.0 {
+		t.Errorf("expected actr_heb_scale=8.0 (number), got: %v (%T)", putBody["actr_heb_scale"], putBody["actr_heb_scale"])
+	}
+	if putBody["traversal_profile"] != "causal" {
+		t.Errorf("expected traversal_profile=causal (string), got: %v", putBody["traversal_profile"])
+	}
+}
+
+func TestRunVaultPlasticity_InvalidPreset(t *testing.T) {
+	out := captureStdout(func() {
+		runVaultPlasticity([]string{"research", "--preset", "bogus"})
+	})
+	if !strings.Contains(out, "unknown preset") {
+		t.Errorf("expected unknown-preset error, got: %q", out)
+	}
+}
+
+func TestRunVaultPlasticity_UnknownField(t *testing.T) {
+	out := captureStdout(func() {
+		runVaultPlasticity([]string{"research", "--set", "not_a_field=1"})
+	})
+	if !strings.Contains(out, "unknown plasticity field") {
+		t.Errorf("expected unknown-field error, got: %q", out)
+	}
+}
+
+func TestRunVaultPlasticity_InvalidValue(t *testing.T) {
+	out := captureStdout(func() {
+		runVaultPlasticity([]string{"research", "--set", "hop_depth=abc"})
+	})
+	if !strings.Contains(out, "invalid value") {
+		t.Errorf("expected invalid-value error, got: %q", out)
+	}
+}

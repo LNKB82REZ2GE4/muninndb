@@ -32,16 +32,9 @@ func (e *Engine) ReindexFTSVault(ctx context.Context, vaultName string) (int64, 
 	mu.Lock()
 	defer mu.Unlock()
 
-	names, err := e.store.ListVaultNames()
+	found, err := e.ensureVaultRegistered(vaultName)
 	if err != nil {
-		return 0, fmt.Errorf("reindex-fts: list vault names: %w", err)
-	}
-	found := false
-	for _, n := range names {
-		if n == vaultName {
-			found = true
-			break
-		}
+		return 0, fmt.Errorf("reindex-fts: vault lookup: %w", err)
 	}
 	if !found {
 		return 0, fmt.Errorf("vault %q: %w", vaultName, ErrVaultNotFound)

@@ -88,6 +88,31 @@ func TestScanVaultEntityNames_DeduplicatesAcrossEngrams(t *testing.T) {
 	require.Equal(t, []string{"Go"}, got, "duplicate entity links must be deduplicated by ScanVaultEntityNames")
 }
 
+// TestScanVaultEntityNames_DeduplicatesCaseVariants verifies that entity names
+// differing only by case (or whitespace/NFKC) collapse to a single identity: they
+// share one 0x1F record, so the scan must invoke fn exactly once. Guards the
+// muninn_entities duplicate-row / similar_entities case-pair regression.
+func TestScanVaultEntityNames_DeduplicatesCaseVariants(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ws := store.VaultPrefix("scan-entity-case-variants")
+
+	require.NoError(t, store.UpsertEntityRecord(ctx, EntityRecord{
+		Name: "MuninnDB", Type: "database", Confidence: 1,
+	}, "test"))
+
+	// Two engrams link the same entity under different casings.
+	require.NoError(t, store.WriteEntityEngramLink(ctx, ws, NewULID(), "MuninnDB"))
+	require.NoError(t, store.WriteEntityEngramLink(ctx, ws, NewULID(), "muninndb"))
+
+	var got []string
+	require.NoError(t, store.ScanVaultEntityNames(ctx, ws, func(name string) error {
+		got = append(got, name)
+		return nil
+	}))
+	require.Len(t, got, 1, "case-variant entity links must collapse to one identity")
+}
+
 // TestScanVaultEntityNames_CallbackError verifies that ScanVaultEntityNames
 // stops immediately and propagates the error returned by the callback.
 func TestScanVaultEntityNames_CallbackError(t *testing.T) {

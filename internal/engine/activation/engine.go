@@ -2,6 +2,7 @@ package activation
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -14,6 +15,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	hnswpkg "github.com/scrypster/muninndb/internal/index/hnsw"
 	"github.com/scrypster/muninndb/internal/storage"
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 )
@@ -171,6 +173,12 @@ type ActivateRequest struct {
 	// ExcludeUntrusted: when true, engrams with TrustUntrusted (0x04) are silently
 	// excluded from activation results. Set by the engine from vault PlasticityConfig.
 	ExcludeUntrusted bool
+	// CallerOwner is the ownership-lease identity of the recall caller. Engrams
+	// held by a live lease owned by someone else are hidden (work-queue checkout),
+	// unless IncludeLeased is set. Empty means the caller owns no leases.
+	CallerOwner string
+	// IncludeLeased disables lease-based visibility filtering (admin/debugging).
+	IncludeLeased bool
 }
 
 // ActivateResult is what the transport layer serializes and returns.
@@ -197,6 +205,9 @@ type ActivateResponseFrame struct {
 type ActivationStore interface {
 	GetMetadata(ctx context.Context, wsPrefix [8]byte, ids []storage.ULID) ([]*storage.EngramMeta, error)
 	GetEngrams(ctx context.Context, wsPrefix [8]byte, ids []storage.ULID) ([]*storage.Engram, error)
+	// GetLeases batch-reads ownership leases, one per id in order (zero Lease for
+	// unleased engrams). Used for work-queue recall visibility filtering.
+	GetLeases(ctx context.Context, wsPrefix [8]byte, ids []storage.ULID) ([]storage.Lease, error)
 	GetAssociations(ctx context.Context, wsPrefix [8]byte, ids []storage.ULID, maxPerNode int) (map[storage.ULID][]storage.Association, error)
 	RecentActive(ctx context.Context, wsPrefix [8]byte, topK int) ([]storage.ULID, error)
 	VaultPrefix(vault string) [8]byte
@@ -496,7 +507,13 @@ func (e *ActivationEngine) phase1(ctx context.Context, req *ActivateRequest) (*p
 	if e.embedder != nil && e.hnsw != nil {
 		vec, err := e.embedder.Embed(ctx, req.Context)
 		if err != nil {
-			return nil, fmt.Errorf("phase1 embed: %w", err)
+			// Embedding backend unreachable (e.g. connection refused on the
+			// embedding endpoint). Degrade to BM25+decay recall instead of
+			// aborting: FTS still returns useful results, and phase2 already
+			// takes the FTS-only path when len(embedding)==0.
+			slog.Warn("activation: embed backend unreachable, degrading to BM25-only recall",
+				"vault", req.VaultID, "error", err)
+			return result, nil
 		}
 		// Embed returns a flat len(texts)*dim slice — each phrase's vector
 		// concatenated. A multi-phrase context must be pooled back into a single
@@ -632,7 +649,16 @@ func (e *ActivationEngine) phase2(ctx context.Context, req *ActivateRequest, p1 
 	g.Go(func() error {
 		results, err := e.hnsw.Search(gctx, ws, p1.embedding, k)
 		if err != nil {
-			slog.Warn("activation: hnsw search degraded", "vault", req.VaultID, "err", err)
+			var dimErr *hnswpkg.DimMismatchError
+			if errors.As(err, &dimErr) {
+				// The active embedder's dimension does not match this vault's
+				// existing vectors (#582). FTS results below still apply — same
+				// degrade-not-abort contract as an unreachable embed backend (#578).
+				slog.Warn("activation: query embedding dimension does not match vault vectors — recall degraded to BM25-only; run `muninn vault reembed` after changing embedding models",
+					"vault", req.VaultID, "query_dim", dimErr.Got, "vault_dim", dimErr.Want)
+			} else {
+				slog.Warn("activation: hnsw search degraded", "vault", req.VaultID, "err", err)
+			}
 			return nil
 		}
 		sets.vector = results
@@ -1207,6 +1233,24 @@ func (e *ActivationEngine) phase6Score(
 		return nil, fmt.Errorf("phase6 get engrams: %w", err)
 	}
 
+	// Ownership-lease work-queue visibility (#548): hide engrams checked out by a
+	// live lease owned by someone other than the caller, mirroring how soft-deleted
+	// engrams are excluded. Staleness is evaluated here against the server clock, so
+	// an expired lease never hides anything. Skipped entirely when IncludeLeased is
+	// set (admin/debug opt-out).
+	leaseFilterNow := time.Now()
+	var leaseByID map[storage.ULID]storage.Lease
+	if !req.IncludeLeased {
+		leases, err := e.store.GetLeases(ctx, ws, ids)
+		if err != nil {
+			return nil, fmt.Errorf("phase6 get leases: %w", err)
+		}
+		leaseByID = make(map[storage.ULID]storage.Lease, len(ids))
+		for i, id := range ids {
+			leaseByID[id] = leases[i]
+		}
+	}
+
 	// Filter out soft-deleted engrams (defense-in-depth; HNSW has no delete method).
 	// Also filter untrusted engrams when ExcludeUntrusted is set in the request.
 	var active []*storage.Engram
@@ -1222,6 +1266,12 @@ func (e *ActivationEngine) phase6Score(
 		// backward-compat alias for TrustInferred, not an "unknown" or untrusted value.
 		if req.ExcludeUntrusted && eng.Trust == storage.TrustUntrusted {
 			continue
+		}
+		// Work-queue checkout: hide engrams under a live foreign lease.
+		if !req.IncludeLeased {
+			if l := leaseByID[eng.ID]; l.Live(leaseFilterNow) && l.Owner != req.CallerOwner {
+				continue
+			}
 		}
 		active = append(active, eng)
 	}
@@ -1775,9 +1825,117 @@ func passesMetaFilter(eng *storage.Engram, filters []Filter) bool {
 					return false
 				}
 			}
+		case "tags_all":
+			// All listed tags must be present on the engram (AND).
+			if want := asStringSlice(f.Value); len(want) > 0 {
+				set := tagSet(eng.Tags)
+				for _, w := range want {
+					if _, ok := set[w]; !ok {
+						return false
+					}
+				}
+			}
+		case "tags_any":
+			// At least one listed tag must be present (OR).
+			if want := asStringSlice(f.Value); len(want) > 0 {
+				set := tagSet(eng.Tags)
+				matched := false
+				for _, w := range want {
+					if _, ok := set[w]; ok {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					return false
+				}
+			}
+		case "tag_prefix":
+			// Value is [prefix, bound]; for each engram tag beginning with
+			// prefix, compare the remainder lexically against bound per Op
+			// (lte/gte/lt/gt/eq). Matches if ANY such tag satisfies the bound.
+			// String comparison suffices for ISO dates and other sortable
+			// key:value tag conventions.
+			if pb := asPair(f.Value); pb != nil {
+				prefix, bound := pb[0], pb[1]
+				matched := false
+				for _, tag := range eng.Tags {
+					if !strings.HasPrefix(tag, prefix) {
+						continue
+					}
+					v := tag[len(prefix):]
+					switch f.Op {
+					case "lte":
+						matched = v <= bound
+					case "gte":
+						matched = v >= bound
+					case "lt":
+						matched = v < bound
+					case "gt":
+						matched = v > bound
+					case "eq", "":
+						matched = v == bound
+					}
+					if matched {
+						break
+					}
+				}
+				if !matched {
+					return false
+				}
+			}
 		}
 	}
 	return true
+}
+
+// tagSet builds a lookup set from an engram's tags.
+func tagSet(tags []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(tags))
+	for _, t := range tags {
+		set[t] = struct{}{}
+	}
+	return set
+}
+
+// asStringSlice coerces a filter Value to []string, accepting both the
+// in-process []string and a msgpack-decoded []interface{} of strings.
+func asStringSlice(v interface{}) []string {
+	switch s := v.(type) {
+	case []string:
+		return s
+	case []interface{}:
+		out := make([]string, 0, len(s))
+		for _, e := range s {
+			if str, ok := e.(string); ok {
+				out = append(out, str)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// asPair coerces a tag_prefix Value to a [prefix, bound] pair, accepting the
+// in-process [2]string and a msgpack-decoded []interface{}/[]string of two.
+func asPair(v interface{}) *[2]string {
+	switch p := v.(type) {
+	case [2]string:
+		return &p
+	case []string:
+		if len(p) == 2 {
+			return &[2]string{p[0], p[1]}
+		}
+	case []interface{}:
+		if len(p) == 2 {
+			a, ok1 := p[0].(string)
+			b, ok2 := p[1].(string)
+			if ok1 && ok2 {
+				return &[2]string{a, b}
+			}
+		}
+	}
+	return nil
 }
 
 func resolveWeights(req *Weights, def DefaultWeights) resolvedWeights {

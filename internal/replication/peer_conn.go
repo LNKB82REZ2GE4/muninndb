@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 )
@@ -13,12 +14,28 @@ import (
 // ErrNotConnected is returned when Send or Receive is called before Connect.
 var ErrNotConnected = errors.New("peer not connected")
 
+// sendWriteTimeout bounds a single frame write so one peer with a full TCP
+// buffer cannot stall the shared MSP tick goroutine (which broadcasts heartbeats
+// to every peer sequentially) and cascade false SDOWNs.
+const sendWriteTimeout = 5 * time.Second
+
+// connKind records how a PeerConn was established, which drives the
+// simultaneous-dial / hello-vs-join precedence in RegisterConnKind (#522 Step 4).
+type connKind uint8
+
+const (
+	kindSeed  connKind = iota // disconnected placeholder from the seed list
+	kindJoin                  // established via the join/replication handshake
+	kindHello                 // established via the PeerHello discovery handshake
+)
+
 // PeerConn is a single persistent TCP connection to one remote peer.
 // It is safe for concurrent Send calls.
 type PeerConn struct {
 	nodeID string
 	addr   string
 	conn   net.Conn
+	kind   connKind
 	mu     sync.Mutex
 	closed bool
 }
@@ -35,6 +52,12 @@ func NewPeerConn(nodeID, addr string) *PeerConn {
 // PeerConn. Used on the Cortex side when a Lobe dials in: the conn exists but
 // the Lobe's stable listen address (addr) comes from the JoinRequest payload.
 func NewPeerConnFromConn(nodeID, addr string, conn net.Conn) *PeerConn {
+	// TCP keepalive is a cheap backstop for detecting a silently-dead peer (the
+	// primary detection is read/write errors + MSP SDOWN, #534).
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(15 * time.Second)
+	}
 	return &PeerConn{
 		nodeID: nodeID,
 		addr:   addr,
@@ -96,7 +119,27 @@ func (p *PeerConn) Send(frameType uint8, payload []byte) error {
 		PayloadLength: uint32(len(payload)),
 		Payload:       payload,
 	}
-	return mbp.WriteFrame(p.conn, f)
+	// Bound the write so a wedged peer can't block the shared heartbeat tick.
+	_ = p.conn.SetWriteDeadline(time.Now().Add(sendWriteTimeout))
+	err := mbp.WriteFrame(p.conn, f)
+	if err != nil {
+		// A write error (incl. timeout) means the conn is dead or wedged — mark it
+		// closed so IsConnected reports false and a restarted peer's new conn can
+		// replace it via RegisterConnKind / discovery re-dial (#534).
+		_ = p.conn.Close()
+		p.conn = nil
+		p.closed = true
+		return err
+	}
+	_ = p.conn.SetWriteDeadline(time.Time{}) // clear for subsequent reads/writes
+	return err
+}
+
+// Is reports whether this PeerConn currently wraps the given net.Conn (identity).
+func (p *PeerConn) Is(conn net.Conn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.conn == conn
 }
 
 // Receive reads one MBP frame from the connection.

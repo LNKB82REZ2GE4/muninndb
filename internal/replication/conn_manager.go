@@ -61,6 +61,64 @@ func (m *ConnManager) AddPeer(nodeID, addr string) {
 	m.peers[nodeID] = NewPeerConn(nodeID, addr)
 }
 
+// EvictIfConn disconnects the peer for nodeID IFF it still wraps the given conn
+// (identity check, so a replacement conn is never evicted). The entry is kept so
+// its address survives for re-dial, but marked disconnected — so a restarted
+// peer's new hello/join is accepted and discovery re-dials it (#534).
+func (m *ConnManager) EvictIfConn(nodeID string, conn net.Conn) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.peers[nodeID]
+	if !ok || !p.Is(conn) {
+		return false
+	}
+	_ = p.Close()
+	return true
+}
+
+// EvictPeerConn disconnects the peer for nodeID IFF the registered PeerConn is
+// exactly p (so a replacement is never evicted), keeping the entry for re-dial.
+func (m *ConnManager) EvictPeerConn(nodeID string, p *PeerConn) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.peers[nodeID] != p {
+		return false
+	}
+	_ = p.Close()
+	return true
+}
+
+// HasLivePeerAt reports whether any registered peer with this advertised address
+// currently has a live connection — used by the discovery loop to skip seeds
+// already covered by a join or hello conn (#522 Step 4).
+func (m *ConnManager) HasLivePeerAt(addr string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, p := range m.peers {
+		if p.addr == addr && p.conn != nil && !p.closed {
+			return true
+		}
+	}
+	return false
+}
+
+// UpdatePeerAddr updates a peer's advertised address WITHOUT disturbing its live
+// connection (adds a disconnected peer if none exists). Used for address-change
+// gossip — the previous path (AddPeer) closed the live conn and tore down the
+// replication stream on any benign addr readvertisement (#522 Step 0).
+func (m *ConnManager) UpdatePeerAddr(nodeID, addr string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if existing, ok := m.peers[nodeID]; ok {
+		existing.mu.Lock()
+		existing.addr = addr
+		existing.mu.Unlock()
+		return
+	}
+	m.peers[nodeID] = NewPeerConn(nodeID, addr)
+}
+
 // RegisterConn registers an already-established inbound connection as a peer
 // and returns the new PeerConn. Unlike AddPeer, the PeerConn wraps the live
 // conn so Send works immediately without a separate Connect call. If a peer
@@ -73,8 +131,41 @@ func (m *ConnManager) RegisterConn(nodeID, addr string, conn net.Conn) *PeerConn
 		_ = existing.Close()
 	}
 	p := NewPeerConnFromConn(nodeID, addr, conn)
+	p.kind = kindJoin // RegisterConn is used only by the join/replication path
 	m.peers[nodeID] = p
 	return p
+}
+
+// RegisterConnKind registers a connection with a kind, enforcing the #522 Step 4
+// precedence so a pair converges on exactly one connection without flapping:
+//   - a live join conn is never evicted by a hello conn;
+//   - a non-canonical hello (the higher node-id's outbound) never evicts a live
+//     conn — only fills an empty/dead slot;
+//   - otherwise (canonical hello = lower node-id's dial, or a join) it replaces.
+//
+// Returns the adopted PeerConn and whether it was adopted (false ⇒ the caller
+// must close conn — its existing registration stands).
+func (m *ConnManager) RegisterConnKind(nodeID, addr string, conn net.Conn, kind connKind, canonical bool) (*PeerConn, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	existing, ok := m.peers[nodeID]
+	liveExisting := ok && existing.conn != nil && !existing.closed
+	if liveExisting {
+		if existing.kind == kindJoin && kind != kindJoin {
+			return existing, false // never evict a live join with a hello
+		}
+		if kind == kindHello && !canonical {
+			return existing, false // non-canonical hello yields to the live conn
+		}
+	}
+	if ok {
+		_ = existing.Close()
+	}
+	p := NewPeerConnFromConn(nodeID, addr, conn)
+	p.kind = kind
+	m.peers[nodeID] = p
+	return p, true
 }
 
 // RemovePeer closes and removes the peer identified by nodeID.

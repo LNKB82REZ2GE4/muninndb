@@ -1,6 +1,7 @@
 package replication
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -279,9 +280,20 @@ func (r *SnapshotReceiver) WipeForResnapshot() error {
 	batch := r.db.NewBatch()
 	batchSize := 0
 
+	epochKey := clusterEpochKey()
 	for valid := iter.First(); valid; valid = iter.Next() {
-		key := make([]byte, len(iter.Key()))
-		copy(key, iter.Key())
+		k := iter.Key()
+		// Preserve ONLY the exact cluster_epoch key — it is fencing state, not
+		// snapshot data, and wiping it would make a re-snapshotting node (e.g. a
+		// deferring ex-primary) restart at epoch 0 (#531 PR3). Must be an exact-key
+		// match: the 0x19 prefix is overloaded (idempotency receipts are
+		// 0x19|siphash, ~0.4% of which begin 0x19 0x03), so a prefix skip would
+		// leave stale data keys behind after the snapshot.
+		if bytes.Equal(k, epochKey) {
+			continue
+		}
+		key := make([]byte, len(k))
+		copy(key, k)
 		if err := batch.Delete(key, nil); err != nil {
 			batch.Close()
 			return fmt.Errorf("snapshot wipe: delete: %w", err)

@@ -69,7 +69,7 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 
 	content, ok := args["content"].(string)
 	if !ok || strings.TrimSpace(content) == "" {
-		sendError(w, id, -32602, "invalid params: 'content' is required")
+		sendError(w, id, -32602, "invalid params: 'content' is required (non-empty string)")
 		return
 	}
 	req := &mbp.WriteRequest{
@@ -315,6 +315,14 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 		Profile:    profile,
 	}
 
+	// Ownership-lease work-queue visibility (#548).
+	if caller, ok := args["caller"].(string); ok {
+		req.CallerOwner = caller
+	}
+	if includeLeased, ok := args["include_leased"].(bool); ok {
+		req.IncludeLeased = includeLeased
+	}
+
 	// Apply non-zero mode preset fields.
 	// Explicit caller threshold/limit args always win (already parsed above).
 	if modePreset.Threshold > 0 {
@@ -362,6 +370,47 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 		}
 		req.Filters = append(req.Filters, mbp.Filter{Field: "created_before", Op: "<", Value: t})
 	}
+
+	// Tag filters: tags_all (AND), tags_any (OR), tag_filter (prefix value range).
+	parseStringArrayArg := func(v any) []string {
+		arr, ok := v.([]any)
+		if !ok {
+			return nil
+		}
+		out := make([]string, 0, len(arr))
+		for _, e := range arr {
+			if s, ok := e.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	if tags := parseStringArrayArg(args["tags_all"]); len(tags) > 0 {
+		req.Filters = append(req.Filters, mbp.Filter{Field: "tags_all", Op: "all", Value: tags})
+	}
+	if tags := parseStringArrayArg(args["tags_any"]); len(tags) > 0 {
+		req.Filters = append(req.Filters, mbp.Filter{Field: "tags_any", Op: "any", Value: tags})
+	}
+	if tf, ok := args["tag_filter"].(map[string]any); ok {
+		prefix, _ := tf["prefix"].(string)
+		if prefix == "" {
+			sendError(w, id, -32602, "invalid 'tag_filter': 'prefix' is required")
+			return
+		}
+		op, bound := "", ""
+		for _, cmp := range []string{"lte", "gte", "lt", "gt", "eq"} {
+			if b, ok := tf[cmp].(string); ok {
+				op, bound = cmp, b
+				break
+			}
+		}
+		if op == "" {
+			sendError(w, id, -32602, "invalid 'tag_filter': one of lte/gte/lt/gt/eq (string) is required")
+			return
+		}
+		req.Filters = append(req.Filters, mbp.Filter{Field: "tag_prefix", Op: op, Value: [2]string{prefix, bound}})
+	}
+
 	if emb, errMsg := parseEmbeddingArg(args); errMsg != "" {
 		sendError(w, id, -32602, errMsg)
 		return
@@ -403,7 +452,11 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 		"total":    resp.TotalFound,
 	}
 	if len(memories) == 0 {
-		result["hint"] = "No results matched. For session continuity try mode='recent', or use muninn_where_left_off. For semantic recall, provide more specific context."
+		hint := "No results matched. For session continuity try mode='recent', or use muninn_where_left_off. For semantic recall, provide more specific context."
+		if p, err := s.engine.GetVaultPlasticity(ctx, vault); err == nil && p != nil && p.MultiUser {
+			hint = "No results matched. For session continuity try mode='recent' scoped to your per-user tag (this vault is shared; muninn_where_left_off is vault-global). For semantic recall, provide more specific context."
+		}
+		result["hint"] = hint
 	}
 	sendResult(w, id, textContent(mustJSON(result)))
 }
@@ -506,7 +559,17 @@ func (s *MCPServer) handleEvolve(ctx context.Context, w http.ResponseWriter, id 
 	newContent, ok2 := args["new_content"].(string)
 	reason, ok3 := args["reason"].(string)
 	if !ok1 || !ok2 || !ok3 || engramID == "" || newContent == "" || reason == "" {
-		sendError(w, id, -32602, "invalid params: 'id', 'new_content', 'reason' are required")
+		var missing []string
+		if !ok1 || engramID == "" {
+			missing = append(missing, "'id' (engram ID to update)")
+		}
+		if !ok2 || newContent == "" {
+			missing = append(missing, "'new_content' (replacement text)")
+		}
+		if !ok3 || reason == "" {
+			missing = append(missing, "'reason' (why the memory changed)")
+		}
+		sendError(w, id, -32602, fmt.Sprintf("invalid params: missing required field(s): %s", strings.Join(missing, ", ")))
 		return
 	}
 	var evolveEmb []float32
@@ -520,7 +583,11 @@ func (s *MCPServer) handleEvolve(ctx context.Context, w http.ResponseWriter, id 
 		}
 		evolveEmb = emb
 	}
-	result, err := s.engine.Evolve(ctx, vault, engramID, newContent, reason, evolveEmb)
+	var evolveConcept string
+	if c, ok := args["concept"].(string); ok {
+		evolveConcept = c
+	}
+	result, err := s.engine.Evolve(ctx, vault, engramID, newContent, reason, evolveEmb, evolveConcept)
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return
@@ -801,10 +868,14 @@ func (s *MCPServer) handleWhereLeftOff(ctx context.Context, w http.ResponseWrite
 	if entries == nil {
 		entries = []WhereLeftOffEntry{}
 	}
+	hint := "These are your most recently accessed memories. Use them to orient yourself for this session."
+	if p, perr := s.engine.GetVaultPlasticity(ctx, vault); perr == nil && p != nil && p.MultiUser {
+		hint = "These are the most recently accessed memories across ALL users of this shared vault — not necessarily yours. For your own session context, use muninn_recall scoped to your per-user tag."
+	}
 	sendResult(w, id, textContent(mustJSON(map[string]any{
 		"memories": entries,
 		"count":    len(entries),
-		"hint":     "These are your most recently accessed memories. Use them to orient yourself for this session.",
+		"hint":     hint,
 	})))
 }
 
@@ -933,11 +1004,15 @@ func (s *MCPServer) handleFindByEntity(ctx context.Context, w http.ResponseWrite
 	if limit > 50 {
 		limit = 50
 	}
-	engrams, err := s.engine.FindByEntity(ctx, vault, entityName, limit)
+	res, err := s.engine.FindByEntity(ctx, vault, entityName, limit)
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return
 	}
+	if res == nil {
+		res = &engine.FindByEntityResult{}
+	}
+	engrams := res.Engrams
 	type engramEntry struct {
 		ID      string `json:"id"`
 		Concept string `json:"concept"`
@@ -953,11 +1028,23 @@ func (s *MCPServer) handleFindByEntity(ctx context.Context, w http.ResponseWrite
 			State:   lifecycleStateLabel(e.State),
 		})
 	}
-	out, _ := json.Marshal(map[string]any{
+	payload := map[string]any{
 		"entity":  entityName,
 		"engrams": entries,
 		"count":   len(entries),
-	})
+	}
+	// Report the resolution when the serving entity differs from the query
+	// (fuzzy match) — never substitute silently (issue #571).
+	if res.MatchedEntity != "" {
+		payload["matched_entity"] = res.MatchedEntity
+	}
+	if res.Fuzzy {
+		payload["fuzzy"] = true
+		if len(res.Candidates) > 0 {
+			payload["other_candidates"] = res.Candidates
+		}
+	}
+	out, _ := json.Marshal(payload)
 	sendResult(w, id, textContent(string(out)))
 }
 
@@ -1810,5 +1897,86 @@ func (s *MCPServer) handleSetTrust(ctx context.Context, w http.ResponseWriter, i
 		"id":    engramID,
 		"trust": trustStr,
 		"ok":    true,
+	})))
+}
+
+func (s *MCPServer) handleCompareAndSet(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	engramID, ok := args["id"].(string)
+	if !ok || engramID == "" {
+		sendError(w, id, -32602, "invalid params: 'id' is required")
+		return
+	}
+	var expectState, setState *string
+	if v, ok := args["expect_state"].(string); ok && v != "" {
+		expectState = &v
+	}
+	if v, ok := args["set_state"].(string); ok && v != "" {
+		setState = &v
+	}
+	if setState == nil {
+		sendError(w, id, -32602, "invalid params: 'set_state' is required")
+		return
+	}
+	applied, state, owner, err := s.engine.CompareAndSet(ctx, vault, engramID, expectState, setState)
+	if err != nil {
+		sendError(w, id, -32000, "tool error: "+err.Error())
+		return
+	}
+	sendResult(w, id, textContent(mustJSON(map[string]any{
+		"id":      engramID,
+		"applied": applied,
+		"current": map[string]any{"state": state, "owner": owner},
+	})))
+}
+
+func (s *MCPServer) handleClaim(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	engramID, ok := args["id"].(string)
+	if !ok || engramID == "" {
+		sendError(w, id, -32602, "invalid params: 'id' is required")
+		return
+	}
+	owner, ok := args["owner"].(string)
+	if !ok || owner == "" {
+		sendError(w, id, -32602, "invalid params: 'owner' is required")
+		return
+	}
+	ttlFloat, ok := args["ttl_secs"].(float64)
+	if !ok || ttlFloat <= 0 {
+		sendError(w, id, -32602, "invalid params: 'ttl_secs' is required and must be a positive number")
+		return
+	}
+	status, curOwner, heartbeat, err := s.engine.Claim(ctx, vault, engramID, owner, int64(ttlFloat))
+	if err != nil {
+		sendError(w, id, -32000, "tool error: "+err.Error())
+		return
+	}
+	sendResult(w, id, textContent(mustJSON(map[string]any{
+		"id":        engramID,
+		"status":    status,
+		"owner":     curOwner,
+		"heartbeat": heartbeat,
+	})))
+}
+
+func (s *MCPServer) handleRelease(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	engramID, ok := args["id"].(string)
+	if !ok || engramID == "" {
+		sendError(w, id, -32602, "invalid params: 'id' is required")
+		return
+	}
+	owner, ok := args["owner"].(string)
+	if !ok || owner == "" {
+		sendError(w, id, -32602, "invalid params: 'owner' is required")
+		return
+	}
+	released, curOwner, err := s.engine.Release(ctx, vault, engramID, owner)
+	if err != nil {
+		sendError(w, id, -32000, "tool error: "+err.Error())
+		return
+	}
+	sendResult(w, id, textContent(mustJSON(map[string]any{
+		"id":       engramID,
+		"released": released,
+		"owner":    curOwner,
 	})))
 }

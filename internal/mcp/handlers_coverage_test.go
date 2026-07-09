@@ -56,7 +56,7 @@ func (e *linkErrEngine) Link(_ context.Context, _ *mbp.LinkRequest) (*mbp.LinkRe
 // evolveErrEngine returns an error from Evolve.
 type evolveErrEngine struct{ fakeEngine }
 
-func (e *evolveErrEngine) Evolve(_ context.Context, _, _, _, _ string, _ []float32) (*WriteResult, error) {
+func (e *evolveErrEngine) Evolve(_ context.Context, _, _, _, _ string, _ []float32, _ string) (*WriteResult, error) {
 	return nil, fmt.Errorf("evolve storage error")
 }
 
@@ -621,6 +621,27 @@ func TestHandleEvolve_MissingID(t *testing.T) {
 	resp := decodeResp(t, w.Body.String())
 	if resp.Error == nil || resp.Error.Code != -32602 {
 		t.Errorf("expected -32602 for missing id, got %v", resp.Error)
+	}
+}
+
+func TestHandleEvolve_MissingFieldsNamed(t *testing.T) {
+	srv := newTestServer()
+	// Only 'new_content' supplied → error must name the two missing fields
+	// ('id' and 'reason') and omit the one that was provided.
+	body := `{"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"muninn_evolve","arguments":{"vault":"default","new_content":"updated"}}}`
+	w := postRPC(t, srv, body)
+	resp := decodeResp(t, w.Body.String())
+	if resp.Error == nil || resp.Error.Code != -32602 {
+		t.Fatalf("expected -32602 for missing fields, got %v", resp.Error)
+	}
+	if !strings.Contains(resp.Error.Message, "'id'") {
+		t.Errorf("error should name missing 'id', got: %s", resp.Error.Message)
+	}
+	if !strings.Contains(resp.Error.Message, "'reason'") {
+		t.Errorf("error should name missing 'reason', got: %s", resp.Error.Message)
+	}
+	if strings.Contains(resp.Error.Message, "'new_content'") {
+		t.Errorf("error should not name the supplied 'new_content', got: %s", resp.Error.Message)
 	}
 }
 

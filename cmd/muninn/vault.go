@@ -10,9 +10,13 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/scrypster/muninndb/internal/auth"
 )
 
 func printVaultUsage() {
@@ -33,6 +37,7 @@ func printVaultUsage() {
 	fmt.Println("  reembed     <name>                               Clear embeddings and re-embed with current model")
 	fmt.Println("  recall-mode <vault> [mode]                        Get or set default recall mode")
 	fmt.Println("  behavior    <vault> [--mode <mode>] [--instructions <text>]  Get or set vault behavior mode")
+	fmt.Println("  plasticity  <vault> [--preset <name>] [--set <key>=<value>]...  Get or set vault plasticity config")
 	fmt.Println()
 	fmt.Println("Auth flags (MySQL-style, optional):")
 	fmt.Println("  -u <user>         Admin username (default: root)")
@@ -65,7 +70,7 @@ func runVault(args []string) {
 
 	// Validate the subcommand before authenticating so typos get fast feedback.
 	switch sub {
-	case "create", "delete", "clear", "clone", "merge", "rename", "export", "export-markdown", "import", "reindex-fts", "reembed", "recall-mode", "behavior":
+	case "create", "delete", "clear", "clone", "merge", "rename", "export", "export-markdown", "import", "reindex-fts", "reembed", "recall-mode", "behavior", "plasticity":
 	default:
 		fmt.Printf("Unknown vault command: %q\n", sub)
 		printVaultUsage()
@@ -107,6 +112,8 @@ func runVault(args []string) {
 		runVaultRecallMode(subArgs)
 	case "behavior":
 		runVaultBehavior(subArgs)
+	case "plasticity":
+		runVaultPlasticity(subArgs)
 	}
 }
 
@@ -1354,5 +1361,265 @@ func runVaultBehavior(args []string) {
 	}
 	if newInstructions != "" {
 		fmt.Printf("  Vault %q custom instructions updated.\n", vaultName)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// vault plasticity
+// ---------------------------------------------------------------------------
+
+// plasticityFieldKinds maps each settable plasticity JSON key to the Go kind of
+// its value, derived by reflection over auth.PlasticityConfig. Pointer override
+// fields are dereferenced to their element kind. The internal "version" field is
+// excluded — it is managed by the engine, not the operator.
+func plasticityFieldKinds() map[string]reflect.Kind {
+	kinds := map[string]reflect.Kind{}
+	t := reflect.TypeOf(auth.PlasticityConfig{})
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag := strings.Split(f.Tag.Get("json"), ",")[0]
+		if tag == "" || tag == "-" || tag == "version" {
+			continue
+		}
+		ft := f.Type
+		if ft.Kind() == reflect.Ptr {
+			ft = ft.Elem()
+		}
+		kinds[tag] = ft.Kind()
+	}
+	return kinds
+}
+
+// coercePlasticityValue converts a raw string flag value into the typed value
+// expected by the plasticity field, so the merged JSON round-trips correctly
+// through the admin PUT handler (which decodes into a typed auth.PlasticityConfig).
+func coercePlasticityValue(kind reflect.Kind, raw string) (any, error) {
+	switch kind {
+	case reflect.Bool:
+		b, err := strconv.ParseBool(raw)
+		if err != nil {
+			return nil, fmt.Errorf("expected a boolean (true/false), got %q", raw)
+		}
+		return b, nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("expected an integer, got %q", raw)
+		}
+		return n, nil
+	case reflect.Float32, reflect.Float64:
+		f, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return nil, fmt.Errorf("expected a number, got %q", raw)
+		}
+		return f, nil
+	default:
+		// String fields (preset, traversal_profile, behavior_*, recall_mode, …).
+		return raw, nil
+	}
+}
+
+// applyPlasticitySet parses a single "key=value" --set argument, validates the
+// key against the known plasticity fields, coerces the value to the field's type,
+// and records it in changes.
+func applyPlasticitySet(kv string, kinds map[string]reflect.Kind, changes map[string]any) error {
+	key, val, found := strings.Cut(kv, "=")
+	if !found || key == "" {
+		return fmt.Errorf("invalid --set %q (expected key=value)", kv)
+	}
+	kind, ok := kinds[key]
+	if !ok {
+		return fmt.Errorf("unknown plasticity field %q", key)
+	}
+	if key == "preset" && !auth.ValidPlasticityPreset(val) {
+		return fmt.Errorf("unknown preset %q (valid: default, reference, scratchpad, knowledge-graph)", val)
+	}
+	coerced, err := coercePlasticityValue(kind, val)
+	if err != nil {
+		return fmt.Errorf("invalid value for %q: %w", key, err)
+	}
+	changes[key] = coerced
+	return nil
+}
+
+// runVaultPlasticity implements
+// `muninn vault plasticity <vault> [--preset <name>] [--set <key>=<value>]...`.
+// With no flags it prints the vault's resolved plasticity config (and active preset).
+// With --preset and/or one or more --set flags it does a merge-PUT against the
+// admin plasticity endpoint, mirroring runVaultRecallMode/runVaultBehavior: the PUT
+// handler replaces the stored config, so we GET the current config, merge the
+// requested changes into it, and PUT the whole thing back (non-destructive).
+func runVaultPlasticity(args []string) {
+	if len(args) == 0 {
+		fmt.Println("Usage: muninn vault plasticity <vault> [--preset <name>] [--set <key>=<value>]...")
+		fmt.Println()
+		fmt.Println("  With no flags, prints the vault's resolved plasticity config.")
+		fmt.Println("  --preset <name>     Set the preset: default, reference, scratchpad, knowledge-graph")
+		fmt.Println("  --set <key>=<value> Set an individual override field (repeatable).")
+		fmt.Println()
+		fmt.Println("  Example: muninn vault plasticity research --preset knowledge-graph")
+		fmt.Println("  Example: muninn vault plasticity research --set hop_depth=4 --set actr_heb_scale=8.0")
+		return
+	}
+
+	vaultName := args[0]
+	plasticityURL := fmt.Sprintf("%s/api/admin/vault/%s/plasticity", vaultAdminBase, url.PathEscape(vaultName))
+
+	// Parse flags, collecting requested changes.
+	kinds := plasticityFieldKinds()
+	changes := map[string]any{}
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "--preset" && i+1 < len(args):
+			i++
+			if err := applyPlasticitySet("preset="+args[i], kinds, changes); err != nil {
+				fmt.Printf("Error: %v\n", err)
+				return
+			}
+		case strings.HasPrefix(a, "--preset="):
+			if err := applyPlasticitySet("preset="+strings.TrimPrefix(a, "--preset="), kinds, changes); err != nil {
+				fmt.Printf("Error: %v\n", err)
+				return
+			}
+		case a == "--set" && i+1 < len(args):
+			i++
+			if err := applyPlasticitySet(args[i], kinds, changes); err != nil {
+				fmt.Printf("Error: %v\n", err)
+				return
+			}
+		case strings.HasPrefix(a, "--set="):
+			if err := applyPlasticitySet(strings.TrimPrefix(a, "--set="), kinds, changes); err != nil {
+				fmt.Printf("Error: %v\n", err)
+				return
+			}
+		default:
+			fmt.Printf("Error: unknown flag or argument %q\n", a)
+			return
+		}
+	}
+
+	client := httpClientForURL(plasticityURL, 5*time.Second)
+
+	if len(changes) == 0 {
+		// GET and pretty-print the resolved config.
+		req, err := http.NewRequest("GET", plasticityURL, nil)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+			return
+		}
+		addSessionCookie(req)
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Printf("Error connecting to MuninnDB: %v\n", err)
+			fmt.Println("Is muninn running? Try: muninn status")
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			printHTTPError(resp)
+			return
+		}
+		var data struct {
+			Config   json.RawMessage `json:"config"`
+			Resolved json.RawMessage `json:"resolved"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+			fmt.Printf("Error parsing response: %v\n", err)
+			return
+		}
+		var cfg struct {
+			Preset string `json:"preset"`
+		}
+		_ = json.Unmarshal(data.Config, &cfg)
+		preset := cfg.Preset
+		if preset == "" {
+			preset = "default"
+		}
+		fmt.Printf("  Vault %q plasticity (preset: %s)\n", vaultName, preset)
+		var resolved map[string]any
+		if err := json.Unmarshal(data.Resolved, &resolved); err == nil {
+			pretty, _ := json.MarshalIndent(resolved, "  ", "  ")
+			fmt.Printf("  Resolved config:\n  %s\n", pretty)
+		}
+		return
+	}
+
+	// SET: GET current config, merge changes, PUT back (non-destructive).
+	getReq, err := http.NewRequest("GET", plasticityURL, nil)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	addSessionCookie(getReq)
+	getResp, err := client.Do(getReq)
+	if err != nil {
+		fmt.Printf("Error connecting to MuninnDB: %v\n", err)
+		return
+	}
+	defer getResp.Body.Close()
+	if getResp.StatusCode != http.StatusOK {
+		printHTTPError(getResp)
+		return
+	}
+	var data struct {
+		Config json.RawMessage `json:"config"`
+	}
+	if err := json.NewDecoder(getResp.Body).Decode(&data); err != nil {
+		fmt.Printf("Error parsing response: %v\n", err)
+		return
+	}
+
+	var cfgMap map[string]any
+	if data.Config != nil && string(data.Config) != "null" {
+		if err := json.Unmarshal(data.Config, &cfgMap); err != nil {
+			cfgMap = map[string]any{}
+		}
+	} else {
+		cfgMap = map[string]any{}
+	}
+	for k, v := range changes {
+		cfgMap[k] = v
+	}
+
+	bodyBytes, err := json.Marshal(cfgMap)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	putReq, err := http.NewRequest("PUT", plasticityURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	putReq.Header.Set("Content-Type", "application/json")
+	addSessionCookie(putReq)
+
+	putResp, err := client.Do(putReq)
+	if err != nil {
+		fmt.Printf("Error connecting to MuninnDB: %v\n", err)
+		return
+	}
+	defer putResp.Body.Close()
+	if putResp.StatusCode != http.StatusOK {
+		printHTTPError(putResp)
+		return
+	}
+
+	// Report what changed, with preset first and the rest sorted for stable output.
+	fmt.Printf("  Vault %q plasticity updated:\n", vaultName)
+	if v, ok := changes["preset"]; ok {
+		fmt.Printf("    preset = %v\n", v)
+	}
+	keys := make([]string, 0, len(changes))
+	for k := range changes {
+		if k != "preset" {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Printf("    %s = %v\n", k, changes[k])
 	}
 }

@@ -62,8 +62,8 @@ func (a *mcpEngineAdapter) GetContradictions(ctx context.Context, vault string) 
 	}
 	return result, nil
 }
-func (a *mcpEngineAdapter) Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32) (*WriteResult, error) {
-	id, err := a.eng.Evolve(ctx, vault, oldID, newContent, reason, embedding)
+func (a *mcpEngineAdapter) Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string) (*WriteResult, error) {
+	id, err := a.eng.Evolve(ctx, vault, oldID, newContent, reason, embedding, concept)
 	if err != nil {
 		return nil, err
 	}
@@ -315,7 +315,7 @@ func (a *mcpEngineAdapter) AddChild(ctx context.Context, vault, parentID string,
 	return &AddChildResult{ChildID: r.ChildID, Ordinal: r.Ordinal}, nil
 }
 
-func (a *mcpEngineAdapter) FindByEntity(ctx context.Context, vault, entityName string, limit int) ([]*storage.Engram, error) {
+func (a *mcpEngineAdapter) FindByEntity(ctx context.Context, vault, entityName string, limit int) (*engine.FindByEntityResult, error) {
 	return a.eng.FindByEntity(ctx, vault, entityName, limit)
 }
 
@@ -598,6 +598,30 @@ func (a *mcpEngineAdapter) GetVaultEmbedDim(ctx context.Context, vault string) i
 
 func (a *mcpEngineAdapter) SetTrust(ctx context.Context, vault, id, trust string) error {
 	return a.eng.SetTrust(ctx, vault, id, trust)
+}
+
+func (a *mcpEngineAdapter) CompareAndSet(ctx context.Context, vault, id string, expectState, setState *string) (bool, string, string, error) {
+	res, err := a.eng.CompareAndSet(ctx, vault, id, expectState, setState)
+	if err != nil {
+		return false, "", "", err
+	}
+	return res.Applied, res.State, res.Owner, nil
+}
+
+func (a *mcpEngineAdapter) Claim(ctx context.Context, vault, id, owner string, ttlSecs int64) (string, string, int64, error) {
+	res, err := a.eng.Claim(ctx, vault, id, owner, ttlSecs)
+	if err != nil {
+		return "", "", 0, err
+	}
+	return string(res.Status), res.Owner, res.Heartbeat, nil
+}
+
+func (a *mcpEngineAdapter) Release(ctx context.Context, vault, id, owner string) (bool, string, error) {
+	res, err := a.eng.Release(ctx, vault, id, owner)
+	if err != nil {
+		return false, "", err
+	}
+	return res.Released, res.Owner, nil
 }
 
 func (a *mcpEngineAdapter) GetAnnotations(ctx context.Context, vault, id string) (*engine.AnnotationData, error) {
