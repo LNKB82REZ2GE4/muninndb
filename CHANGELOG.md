@@ -9,11 +9,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.8.0] - 2026-07-09
+
+### Added
+
+- **Atomic compare-and-set + ownership lease on engrams.** A low-level CAS
+  primitive (`PebbleStore.CompareAndSet`), layered into an advisory ownership
+  lease (`Claim`/`Release`), giving a fleet of agents sharing a vault
+  work-queue semantics — no two agents grab the same item. Closes a
+  pre-existing lifecycle-state TOCTOU as a side effect. (#576, closes #548)
+- **Fuzzy entity resolve behind exact `find_by_entity` lookup.** Exact match
+  is tried first; fuzzy token-set-containment matching is the fallback, not
+  the default, avoiding over-eager matches. (#571, #572, tightened in #581)
+- **Vault dimension guard.** Each vault's embedding dimension is established
+  atomically on first insert and enforced on every write path. On mismatch,
+  recall degrades to BM25-only instead of silently mixing embedding spaces.
+  (#589, closes #582)
+- **User-supplied local ONNX embedding model.** New `embed_model_path` /
+  `embed_tokenizer_path` config lets operators point at their own model
+  instead of the bundled one; dimension is probed via real inference at
+  init, never hardcoded. (#589, closes #583)
+- **`vault plasticity` CLI command** to get/set per-vault plasticity
+  settings. (#551)
+- **`multi_user` vault setting** with shared-vault session-start guidance.
+  (#575)
+- **gRPC `ListVaults` and `BatchForget` RPCs**, with per-item vault
+  resolution and auth requirements. (#557, #558)
+
+### Fixed
+
+- **Entity boost no longer floods recall in mature vaults.** The post-BFS
+  entity boost is now rarity-weighted (idf), credited once per entity
+  regardless of seed count, capped so associative evidence can't outrank
+  content evidence, and injection is gated on the caller's threshold.
+  (#581, fixes #569)
+- **Embed provider silent fallback eliminated.** An explicitly configured
+  embed provider is never silently substituted for a different model. (#585)
+- **BM25 fallback when the embed backend is unreachable**, with precise
+  `-32602` error messages instead of an opaque failure. (#578)
+- **Plasticity panel reset.** Advanced plasticity overrides no longer leak
+  stale values into the save payload when the panel is collapsed. (#579)
+- **CLI joined `exec:`/`logs:` tokens** now route to their handlers instead
+  of being misparsed. (#580)
+- **Idempotent write paths.** Idempotency keys are wired through gRPC and
+  REST write paths and deduped within a batch. (#560, plus follow-up fix)
+- **Entity scan dedup** by normalized identity instead of raw casing.
+- **HNSW graph rebuild** from vectors when the restored structure is
+  disconnected.
+- **`vault create` registration** in the Pebble index, repairing a
+  split-brain window in reindex-fts/export. (#547)
+
 ### Security
 
 - Bump Go toolchain to 1.26.5, fixing [GO-2026-5856](https://pkg.go.dev/vuln/GO-2026-5856)
   (Encrypted Client Hello privacy leak in `crypto/tls`), reachable via the gRPC server,
-  MCP server, WAL recovery, `doctor` cert dial, and plugin transport.
+  MCP server, WAL recovery, `doctor` cert dial, and plugin transport. (#591)
 
 ---
 
