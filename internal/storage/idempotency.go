@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/scrypster/muninndb/internal/prefix"
 	"github.com/scrypster/muninndb/internal/storage/keys"
 )
 
@@ -57,7 +58,7 @@ func (ps *PebbleStore) WriteIdempotency(ctx context.Context, opID, engramID stri
 func (ps *PebbleStore) PurgeExpiredIdempotency(ctx context.Context, maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge).UnixNano()
 
-	lower := []byte{0x19}
+	lower := []byte{prefix.Idempotency}
 	upper := keys.PrefixUpperBound(lower)
 
 	iter, err := ps.db.NewIter(&pebble.IterOptions{
@@ -72,7 +73,7 @@ func (ps *PebbleStore) PurgeExpiredIdempotency(ctx context.Context, maxAge time.
 	var toDelete [][]byte
 	for iter.SeekGE(lower); iter.Valid(); iter.Next() {
 		k := iter.Key()
-		if len(k) == 0 || k[0] != 0x19 {
+		if len(k) == 0 || k[0] != prefix.Idempotency {
 			break
 		}
 		val := iter.Value()
