@@ -17,6 +17,12 @@ Today every agent (Claude Code, Codex, Pi) shares one vault, `agent-memory`, for
 
 Inside a project, agents recall from **both** tiers (project-weighted); outside any project, behaviour is unchanged. Project vaults double as a hygiene layer: raw session noise stops accumulating in `agent-memory`.
 
+### Prior art in this repo (audited 2026-07-19 — none of this is implemented)
+
+- `docs/auth.md` §"If you need isolation, use separate vaults" explicitly recommends a vault per project; keys, however, remain strictly one-vault (§3 fixes that).
+- `docs/architecture.md` "Vault sharding" describes federating results "when multi-vault activation is requested" — aspirational sharding prose with no code behind it (no federation/multi-activate exists). §4's `ActivateMulti` is the single-node realisation of that stated direction, which strengthens the eventual upstream-PR case.
+- MQL (`internal/query/mql/`) is called a "multi-vault query language" but its `FROM` clause takes exactly one vault, and the package is not wired to any transport (only its own tests import it). It is not an additional vault-authorization surface today; if it ever gets wired up, its `FROM` vault must pass the §3.2 scope check.
+
 ### Decision record (pinned with Jake, 2026-07-19)
 
 1. **Project identity:** git root, with a registry override that can group several repos into one vault. Non-git directories → global-only.
