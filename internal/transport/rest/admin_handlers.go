@@ -289,6 +289,16 @@ func (s *Server) handleSetVaultConfig(authStore *auth.Store) http.HandlerFunc {
 			s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
 			return
 		}
+		// Register the vault in the Pebble name index so admin operations
+		// (reindex-fts, vault export) can find it before the first engram is written.
+		type vaultNameRegistrar interface {
+			RegisterVaultName(name string) error
+		}
+		if reg, ok := s.engine.(vaultNameRegistrar); ok {
+			if rErr := reg.RegisterVaultName(cfg.Name); rErr != nil {
+				slog.Warn("vault create: failed to register vault name", "vault", cfg.Name, "err", rErr)
+			}
+		}
 		s.sendJSON(w, http.StatusOK, cfg)
 		s.EmitAudit(r, "vault.config_update", "vault", cfg.Name, "ok", nil)
 	}

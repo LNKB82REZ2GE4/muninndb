@@ -147,6 +147,21 @@ func (a *grpcEngineAdapter) Forget(ctx context.Context, req *pb.ForgetRequest) (
 	return &pb.ForgetResponse{OK: resp.OK}, nil
 }
 
+func (a *grpcEngineAdapter) BatchForget(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error) {
+	results := make([]*pb.BatchForgetItemResult, len(req.Requests))
+	for i, r := range req.Requests {
+		result := &pb.BatchForgetItemResult{Index: int32(i)}
+		resp, err := a.eng.Forget(ctx, &mbp.ForgetRequest{ID: r.ID, Hard: r.Hard, Vault: r.Vault})
+		if err != nil {
+			result.Error = err.Error()
+		} else {
+			result.Ok = resp.OK
+		}
+		results[i] = result
+	}
+	return &pb.BatchForgetResponse{Results: results}, nil
+}
+
 func (a *grpcEngineAdapter) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error) {
 	resp, err := a.eng.Stat(ctx, &mbp.StatRequest{Vault: req.Vault})
 	if err != nil {
@@ -156,6 +171,14 @@ func (a *grpcEngineAdapter) Stat(ctx context.Context, req *pb.StatRequest) (*pb.
 		EngramCount: resp.EngramCount, StorageBytes: resp.StorageBytes,
 		VaultCount: int32(resp.VaultCount), IndexSize: resp.IndexSize,
 	}, nil
+}
+
+func (a *grpcEngineAdapter) ListVaults(ctx context.Context, _ *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error) {
+	vaults, err := a.eng.ListVaults(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.ListVaultsResponse{Vaults: vaults}, nil
 }
 
 func (a *grpcEngineAdapter) Subscribe(ctx context.Context, req *pb.SubscribeRequest) (*pb.SubscribeResponse, error) {

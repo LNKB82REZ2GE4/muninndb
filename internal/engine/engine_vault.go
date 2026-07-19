@@ -199,6 +199,52 @@ func (e *Engine) deleteVault(ctx context.Context, vaultName string) error {
 	return nil
 }
 
+// ensureVaultRegistered checks whether vaultName appears in the Pebble 0x0E
+// name index. If it does not, it checks the auth store — a vault created via
+// `muninn vault create` only writes an auth config entry until the first engram
+// is stored, leaving a gap between the auth registry and the Pebble index.
+// When found exclusively in the auth store the name is written into the Pebble
+// index so subsequent admin operations (reindex-fts, vault export, etc.) can
+// find it. Returns false only when the vault is absent from both registries.
+func (e *Engine) ensureVaultRegistered(name string) (bool, error) {
+	names, err := e.store.ListVaultNames()
+	if err != nil {
+		return false, err
+	}
+	for _, n := range names {
+		if n == name {
+			return true, nil
+		}
+	}
+	// Fall back to the auth store which only holds explicitly configured vaults.
+	// GetVaultConfig is fail-closed (returns a default for unknown vaults), so use
+	// ListVaultConfigs which exclusively returns persisted entries.
+	if e.authStore != nil {
+		cfgs, lErr := e.authStore.ListVaultConfigs()
+		if lErr == nil {
+			for _, cfg := range cfgs {
+				if cfg.Name == name {
+					ws := e.store.ResolveVaultPrefix(name)
+					if wErr := e.store.WriteVaultName(ws, name); wErr != nil {
+						slog.Warn("vault registry repair failed", "vault", name, "err", wErr)
+					}
+					return true, nil
+				}
+			}
+		}
+	}
+	return false, nil
+}
+
+// RegisterVaultName writes the vault name into the Pebble 0x0E name index.
+// Called by the admin REST handler when a vault is created so that admin
+// operations (reindex-fts, vault export, vault clear) can find it immediately,
+// even before the first engram has been written.
+func (e *Engine) RegisterVaultName(name string) error {
+	ws := e.store.ResolveVaultPrefix(name)
+	return e.store.WriteVaultName(ws, name)
+}
+
 // RenameVault atomically renames a vault. This is a metadata-only operation —
 // no engram data is moved or modified. Returns ErrVaultNotFound if oldName
 // doesn't exist, ErrVaultJobActive if a clone/merge job targets the vault,

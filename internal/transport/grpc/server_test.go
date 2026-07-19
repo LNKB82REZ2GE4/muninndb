@@ -31,7 +31,9 @@ type mockEngine struct {
 	activateFn             func(ctx context.Context, req *pb.ActivateRequest) (*pb.ActivateResponse, error)
 	linkFn                 func(ctx context.Context, req *pb.LinkRequest) (*pb.LinkResponse, error)
 	forgetFn               func(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetResponse, error)
+	batchForgetFn          func(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error)
 	statFn                 func(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error)
+	listVaultsFn           func(ctx context.Context, req *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error)
 	subscribeFn            func(ctx context.Context, req *pb.SubscribeRequest) (*pb.SubscribeResponse, error)
 	subscribeWithDeliverFn func(ctx context.Context, req *pb.SubscribeRequest, deliver trigger.DeliverFunc) (string, error)
 	unsubscribeFn          func(ctx context.Context, subID string) error
@@ -93,11 +95,29 @@ func (m *mockEngine) Forget(ctx context.Context, req *pb.ForgetRequest) (*pb.For
 	return &pb.ForgetResponse{OK: true}, nil
 }
 
+func (m *mockEngine) BatchForget(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error) {
+	if m.batchForgetFn != nil {
+		return m.batchForgetFn(ctx, req)
+	}
+	results := make([]*pb.BatchForgetItemResult, len(req.Requests))
+	for i := range req.Requests {
+		results[i] = &pb.BatchForgetItemResult{Index: int32(i), Ok: true}
+	}
+	return &pb.BatchForgetResponse{Results: results}, nil
+}
+
 func (m *mockEngine) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error) {
 	if m.statFn != nil {
 		return m.statFn(ctx, req)
 	}
 	return &pb.StatResponse{}, nil
+}
+
+func (m *mockEngine) ListVaults(ctx context.Context, req *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error) {
+	if m.listVaultsFn != nil {
+		return m.listVaultsFn(ctx, req)
+	}
+	return &pb.ListVaultsResponse{Vaults: []string{}}, nil
 }
 
 func (m *mockEngine) Subscribe(ctx context.Context, req *pb.SubscribeRequest) (*pb.SubscribeResponse, error) {
@@ -704,6 +724,7 @@ func TestPublicVaultFullMutatingUnaryRPCsAllowed(t *testing.T) {
 	batchWriteCalled := false
 	linkCalled := false
 	forgetCalled := false
+	batchForgetCalled := false
 	srv := transportgrpc.NewServer(":0", &mockEngine{
 		writeFn: func(ctx context.Context, req *pb.WriteRequest) (*pb.WriteResponse, error) {
 			writeCalled = true
@@ -720,6 +741,10 @@ func TestPublicVaultFullMutatingUnaryRPCsAllowed(t *testing.T) {
 		forgetFn: func(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetResponse, error) {
 			forgetCalled = true
 			return &pb.ForgetResponse{OK: true}, nil
+		},
+		batchForgetFn: func(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error) {
+			batchForgetCalled = true
+			return &pb.BatchForgetResponse{}, nil
 		},
 	}, store, nil)
 
@@ -754,6 +779,14 @@ func TestPublicVaultFullMutatingUnaryRPCsAllowed(t *testing.T) {
 			req:    &pb.ForgetRequest{Vault: "default", ID: "id1"},
 			invoke: func(ctx context.Context, req any) (any, error) { return srv.Forget(ctx, req.(*pb.ForgetRequest)) },
 			called: &forgetCalled,
+		},
+		{
+			name: "BatchForget",
+			req:  &pb.BatchForgetRequest{Requests: []*pb.ForgetRequest{{Vault: "default", ID: "id1"}}},
+			invoke: func(ctx context.Context, req any) (any, error) {
+				return srv.BatchForget(ctx, req.(*pb.BatchForgetRequest))
+			},
+			called: &batchForgetCalled,
 		},
 	}
 
@@ -784,6 +817,7 @@ func TestObserveKeyMutatingUnaryRPCsDenied(t *testing.T) {
 	batchWriteCalled := false
 	linkCalled := false
 	forgetCalled := false
+	batchForgetCalled := false
 	srv := transportgrpc.NewServer(":0", &mockEngine{
 		writeFn: func(ctx context.Context, req *pb.WriteRequest) (*pb.WriteResponse, error) {
 			writeCalled = true
@@ -800,6 +834,10 @@ func TestObserveKeyMutatingUnaryRPCsDenied(t *testing.T) {
 		forgetFn: func(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetResponse, error) {
 			forgetCalled = true
 			return &pb.ForgetResponse{OK: true}, nil
+		},
+		batchForgetFn: func(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error) {
+			batchForgetCalled = true
+			return &pb.BatchForgetResponse{}, nil
 		},
 	}, store, nil)
 
@@ -834,6 +872,14 @@ func TestObserveKeyMutatingUnaryRPCsDenied(t *testing.T) {
 			req:    &pb.ForgetRequest{Vault: "default", ID: "id1"},
 			invoke: func(ctx context.Context, req any) (any, error) { return srv.Forget(ctx, req.(*pb.ForgetRequest)) },
 			called: &forgetCalled,
+		},
+		{
+			name: "BatchForget",
+			req:  &pb.BatchForgetRequest{Requests: []*pb.ForgetRequest{{Vault: "default", ID: "id1"}}},
+			invoke: func(ctx context.Context, req any) (any, error) {
+				return srv.BatchForget(ctx, req.(*pb.BatchForgetRequest))
+			},
+			called: &batchForgetCalled,
 		},
 	}
 
@@ -1359,6 +1405,78 @@ func TestSubscribe_NilEngram(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// BatchForget tests
+// ---------------------------------------------------------------------------
+
+func TestBatchForget_Success(t *testing.T) {
+	eng := &mockEngine{}
+	srv := newPublicTestServer(t, eng)
+
+	resp, err := srv.BatchForget(context.Background(), &pb.BatchForgetRequest{
+		Requests: []*pb.ForgetRequest{
+			{ID: "engram-1"},
+			{ID: "engram-2"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BatchForget: %v", err)
+	}
+	if len(resp.Results) != 2 {
+		t.Fatalf("got %d results, want 2", len(resp.Results))
+	}
+	for i, r := range resp.Results {
+		if !r.Ok {
+			t.Errorf("result[%d].Ok = false, want true", i)
+		}
+		if r.Error != "" {
+			t.Errorf("result[%d].Error = %q, want empty", i, r.Error)
+		}
+	}
+}
+
+func TestBatchForget_ItemError(t *testing.T) {
+	eng := &mockEngine{
+		batchForgetFn: func(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error) {
+			results := make([]*pb.BatchForgetItemResult, len(req.Requests))
+			for i, r := range req.Requests {
+				result := &pb.BatchForgetItemResult{Index: int32(i)}
+				if r.ID == "missing" {
+					result.Error = "not found"
+				} else {
+					result.Ok = true
+				}
+				results[i] = result
+			}
+			return &pb.BatchForgetResponse{Results: results}, nil
+		},
+	}
+	srv := newPublicTestServer(t, eng)
+
+	resp, err := srv.BatchForget(context.Background(), &pb.BatchForgetRequest{
+		Requests: []*pb.ForgetRequest{
+			{ID: "engram-1"},
+			{ID: "missing"},
+			{ID: "engram-3"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BatchForget returned unexpected batch error: %v", err)
+	}
+	if len(resp.Results) != 3 {
+		t.Fatalf("got %d results, want 3", len(resp.Results))
+	}
+	if !resp.Results[0].Ok {
+		t.Error("result[0].Ok = false, want true")
+	}
+	if resp.Results[1].Ok || resp.Results[1].Error == "" {
+		t.Errorf("result[1]: Ok=%v Error=%q, want Ok=false and non-empty error", resp.Results[1].Ok, resp.Results[1].Error)
+	}
+	if !resp.Results[2].Ok {
+		t.Error("result[2].Ok = false, want true")
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Shutdown tests
 // ---------------------------------------------------------------------------
 
@@ -1398,5 +1516,51 @@ func TestShutdown_ContextTimeout(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Shutdown error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestListVaults_Success(t *testing.T) {
+	eng := &mockEngine{}
+	eng.listVaultsFn = func(_ context.Context, _ *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error) {
+		return &pb.ListVaultsResponse{Vaults: []string{"default", "work"}}, nil
+	}
+	srv := newPublicTestServer(t, eng)
+
+	// ListVaults requires an authenticated caller — inject a key into the context.
+	ctx := context.WithValue(context.Background(), auth.ContextAPIKey, &auth.APIKey{Vault: "default", Mode: auth.ModeFull})
+	resp, err := srv.ListVaults(ctx, &pb.ListVaultsRequest{})
+	if err != nil {
+		t.Fatalf("ListVaults: %v", err)
+	}
+	if len(resp.Vaults) != 2 {
+		t.Errorf("len(Vaults) = %d, want 2", len(resp.Vaults))
+	}
+	if resp.Vaults[0] != "default" || resp.Vaults[1] != "work" {
+		t.Errorf("Vaults = %v, want [default work]", resp.Vaults)
+	}
+}
+
+func TestListVaults_UnauthenticatedRejected(t *testing.T) {
+	eng := &mockEngine{}
+	srv := newPublicTestServer(t, eng)
+
+	// Anonymous caller (no ContextAPIKey in context) must be rejected.
+	_, err := srv.ListVaults(context.Background(), &pb.ListVaultsRequest{})
+	if err == nil {
+		t.Fatal("expected Unauthenticated error for anonymous caller, got nil")
+	}
+}
+
+func TestListVaults_Error(t *testing.T) {
+	eng := &mockEngine{}
+	eng.listVaultsFn = func(_ context.Context, _ *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error) {
+		return nil, errors.New("storage unavailable")
+	}
+	srv := newPublicTestServer(t, eng)
+
+	ctx := context.WithValue(context.Background(), auth.ContextAPIKey, &auth.APIKey{Vault: "default", Mode: auth.ModeFull})
+	_, err := srv.ListVaults(ctx, &pb.ListVaultsRequest{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
 	}
 }

@@ -109,6 +109,24 @@ func TestFindSimilarEntities_NoPairsForDifferentNames(t *testing.T) {
 	}
 }
 
+// TestFindSimilarEntities_IgnoresCaseVariants verifies that names differing only
+// by case are NOT reported as a similar pair: they are the same identity (one 0x1F
+// record) and merge_entity refuses them, so surfacing them is un-actionable noise.
+func TestFindSimilarEntities_IgnoresCaseVariants(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	writeEntityEngram(t, eng, "default", "MuninnDB is the memory store",
+		mbp.InlineEntity{Name: "MuninnDB", Type: "database"})
+	writeEntityEngram(t, eng, "default", "muninndb runs on the server",
+		mbp.InlineEntity{Name: "muninndb", Type: "database"})
+
+	pairs, err := eng.FindSimilarEntities(ctx, "default", 0.7, 20)
+	require.NoError(t, err)
+	require.Empty(t, pairs, "case-only variants share one identity and must not be reported as a similar pair")
+}
+
 func TestFindSimilarEntities_EmptyVault(t *testing.T) {
 	eng, cleanup := testEnv(t)
 	defer cleanup()

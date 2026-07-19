@@ -118,8 +118,8 @@ func (f *fakeEngine) GetEnrichmentMode(_ context.Context) string {
 func (f *fakeEngine) WhereLeftOff(_ context.Context, _ string, _ int) ([]WhereLeftOffEntry, error) {
 	return []WhereLeftOffEntry{}, nil
 }
-func (f *fakeEngine) FindByEntity(_ context.Context, _, _ string, _ int) ([]*storage.Engram, error) {
-	return nil, nil
+func (f *fakeEngine) FindByEntity(_ context.Context, _, _ string, _ int) (*engine.FindByEntityResult, error) {
+	return &engine.FindByEntityResult{}, nil
 }
 func (f *fakeEngine) CheckIdempotency(_ context.Context, _ string) (*storage.IdempotencyReceipt, error) {
 	return nil, nil
@@ -181,6 +181,22 @@ func (f *fakeEngine) GetVaultEmbedDim(_ context.Context, _ string) int {
 	return 0
 }
 func (f *fakeEngine) SetTrust(_ context.Context, _, _, _ string) error { return nil }
+
+func (f *fakeEngine) CompareAndSet(_ context.Context, _, _ string, _, setState *string) (bool, string, string, error) {
+	state := ""
+	if setState != nil {
+		state = *setState
+	}
+	return true, state, "", nil
+}
+
+func (f *fakeEngine) Claim(_ context.Context, _, _, owner string, _ int64) (string, string, int64, error) {
+	return "acquired", owner, 0, nil
+}
+
+func (f *fakeEngine) Release(_ context.Context, _, _, _ string) (bool, string, error) {
+	return true, "", nil
+}
 
 func (f *fakeEngine) GetAnnotations(_ context.Context, _, _ string) (*engine.AnnotationData, error) {
 	return nil, nil
@@ -283,8 +299,8 @@ func TestListTools(t *testing.T) {
 	var result map[string]any
 	json.NewDecoder(w.Body).Decode(&result)
 	tools, _ := result["tools"].([]any)
-	if len(tools) != 39 {
-		t.Errorf("expected 39 tools, got %d", len(tools))
+	if len(tools) != 42 {
+		t.Errorf("expected 42 tools, got %d", len(tools))
 	}
 }
 
