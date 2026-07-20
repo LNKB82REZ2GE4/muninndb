@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -299,5 +300,47 @@ func TestCreateVault_InvalidNameRejected(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for invalid vault name, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── GET /api/vaults — scoped keys must not see out-of-scope vault names ─────
+
+type listVaultsMockEngine struct {
+	MockEngine
+}
+
+func (m *listVaultsMockEngine) ListVaults(ctx context.Context) ([]string, error) {
+	return []string{"agent-memory", "pi", "phd-research", "proj-muninndb-ee56f739"}, nil
+}
+
+func TestListVaults_ScopedKeyFiltersToScope(t *testing.T) {
+	store := newTestAuthStore(t)
+	token, _, err := store.GenerateScopedAPIKey([]string{"agent-memory", "proj-*"}, "test-key", auth.ModeFull, nil, false)
+	if err != nil {
+		t.Fatalf("GenerateScopedAPIKey: %v", err)
+	}
+	engine := &listVaultsMockEngine{}
+	server := NewServer("localhost:8080", engine, store, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
+
+	req := httptest.NewRequest("GET", "/api/vaults", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	server.mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var vaults []string
+	if err := json.NewDecoder(w.Body).Decode(&vaults); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := map[string]bool{"agent-memory": true, "proj-muninndb-ee56f739": true}
+	if len(vaults) != len(want) {
+		t.Fatalf("expected exactly %d in-scope vaults, got %v", len(want), vaults)
+	}
+	for _, v := range vaults {
+		if !want[v] {
+			t.Errorf("out-of-scope vault leaked into listing: %q (full: %v)", v, vaults)
+		}
 	}
 }

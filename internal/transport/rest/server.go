@@ -1416,6 +1416,20 @@ func (s *Server) handleListVaults(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Scoped API keys must not learn of vaults outside their scope (no-leak,
+	// project-vaults §3.2). Static-token and admin sessions carry no APIKey in
+	// context and see the full list.
+	if key, ok := r.Context().Value(auth.ContextAPIKey).(*auth.APIKey); ok && key != nil {
+		scope := key.Scope()
+		filtered := vaults[:0]
+		for _, v := range vaults {
+			if auth.ScopeMatch(scope, v) {
+				filtered = append(filtered, v)
+			}
+		}
+		vaults = filtered
+	}
+
 	s.sendJSON(w, http.StatusOK, vaults)
 }
 
