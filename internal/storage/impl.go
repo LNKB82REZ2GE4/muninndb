@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/hashicorp/golang-lru/v2/expirable"
+	"github.com/scrypster/muninndb/internal/prefix"
 	"github.com/scrypster/muninndb/internal/provenance"
 	"github.com/scrypster/muninndb/internal/scoring"
 	"github.com/scrypster/muninndb/internal/storage/erf"
@@ -157,7 +158,7 @@ func (ps *PebbleStore) countEngramsForVault(ctx context.Context, wsPrefix [8]byt
 		}
 	}
 	upper := make([]byte, 1+8)
-	upper[0] = 0x01
+	upper[0] = prefix.Engram
 	copy(upper[1:9], upperWS[:])
 	iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
@@ -634,11 +635,18 @@ func (ps *PebbleStore) ProvenanceStore() *provenance.Store {
 	return ps.provenance
 }
 
+// clearFTSKeysPrefixes lists every FTS-index prefix that ClearFTSKeys deletes
+// via range tombstones. Hoisted to package scope so the per-list partition
+// guard (TestClearFTSKeysPrefixes_Scope) can pin its membership directly.
+var clearFTSKeysPrefixes = []byte{
+	prefix.FTSPosting, prefix.Trigram, prefix.FTSStats, prefix.TermStats,
+}
+
 // ClearFTSKeys deletes all FTS index keys for the given vault workspace prefix via
 // range tombstones. Prefixes cleared: 0x05 (posting lists), 0x06 (trigrams),
 // 0x08 (FTS global stats), 0x09 (per-term stats).
 func (ps *PebbleStore) ClearFTSKeys(ws, wsPlus [8]byte) error {
-	ftsPrefixes := []byte{0x05, 0x06, 0x08, 0x09}
+	ftsPrefixes := clearFTSKeysPrefixes
 	batch := ps.db.NewBatch()
 	for _, p := range ftsPrefixes {
 		lo := make([]byte, 9)

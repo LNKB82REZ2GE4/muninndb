@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/scrypster/muninndb/internal/prefix"
 	"github.com/scrypster/muninndb/internal/storage/erf"
 	"github.com/scrypster/muninndb/internal/storage/keys"
 )
@@ -43,10 +44,11 @@ func incrementWS(ws [8]byte) ([8]byte, error) {
 // 0x13 (VaultWeightsKey) is intentionally omitted — weights are vault-specific
 // and must not be inherited from the source.
 var vaultScopedSwapPrefixes = []byte{
-	0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-	0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x10, 0x14,
-	0x15, 0x16, 0x17,
-	0x28, // content-hash dedup index
+	prefix.Meta, prefix.AssocFwd, prefix.AssocRev, prefix.FTSPosting,
+	prefix.Trigram, prefix.HNSWNode, prefix.FTSStats, prefix.TermStats,
+	prefix.Contradiction, prefix.StateIndex, prefix.TagIndex, prefix.CreatorIndex,
+	prefix.RelevanceBucket, prefix.AssocWeightIndex, prefix.VaultCount, prefix.Provenance,
+	prefix.BucketMigration, prefix.ContentHash,
 }
 
 const cloneBatchSize = 512
@@ -84,10 +86,10 @@ func (ps *PebbleStore) CloneVaultData(
 	// ---- Phase 1: Copy engrams (0x01) with ERF decode → reset → re-encode ----
 	{
 		lo := make([]byte, 9)
-		lo[0] = 0x01
+		lo[0] = prefix.Engram
 		copy(lo[1:], wsSource[:])
 		hi := make([]byte, 9)
-		hi[0] = 0x01
+		hi[0] = prefix.Engram
 		copy(hi[1:], wsSourceNext[:])
 
 		iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
@@ -200,8 +202,8 @@ func (ps *PebbleStore) CloneVaultData(
 
 			k := iter.Key()
 
-			// Skip the 9-byte VaultCountKey (0x15 | ws[8]) — written separately.
-			if p == 0x15 && len(k) == 9 {
+			// Skip the 9-byte VaultCountKey (prefix.VaultCount | ws[8]) — written separately.
+			if p == prefix.VaultCount && len(k) == 9 {
 				continue
 			}
 
@@ -290,10 +292,10 @@ func (ps *PebbleStore) MergeVaultData(
 	// ---- Phase 1: Merge engrams (0x01) with collision detection ----
 	{
 		lo := make([]byte, 9)
-		lo[0] = 0x01
+		lo[0] = prefix.Engram
 		copy(lo[1:], wsSource[:])
 		hi := make([]byte, 9)
-		hi[0] = 0x01
+		hi[0] = prefix.Engram
 		copy(hi[1:], wsSourceNext[:])
 
 		iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
@@ -395,13 +397,13 @@ func (ps *PebbleStore) MergeVaultData(
 	for _, p := range vaultScopedSwapPrefixes {
 		// Prefix-level skip: FTS stats and keeper-target prefixes.
 		switch p {
-		case 0x08, 0x09:
+		case prefix.FTSStats, prefix.TermStats:
 			// FTS global stats / per-term stats — rebuilt by reindexVault after merge.
 			continue
-		case 0x13:
+		case prefix.VaultWeights:
 			// Vault scoring weights — keep target's weights, don't overwrite with source.
 			continue
-		case 0x17:
+		case prefix.BucketMigration:
 			// Bucket migration state — keep target state, don't overwrite.
 			continue
 		}
@@ -441,7 +443,7 @@ func (ps *PebbleStore) MergeVaultData(
 
 			// Per-key strategy based on prefix.
 			switch p {
-			case 0x15:
+			case prefix.VaultCount:
 				// VaultCountKey (9 bytes): skip — recomputed in Phase 4.
 				// Episode keys (>9 bytes): UNION.
 				if len(k) == 9 {

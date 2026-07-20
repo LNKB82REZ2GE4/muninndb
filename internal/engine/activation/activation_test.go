@@ -1,9 +1,11 @@
 package activation_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"testing"
 	"time"
 
@@ -33,7 +35,13 @@ func newStubStore() *stubStore {
 
 func (s *stubStore) writeEngram(eng *storage.Engram) {
 	if eng.ID == (storage.ULID{}) {
-		eng.ID = storage.NewULID()
+		// Mirror PebbleStore.WriteEngram: derive the ULID from CreatedAt when set
+		// so the tag/time indexes are ULID-time-ordered exactly as in production.
+		if !eng.CreatedAt.IsZero() {
+			eng.ID = storage.NewULIDWithTime(eng.CreatedAt)
+		} else {
+			eng.ID = storage.NewULID()
+		}
 	}
 	if eng.Confidence == 0 {
 		eng.Confidence = 1.0
@@ -127,6 +135,80 @@ func (s *stubStore) EngramIDsByCreatedRange(_ context.Context, _ [8]byte, since,
 		}
 	}
 	return ids, nil
+}
+
+// ListByTagInRange returns tagged engrams newest-first within [since, until],
+// truncated at limit. It scans the full engram set (the tag index is independent
+// of the decay/recent pool — that independence is the whole point of #607) and
+// sorts by ULID descending, mirroring the real PebbleStore's newest-first,
+// oldest-sacrificed-on-truncation semantics.
+func (s *stubStore) ListByTagInRange(_ context.Context, _ [8]byte, tag string, since, until time.Time, limit int) ([]storage.ULID, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var matched []storage.ULID
+	for id, eng := range s.engrams {
+		if !tagInEngram(eng, tag) {
+			continue
+		}
+		if (!since.IsZero() && eng.CreatedAt.Before(since)) || (!until.IsZero() && eng.CreatedAt.After(until)) {
+			continue
+		}
+		matched = append(matched, id)
+	}
+	// Newest-first: ULID embeds the millisecond timestamp, so descending byte
+	// order is descending creation time.
+	sort.Slice(matched, func(i, j int) bool {
+		return bytes.Compare(matched[i][:], matched[j][:]) > 0
+	})
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, nil
+}
+
+func tagInEngram(eng *storage.Engram, tag string) bool {
+	for _, t := range eng.Tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// ListByTagsAllInRange returns engrams carrying EVERY tag, newest-first within
+// [since, until], with limit bounding the OUTPUT. It computes an exact set
+// intersection over the full engram set (mirroring the real PebbleStore's
+// hash-level stream intersection minus collision false positives) so the limit
+// never truncates the per-tag input the way a per-tag window would.
+func (s *stubStore) ListByTagsAllInRange(_ context.Context, _ [8]byte, tags []string, since, until time.Time, limit int) ([]storage.ULID, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var matched []storage.ULID
+	for id, eng := range s.engrams {
+		all := true
+		for _, tag := range tags {
+			if !tagInEngram(eng, tag) {
+				all = false
+				break
+			}
+		}
+		if !all {
+			continue
+		}
+		if (!since.IsZero() && eng.CreatedAt.Before(since)) || (!until.IsZero() && eng.CreatedAt.After(until)) {
+			continue
+		}
+		matched = append(matched, id)
+	}
+	sort.Slice(matched, func(i, j int) bool {
+		return bytes.Compare(matched[i][:], matched[j][:]) > 0
+	})
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, nil
 }
 
 func (s *stubStore) RestoreArchivedEdgesTransitive(_ context.Context, _ [8]byte, _ storage.ULID, _, _ int) ([]storage.ULID, error) {
@@ -1379,6 +1461,65 @@ func TestRRF_ReturnsResultsWithDefaultThreshold(t *testing.T) {
 	}
 	t.Logf("RRF returned %d results with auto-lowered threshold (score=%v)",
 		len(result.Activations), result.Activations[0].Score)
+}
+
+// ---------------------------------------------------------------------------
+// Test: Run() applies a mode-appropriate DEFAULT threshold only when the caller
+// leaves Threshold <= 0, and never overrides an explicit user-set value.
+//
+// Regression for the threshold-preservation bug: previously any explicit
+// threshold >= 0.01 was silently trampled down to 0.001 whenever RRF was on,
+// which made the API's threshold parameter meaningless under RRF.
+//
+// Run() mutates req.Threshold in place, so we assert on it after the call.
+// ---------------------------------------------------------------------------
+
+func TestRun_ThresholdDefaulting(t *testing.T) {
+	store := newStubStore()
+	eng1 := &storage.Engram{
+		Concept:    "threshold defaulting",
+		Content:    "engram for threshold defaulting behavior",
+		Confidence: 1.0,
+		Stability:  30.0,
+		Relevance:  0.8,
+	}
+	store.writeEngram(eng1)
+	ftsResults := []activation.ScoredID{{ID: eng1.ID, Score: 0.8}}
+
+	cases := []struct {
+		name      string
+		threshold float64
+		rrf       bool
+		want      float64
+	}{
+		{"explicit value preserved under RRF", 0.02, true, 0.02},
+		{"explicit value preserved without RRF", 0.02, false, 0.02},
+		{"no threshold defaults to 0.001 under RRF", 0, true, 0.001},
+		{"no threshold defaults to 0.05 without RRF", 0, false, 0.05},
+		{"negative threshold defaults to 0.001 under RRF", -1, true, 0.001},
+		{"negative threshold defaults to 0.05 without RRF", -1, false, 0.05},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := newTestEngine(store, &stubFTS{results: ftsResults}, nil)
+			req := &activation.ActivateRequest{
+				Context:    []string{"threshold"},
+				Threshold:  tc.threshold,
+				MaxResults: 10,
+				Weights: &activation.Weights{
+					UseRRFFusion: tc.rrf,
+					DisableACTR:  tc.rrf,
+				},
+			}
+			if _, err := eng.Run(context.Background(), req); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if req.Threshold != tc.want {
+				t.Errorf("Threshold = %v, want %v", req.Threshold, tc.want)
+			}
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/scrypster/muninndb/internal/prefix"
 	"github.com/scrypster/muninndb/internal/provenance"
 	"github.com/scrypster/muninndb/internal/storage/erf"
 	"github.com/scrypster/muninndb/internal/storage/keys"
@@ -424,6 +425,21 @@ func (ps *PebbleStore) UpdateTrust(ctx context.Context, wsPrefix [8]byte, id ULI
 // DeleteEngram performs a hard delete: removes the engram, all association keys,
 // and all secondary indexes. Reads the engram first to gather index data.
 func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id ULID) error {
+	// Serialize against CompareAndSet on the same engram: hold the per-engram
+	// stripe lock across the read + delete-batch-commit, mirroring what
+	// CompareAndSet does. Otherwise a concurrent CAS can read the engram, this
+	// delete can commit, and the CAS's later metadata/lease write lands after
+	// the delete — resurrecting a record the caller believes is gone. Under the
+	// lock the two paths serialize: a CAS that loses the race reads not-found
+	// and writes nothing.
+	//
+	// The lock only needs to span the read and the batch commit: once the batch
+	// is committed the metadata/lease are gone, so a later CAS reads not-found.
+	// Post-commit cleanup (replication, cache, entity counts) is unlocked to
+	// keep the stripe free during the O(n) entity work.
+	mu := ps.casLocks.For(id[:])
+	mu.Lock()
+
 	// Read engram to collect secondary index data for cleanup.
 	eng, err := ps.GetEngram(ctx, wsPrefix, id)
 	if err != nil {
@@ -433,11 +449,13 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 		batch.Delete(keys.EngramKey(wsPrefix, [16]byte(id)), nil)
 		batch.Delete(keys.MetaKey(wsPrefix, [16]byte(id)), nil)
 		batch.Delete(keys.LeaseKey(wsPrefix, [16]byte(id)), nil)
-		ps.cache.Delete(wsPrefix, id)
 		if err := batch.Commit(pebble.NoSync); err != nil {
+			mu.Unlock()
 			return err
 		}
+		mu.Unlock()
 		ps.replicateBatch(batch)
+		ps.cache.Delete(wsPrefix, id)
 		return nil
 	}
 
@@ -563,8 +581,10 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 	}
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
+		mu.Unlock()
 		return fmt.Errorf("delete engram: %w", err)
 	}
+	mu.Unlock()
 	ps.replicateBatch(batch)
 
 	ps.cache.Delete(wsPrefix, id)
@@ -903,10 +923,10 @@ func (ps *PebbleStore) ScanEngrams(ctx context.Context, ws [8]byte, fn func(*Eng
 	}
 
 	lo := make([]byte, 9)
-	lo[0] = 0x01
+	lo[0] = prefix.Engram
 	copy(lo[1:], ws[:])
 	hi := make([]byte, 9)
-	hi[0] = 0x01
+	hi[0] = prefix.Engram
 	copy(hi[1:], wsNext[:])
 
 	iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
@@ -917,10 +937,10 @@ func (ps *PebbleStore) ScanEngrams(ctx context.Context, ws [8]byte, fn func(*Eng
 
 	// Second iterator for 0x18 embedding keys — sorted by ws|id, same order as 0x01.
 	eLo := make([]byte, 9)
-	eLo[0] = 0x18
+	eLo[0] = prefix.Embedding
 	copy(eLo[1:], ws[:])
 	eHi := make([]byte, 9)
-	eHi[0] = 0x18
+	eHi[0] = prefix.Embedding
 	copy(eHi[1:], wsNext[:])
 
 	embedIter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: eLo, UpperBound: eHi})

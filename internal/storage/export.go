@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/scrypster/muninndb/internal/prefix"
 )
 
 // vaultScopedExportPrefixes lists every prefix scoped by a vault workspace
@@ -23,30 +24,12 @@ import (
 // global/name keys excluded from the data stream (written by WriteVaultName
 // on import). 0x11 (DigestFlagsKey) is globally keyed by ULID — excluded.
 var vaultScopedExportPrefixes = []byte{
-	0x01, // engrams (full record)
-	0x02, // metadata-only
-	0x03, // forward associations
-	0x04, // reverse associations
-	0x05, // FTS posting lists
-	0x06, // trigrams
-	0x07, // HNSW node neighbors
-	0x08, // FTS global stats
-	0x09, // per-term FTS stats
-	0x0A, // contradictions
-	0x0B, // state secondary index
-	0x0C, // tag secondary index
-	0x0D, // creator secondary index
-	0x10, // relevance bucket index
-	0x12, // coherence counters
-	0x13, // vault scoring weights
-	0x14, // association weight index
-	0x15, // vault count key
-	0x16, // provenance
-	0x17, // bucket migration state
-	0x18, // standalone embeddings (ERF v2 EmbeddingKey)
-	0x1A, // episode keys (EpisodeKey + EpisodeFrameKey)
-	0x1B, // FTS schema version marker
-	0x28, // content-hash dedup index
+	prefix.Engram, prefix.Meta, prefix.AssocFwd, prefix.AssocRev,
+	prefix.FTSPosting, prefix.Trigram, prefix.HNSWNode, prefix.FTSStats,
+	prefix.TermStats, prefix.Contradiction, prefix.StateIndex, prefix.TagIndex,
+	prefix.CreatorIndex, prefix.RelevanceBucket, prefix.Coherence, prefix.VaultWeights,
+	prefix.AssocWeightIndex, prefix.VaultCount, prefix.Provenance, prefix.BucketMigration,
+	prefix.Embedding, prefix.Episode, prefix.FTSVersion, prefix.ContentHash,
 }
 
 const exportBatchSize = 512
@@ -111,7 +94,7 @@ func (ps *PebbleStore) ExportVaultData(
 			// byte size: 4 (key_len) + strippedLen + 4 (val_len) + len(v)
 			kvSize += int64(4 + strippedLen + 4 + len(v))
 
-			if p == 0x01 {
+			if p == prefix.Engram {
 				engramCount++
 			}
 			totalKeys++
@@ -399,12 +382,12 @@ func (ps *PebbleStore) ImportVaultData(
 				copy(fullKey[1:9], wsTarget[:])
 				copy(fullKey[9:], strippedKey[1:])
 
-				prefix := strippedKey[0]
+				prefixByte := strippedKey[0]
 
-				// Deduplication: for EngramKey (0x01), check if this engram already exists
+				// Deduplication: for EngramKey (prefix.Engram), check if this engram already exists
 				// in the target vault. If it does, record its ID in skipIDs so that all
 				// related keys are also skipped.
-				if prefix == 0x01 {
+				if prefixByte == prefix.Engram {
 					if len(strippedKey) >= 17 {
 						existing, closer, getErr := ps.db.Get(fullKey)
 						if getErr == nil {
@@ -426,8 +409,8 @@ func (ps *PebbleStore) ImportVaultData(
 				// Skip keys whose engram ID is in skipIDs.
 				// Each key type has the engram ID at a specific offset in the stripped key.
 				if len(skipIDs) > 0 {
-					switch prefix {
-					case 0x02, 0x07, 0x16, 0x18:
+					switch prefixByte {
+					case prefix.Meta, prefix.HNSWNode, prefix.Provenance, prefix.Embedding:
 						// MetaKey, HNSWNodeKey, ProvenanceKey, EmbeddingKey:
 						// stripped layout: [prefix(1)][id(16)]...  — ID at bytes 1:17
 						if len(strippedKey) >= 17 {
@@ -437,8 +420,8 @@ func (ps *PebbleStore) ImportVaultData(
 								continue
 							}
 						}
-					case 0x03:
-						// AssocFwdKey: stripped = [0x03][src(16)][weight(4)][dst(16)]
+					case prefix.AssocFwd:
+						// AssocFwdKey: stripped = [prefix.AssocFwd][src(16)][weight(4)][dst(16)]
 						// src ID at bytes 1:17
 						if len(strippedKey) >= 17 {
 							var id [16]byte
@@ -447,8 +430,8 @@ func (ps *PebbleStore) ImportVaultData(
 								continue
 							}
 						}
-					case 0x04:
-						// AssocRevKey: stripped = [0x04][dst(16)][weight(4)][src(16)]
+					case prefix.AssocRev:
+						// AssocRevKey: stripped = [prefix.AssocRev][dst(16)][weight(4)][src(16)]
 						// src ID at bytes 21:37
 						if len(strippedKey) >= 37 {
 							var id [16]byte
@@ -457,8 +440,8 @@ func (ps *PebbleStore) ImportVaultData(
 								continue
 							}
 						}
-					case 0x10:
-						// RelevanceBucketKey: stripped = [0x10][bucket(1)][id(16)]
+					case prefix.RelevanceBucket:
+						// RelevanceBucketKey: stripped = [prefix.RelevanceBucket][bucket(1)][id(16)]
 						// ID at bytes 2:18
 						if len(strippedKey) >= 18 {
 							var id [16]byte
@@ -471,7 +454,7 @@ func (ps *PebbleStore) ImportVaultData(
 				}
 
 				batch.Set(fullKey, val, nil)
-				if strippedKey[0] == 0x01 {
+				if strippedKey[0] == prefix.Engram {
 					engramCount++
 				}
 				totalKeys++

@@ -23,6 +23,19 @@ type mcpEngineAdapter struct {
 	pStore   plugin.PluginStore // needed by RetryEnrich to persist entities/relationships
 }
 
+// RegisterVaultName registers a vault name (idempotent 2-key write).
+// Delegates to engine.Engine.RegisterVaultName (RFC #597: muninn_create_workflow_vault).
+func (a *mcpEngineAdapter) RegisterVaultName(name string) error {
+	return a.eng.RegisterVaultName(name)
+}
+
+// VaultNameExists reports whether a vault name is already registered.
+// Delegates to engine.Engine.VaultNameExists (RFC #597 RedTeam fix:
+// existence-check before minting into a caller-supplied name).
+func (a *mcpEngineAdapter) VaultNameExists(name string) bool {
+	return a.eng.VaultNameExists(name)
+}
+
 // NewEngineAdapter returns an EngineInterface backed by eng with optional enricher.
 // pStore is used by RetryEnrich to persist entity and relationship data; pass nil when
 // no enrichment plugin is configured (RetryEnrich will error before using pStore).
@@ -369,15 +382,23 @@ func (a *mcpEngineAdapter) WhereLeftOff(ctx context.Context, vault string, limit
 		if eng == nil {
 			continue
 		}
-		entries = append(entries, WhereLeftOffEntry{
-			ID:         eng.ID.String(),
-			Concept:    eng.Concept,
-			Summary:    eng.Summary,
-			LastAccess: eng.LastAccess,
-			State:      lifecycleStateLabel(eng.State),
-		})
+		entries = append(entries, whereLeftOffEntryFromEngram(eng))
 	}
 	return entries, nil
+}
+
+// whereLeftOffEntryFromEngram projects a stored engram onto the
+// muninn_where_left_off result shape.
+func whereLeftOffEntryFromEngram(eng *storage.Engram) WhereLeftOffEntry {
+	return WhereLeftOffEntry{
+		ID:         eng.ID.String(),
+		Concept:    eng.Concept,
+		Summary:    eng.Summary,
+		LastAccess: eng.LastAccess,
+		State:      lifecycleStateLabel(eng.State),
+		Type:       eng.MemoryType.String(),
+		TypeLabel:  eng.TypeLabel,
+	}
 }
 
 // lifecycleStateLabel converts a storage.LifecycleState to a display string.
