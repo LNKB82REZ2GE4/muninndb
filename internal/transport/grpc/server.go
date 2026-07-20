@@ -72,10 +72,14 @@ func denyReadOnlyMutation(ctx context.Context) error {
 func (s *Server) resolveRequestVault(ctx context.Context, reqVault string) (string, error) {
 	reqVault = strings.TrimSpace(reqVault)
 	if key, ok := ctx.Value(auth.ContextAPIKey).(*auth.APIKey); ok && key != nil {
-		if reqVault != "" && reqVault != key.Vault {
+		resolved, ok := auth.ResolveScopedVault(key.Scope(), reqVault)
+		if !ok {
+			if reqVault == "" {
+				return "", status.Error(codes.PermissionDenied, "this key requires an explicit vault")
+			}
 			return "", status.Errorf(codes.PermissionDenied, "api key is not authorized for vault %q", reqVault)
 		}
-		return key.Vault, nil
+		return resolved, nil
 	}
 
 	vault := reqVault

@@ -5,7 +5,27 @@ const (
 	prefixAPIKey     byte = 0x12
 	prefixAPIKeyVIdx byte = 0x13
 	prefixVaultCfg   byte = 0x14
+	prefixAPIKeyGlob byte = 0x29 // glob-scope key index; see docs/key-space-schema.md
 )
+
+// apiKeyGlobIdxKey indexes API keys that have at least one glob-scope entry
+// (e.g. "proj-*"). Unlike apiKeyVaultIdxKey this is not vault-scoped — a glob
+// entry has no single vault name to index against — so listing for a
+// specific vault scans this whole (expected-small) prefix and pattern-matches
+// each key's scope client-side (see Store.ListAPIKeys). The value is the
+// key's 16-byte storage hash, mirroring apiKeyVaultIdxKey.
+func apiKeyGlobIdxKey(keyID []byte) []byte {
+	key := make([]byte, 1+8)
+	key[0] = prefixAPIKeyGlob
+	copy(key[1:], keyID[:8])
+	return key
+}
+
+// apiKeyGlobIdxBounds returns the [lower, upper) scan range covering every
+// glob-scope index entry.
+func apiKeyGlobIdxBounds() (lower, upper []byte) {
+	return []byte{prefixAPIKeyGlob}, []byte{prefixAPIKeyGlob + 1}
+}
 
 func adminUserKey(username string) []byte {
 	key := make([]byte, 1+len(username))

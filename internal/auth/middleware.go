@@ -34,18 +34,26 @@ func (s *Store) VaultAuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 				http.Error(w, `{"error":"invalid api key"}`, http.StatusUnauthorized)
 				return
 			}
-			// Check query-param vault against the key's vault (no body parse needed).
-			if queryVault := strings.TrimSpace(r.URL.Query().Get("vault")); queryVault != "" && queryVault != key.Vault {
+			// Check query-param vault against the key's scope (no body parse needed).
+			queryVault := strings.TrimSpace(r.URL.Query().Get("vault"))
+			resolvedVault, ok := ResolveScopedVault(key.Scope(), queryVault)
+			if !ok {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
+				msg := "this key requires an explicit vault"
+				code := "VAULT_SCOPE_REQUIRED"
+				if queryVault != "" {
+					msg = fmt.Sprintf("api key is not authorized for vault %q", queryVault)
+					code = "VAULT_KEY_MISMATCH"
+				}
 				errMsg, _ := json.Marshal(map[string]string{
-					"error": fmt.Sprintf("api key is not authorized for vault %q", queryVault),
-					"code":  "VAULT_KEY_MISMATCH",
+					"error": msg,
+					"code":  code,
 				})
 				w.Write(errMsg)
 				return
 			}
-			ctx := context.WithValue(r.Context(), ContextVault, key.Vault)
+			ctx := context.WithValue(r.Context(), ContextVault, resolvedVault)
 			ctx = context.WithValue(ctx, ContextMode, key.Mode)
 			ctx = context.WithValue(ctx, ContextAPIKey, &key)
 			next(w, r.WithContext(ctx))

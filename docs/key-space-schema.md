@@ -1,8 +1,10 @@
 # Key-Space Schema
 
-MuninnDB stores all state in a single Pebble instance using a prefix-partitioned key space. Each prefix byte (0x01–0x24) identifies a distinct data type, and keys are constructed by dedicated functions in the `storage` package — never assembled ad hoc. Most prefixes are vault-scoped: the key begins with a workspace prefix (`wsPrefix`) derived from a SipHash of the vault name. A handful of prefixes are global (cross-vault) and omit the workspace prefix entirely.
+MuninnDB stores all state in a single Pebble instance using a prefix-partitioned key space. Each prefix byte identifies a distinct data type, and keys are normally constructed by dedicated functions in the `storage` package — never assembled ad hoc. Most prefixes are vault-scoped: the key begins with a workspace prefix (`wsPrefix`) derived from a SipHash of the vault name. A handful of prefixes are global (cross-vault) and omit the workspace prefix entirely.
 
 This document is the authoritative reference for every prefix in the system. Update it before merging any change that introduces or modifies a key layout.
+
+> **Known gap (found 2026-07-20, not fixed by this note):** `internal/auth` maintains its own prefix byte constants (`prefixAdminUser`, `prefixAPIKey`, `prefixAPIKeyVIdx`, `prefixVaultCfg` = `0x11`–`0x14`) in `internal/auth/keys.go`, assigned independently of this table and of the `storage` package's own `0x11`–`0x14` (Digest Flags, Coherence, Vault Weights, Assoc Weight Index). `auth.Store` and `storage.PebbleStore` share the *same* `pebble.DB` handle (see `cmd/muninn/server.go`), so these are the same byte-space, not two separate namespaces. In practice this has not caused observed corruption because the two packages' key layouts differ enough in trailing-byte content that exact-key collisions are astronomically unlikely, and nothing does a raw prefix-only scan across both packages' data — but it is a latent correctness hazard and a documentation gap this table does not otherwise capture. The new `0x29` prefix added below was chosen to avoid colliding with *either* package's existing bytes. Fixing the underlying auth/storage prefix-space split is out of scope for the change that added this note.
 
 ---
 
@@ -54,9 +56,15 @@ This document is the authoritative reference for every prefix in the system. Upd
 | 0x1F | Entity Registry | Global | `nameHash(8)` | NoSync | Global entity record. Confidence-preserving merge on conflict. |
 | 0x20 | Entity Forward Link | Vault | `ws(8) \| engramID(16) \| nameHash(8)` | NoSync | Engram→entity link. Always written atomically with 0x23. |
 | 0x21 | Entity Relationship | Vault | `ws(8) \| engramID(16) \| fromHash(8) \| relTypeByte(1) \| toHash(8)` | NoSync | Typed relationship between two entities, scoped to an engram. |
+| 0x22 | Last Access Index | Vault | `ws(8) \| invertedMillis(8) \| id(16)` | NoSync | Secondary index on last-access time. Inverted milliseconds so ascending Pebble scan returns most-recently-accessed entries first. (Row was missing from this table pre-2026-07; entry has existed in code since the last-access index was added — see `storage/keys.LastAccessIndexKey`.) |
 | 0x23 | Entity Reverse Index | Cross-vault | `nameHash(8) \| ws(8) \| engramID(16)` | NoSync | Entity←engram reverse lookup across vaults. Always written atomically with 0x20. |
 | 0x24 | Entity Co-occurrence | Vault | `ws(8) \| hashA(8) \| hashB(8)` | NoSync | Pairwise entity co-occurrence count. Hash pair is canonically ordered (hashA < hashB). |
+| 0x25 | Archived Association | Vault | `ws(8) \| src(16) \| dst(16)` | NoSync | Association edges moved out of the hot 0x03/0x04/0x14 indexes once their weight exceeds the archive threshold. (Row was missing from this table; entry has existed in code — see `storage/keys.ArchiveAssocKey`.) |
+| 0x26 | Relationship Entity Index | Vault | `ws(8) \| entityHash(8) \| engramID(16)` | NoSync | Secondary index from an entity back to engrams referencing it via 0x21, for efficient entity-scoped relationship lookups. (Row was missing from this table; entry has existed in code — see `storage/keys.RelEntityIndexKey`.) |
 | 0x27 | Dream State | Vault | `ws(8)` | NoSync→Sync | Per-vault dream consolidation state (last run time, engram count at run). Also used for global dream-due flag with zero vault prefix. |
+| 0x28 | Content-Hash Dedup Index | Vault | `ws(8) \| sha256(32)` | NoSync | Maps a content hash to an existing engram, for dedup-on-write. (Row was missing from this table; entry has existed in code — see `storage/keys.ContentHashKey`.) |
+| 0x29 | API Key Glob-Scope Index | Global | `keyID(8)` | **Sync** | Indexes API keys that have at least one glob (`<prefix>*`) vault-scope entry, for vault-scoped key listing/revocation (`internal/auth`, not `internal/storage` — see note below). Value is the key's 16-byte storage hash. Written in the same batch as the key record, alongside one 0x13-prefixed entry per literal scope entry (existing prefix, reused for multi-entry scopes). |
+| 0x2A | Ownership Lease | Vault | `ws(8) \| ulid(16)` | NoSync | Sidecar record next to an engram recording which process/worker currently owns it. (Row was missing from this table; entry has existed in code — see `storage/lease.go`.) |
 
 \* Engram (0x01) and Metadata (0x02) default to Sync. When `NoSyncEngrams=true`, they move to NoSync tier (WAL syncer provides ≤10ms durability).
 

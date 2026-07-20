@@ -177,3 +177,124 @@ func TestAPIKey_WrongVault(t *testing.T) {
 		t.Error("key should not be valid for vault-b")
 	}
 }
+
+// --- GenerateScopedAPIKey: multi-vault index round-trip (§3.5) ---
+
+func TestGenerateScopedAPIKey_MixedScope_CreateListRevoke(t *testing.T) {
+	s := NewStore(openAuthTestDB(t))
+
+	token, key, err := s.GenerateScopedAPIKey([]string{"agent-memory", "proj-*"}, "hook", ModeFull, nil, false)
+	if err != nil {
+		t.Fatalf("GenerateScopedAPIKey: %v", err)
+	}
+	if len(key.Vaults) != 2 {
+		t.Fatalf("expected 2 scope entries, got %v", key.Vaults)
+	}
+	if key.Vault != "agent-memory" {
+		t.Errorf("expected legacy Vault display field to default to 'agent-memory', got %q", key.Vault)
+	}
+
+	// Validate: token round-trips to the same scope.
+	got, err := s.ValidateAPIKey(token)
+	if err != nil {
+		t.Fatalf("ValidateAPIKey: %v", err)
+	}
+	if !ScopeMatch(got.Scope(), "proj-anything") {
+		t.Error("expected validated key's scope to match proj-* glob")
+	}
+
+	// List by literal vault: found via the literal index (0x13).
+	literalKeys, err := s.ListAPIKeys("agent-memory")
+	if err != nil {
+		t.Fatalf("ListAPIKeys(agent-memory): %v", err)
+	}
+	if !containsKeyID(literalKeys, key.ID) {
+		t.Errorf("expected key %s to appear when listing agent-memory", key.ID)
+	}
+
+	// List by glob-matched vault: found via the glob index (0x29), never via
+	// the literal index (since "proj-anything" was never written literally).
+	globKeys, err := s.ListAPIKeys("proj-anything")
+	if err != nil {
+		t.Fatalf("ListAPIKeys(proj-anything): %v", err)
+	}
+	if !containsKeyID(globKeys, key.ID) {
+		t.Errorf("expected key %s to appear when listing proj-anything via glob index", key.ID)
+	}
+
+	// Listing an out-of-scope vault must not find the key.
+	otherKeys, err := s.ListAPIKeys("unrelated-vault")
+	if err != nil {
+		t.Fatalf("ListAPIKeys(unrelated-vault): %v", err)
+	}
+	if containsKeyID(otherKeys, key.ID) {
+		t.Error("key must not appear for an out-of-scope vault")
+	}
+
+	// Revoke via one of the literal scope entries deletes every index entry
+	// (literal 0x13 row and the glob 0x29 row).
+	if err := s.RevokeAPIKey("agent-memory", key.ID); err != nil {
+		t.Fatalf("RevokeAPIKey: %v", err)
+	}
+	if _, err := s.ValidateAPIKey(token); err == nil {
+		t.Error("expected revoked key to be invalid")
+	}
+	if postRevoke, _ := s.ListAPIKeys("agent-memory"); containsKeyID(postRevoke, key.ID) {
+		t.Error("revoked key must not appear in literal-scope listing")
+	}
+	if postRevoke, _ := s.ListAPIKeys("proj-anything"); containsKeyID(postRevoke, key.ID) {
+		t.Error("revoked key must not appear in glob-scope listing (glob index entry not cleaned up)")
+	}
+}
+
+func TestGenerateScopedAPIKey_GlobOnlyScope_RevokeByAnyVault(t *testing.T) {
+	s := NewStore(openAuthTestDB(t))
+
+	_, key, err := s.GenerateScopedAPIKey([]string{"proj-*"}, "hook", ModeFull, nil, false)
+	if err != nil {
+		t.Fatalf("GenerateScopedAPIKey: %v", err)
+	}
+	// A glob-only scope has no literal index entry at all; revocation must
+	// still succeed via the keyID-only glob index, regardless of the vault
+	// argument passed in (it has no meaning for a glob-only key).
+	if err := s.RevokeAPIKey("default", key.ID); err != nil {
+		t.Fatalf("RevokeAPIKey on glob-only scope: %v", err)
+	}
+}
+
+func TestGenerateScopedAPIKey_GlobGrammar_Rejected(t *testing.T) {
+	s := NewStore(openAuthTestDB(t))
+
+	cases := [][]string{
+		{"proj-*-suffix"}, // mid-string star
+		{"*"},             // bare star without allow-all
+		{"Invalid_Upper*"},
+		{"has space"},
+	}
+	for _, scope := range cases {
+		if _, _, err := s.GenerateScopedAPIKey(scope, "l", ModeFull, nil, false); err == nil {
+			t.Errorf("expected GenerateScopedAPIKey(%v) to be rejected", scope)
+		}
+	}
+
+	// Bare '*' accepted only with allowAll.
+	if _, _, err := s.GenerateScopedAPIKey([]string{"*"}, "l", ModeFull, nil, true); err != nil {
+		t.Errorf("expected bare '*' with allowAll to succeed, got: %v", err)
+	}
+}
+
+func TestGenerateScopedAPIKey_EmptyScope_Rejected(t *testing.T) {
+	s := NewStore(openAuthTestDB(t))
+	if _, _, err := s.GenerateScopedAPIKey(nil, "l", ModeFull, nil, false); err == nil {
+		t.Error("expected error for empty scope")
+	}
+}
+
+func containsKeyID(keys []APIKey, id string) bool {
+	for _, k := range keys {
+		if k.ID == id {
+			return true
+		}
+	}
+	return false
+}

@@ -182,8 +182,8 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 		args = make(map[string]any)
 	}
 
-	// Resolve vault — pinned to key's vault when authenticated via mk_ API key.
-	vault, errMsg := resolveVault(a.Vault, args)
+	// Resolve vault — scoped to key's vault(s) when authenticated via mk_ API key.
+	vault, errMsg := resolveVaultScoped(a.Scope, args)
 	if errMsg != "" {
 		sendError(w, req.ID, -32602, "invalid params: "+errMsg)
 		return

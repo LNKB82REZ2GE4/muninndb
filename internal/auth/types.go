@@ -16,6 +16,13 @@ type APIKey struct {
 	CreatedAt   time.Time  `json:"created_at"`
 	StorageHash []byte     `json:"storage_hash"`
 	ExpiresAt   *time.Time `json:"expires_at,omitempty"` // nil = never expires
+
+	// Vaults is the key's vault scope: literal vault names and/or
+	// "<literal-prefix>*" glob entries (trailing star only). When empty,
+	// the legacy single-vault Vault field is the key's scope (back-compat
+	// for records written before multi-vault keys existed). Use Scope() to
+	// read the effective scope rather than this field directly.
+	Vaults []string `json:"vaults,omitempty"`
 }
 
 type VaultConfig struct {

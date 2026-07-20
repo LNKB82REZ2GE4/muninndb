@@ -84,20 +84,15 @@ func vaultNameCollision(existingNames []string, newName string) string {
 func (s *Server) handleCreateAPIKey(authStore *auth.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Vault   string `json:"vault"`
-			Label   string `json:"label"`
-			Mode    string `json:"mode"`
-			Expires string `json:"expires"` // optional: duration like "90d", "1y", or RFC3339 date
+			Vault    string   `json:"vault"`
+			Vaults   []string `json:"vaults"`
+			AllowAll bool     `json:"allow_all"`
+			Label    string   `json:"label"`
+			Mode     string   `json:"mode"`
+			Expires  string   `json:"expires"` // optional: duration like "90d", "1y", or RFC3339 date
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid request body")
-			return
-		}
-		if req.Vault == "" {
-			req.Vault = "default"
-		}
-		if !isValidVaultName(req.Vault) {
-			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid vault name")
 			return
 		}
 		if len(req.Label) > 256 {
@@ -120,10 +115,31 @@ func (s *Server) handleCreateAPIKey(authStore *auth.Store) http.HandlerFunc {
 			}
 			expiresAt = &t
 		}
-		token, key, err := authStore.GenerateAPIKey(req.Vault, req.Label, req.Mode, expiresAt)
-		if err != nil {
-			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, err.Error())
-			return
+
+		var token string
+		var key auth.APIKey
+		var err error
+		if len(req.Vaults) > 0 {
+			// New multi-vault scoped path: literal names and/or trailing-star globs.
+			token, key, err = authStore.GenerateScopedAPIKey(req.Vaults, req.Label, req.Mode, expiresAt, req.AllowAll)
+			if err != nil {
+				s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, err.Error())
+				return
+			}
+		} else {
+			// Legacy single-vault path — unchanged behavior.
+			if req.Vault == "" {
+				req.Vault = "default"
+			}
+			if !isValidVaultName(req.Vault) {
+				s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid vault name")
+				return
+			}
+			token, key, err = authStore.GenerateAPIKey(req.Vault, req.Label, req.Mode, expiresAt)
+			if err != nil {
+				s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, err.Error())
+				return
+			}
 		}
 		key.StorageHash = nil // never leak the storage hash to API consumers
 		s.sendJSON(w, http.StatusCreated, map[string]interface{}{
@@ -132,7 +148,7 @@ func (s *Server) handleCreateAPIKey(authStore *auth.Store) http.HandlerFunc {
 		})
 		s.EmitAudit(r, "api_key.create", "api_key", key.ID, "ok", map[string]string{
 			"label": req.Label,
-			"vault": req.Vault,
+			"vault": strings.Join(key.Scope(), ","),
 		})
 	}
 }

@@ -16,7 +16,10 @@ func printAPIKeyUsage() {
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  create  --vault <vault> [--label <label>] [--mode full|observe] [--expires 90d]")
+	fmt.Println("  create  --vaults <a,b,proj-*> [--allow-all] [--label <label>] [--mode full|observe] [--expires 90d]")
 	fmt.Println("                                           Create a new API key (token shown once)")
+	fmt.Println("                                           --vaults accepts literal vault names and/or")
+	fmt.Println("                                           trailing-star globs (e.g. proj-*); bare '*' needs --allow-all")
 	fmt.Println("  list    [--vault <vault>]                List API keys (no token values)")
 	fmt.Println("  revoke  <key-id> [--vault <vault>]      Revoke an API key immediately")
 	fmt.Println()
@@ -75,7 +78,8 @@ func runAPIKey(args []string) {
 // ---------------------------------------------------------------------------
 
 func runAPIKeyCreate(args []string) {
-	var vault, label, mode, expires string
+	var vault, vaults, label, mode, expires string
+	var allowAll bool
 
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -87,6 +91,15 @@ func runAPIKeyCreate(args []string) {
 			}
 		case strings.HasPrefix(a, "--vault="):
 			vault = strings.TrimPrefix(a, "--vault=")
+		case a == "--vaults":
+			if i+1 < len(args) {
+				i++
+				vaults = args[i]
+			}
+		case strings.HasPrefix(a, "--vaults="):
+			vaults = strings.TrimPrefix(a, "--vaults=")
+		case a == "--allow-all":
+			allowAll = true
 		case a == "--label" || a == "-l":
 			if i+1 < len(args) {
 				i++
@@ -111,8 +124,13 @@ func runAPIKeyCreate(args []string) {
 		}
 	}
 
-	if vault == "" {
+	if vault == "" && vaults == "" {
 		fmt.Println("Usage: muninn api-key create --vault <vault> [--label <label>] [--mode full|observe] [--expires 90d]")
+		fmt.Println("       muninn api-key create --vaults <a,b,proj-*> [--allow-all] [--label <label>] [--mode full|observe] [--expires 90d]")
+		return
+	}
+	if vault != "" && vaults != "" {
+		fmt.Println("Error: use either --vault or --vaults, not both")
 		return
 	}
 
@@ -125,9 +143,14 @@ func runAPIKeyCreate(args []string) {
 	}
 
 	body := map[string]any{
-		"vault": vault,
 		"label": label,
 		"mode":  mode,
+	}
+	if vaults != "" {
+		body["vaults"] = strings.Split(vaults, ",")
+		body["allow_all"] = allowAll
+	} else {
+		body["vault"] = vault
 	}
 	if expires != "" {
 		body["expires"] = expires
@@ -167,6 +190,7 @@ func runAPIKeyCreate(args []string) {
 		Key   struct {
 			ID        string     `json:"id"`
 			Vault     string     `json:"vault"`
+			Vaults    []string   `json:"vaults,omitempty"`
 			Label     string     `json:"label"`
 			Mode      string     `json:"mode"`
 			CreatedAt time.Time  `json:"created_at"`
@@ -178,6 +202,11 @@ func runAPIKeyCreate(args []string) {
 		return
 	}
 
+	scope := result.Key.Vault
+	if len(result.Key.Vaults) > 0 {
+		scope = strings.Join(result.Key.Vaults, ", ")
+	}
+
 	fmt.Println()
 	fmt.Println("  API key created.")
 	fmt.Println()
@@ -186,7 +215,7 @@ func runAPIKeyCreate(args []string) {
 	fmt.Println("  IMPORTANT: This token will NOT be shown again. Copy it now.")
 	fmt.Println()
 	fmt.Printf("  ID     : %s\n", result.Key.ID)
-	fmt.Printf("  Vault  : %s\n", result.Key.Vault)
+	fmt.Printf("  Vault  : %s\n", scope)
 	fmt.Printf("  Label  : %s\n", result.Key.Label)
 	fmt.Printf("  Mode   : %s\n", result.Key.Mode)
 	fmt.Printf("  Created: %s\n", result.Key.CreatedAt.Format(time.RFC3339))
@@ -250,6 +279,7 @@ func runAPIKeyList(args []string) {
 		Keys []struct {
 			ID        string     `json:"id"`
 			Vault     string     `json:"vault"`
+			Vaults    []string   `json:"vaults,omitempty"`
 			Label     string     `json:"label"`
 			Mode      string     `json:"mode"`
 			CreatedAt time.Time  `json:"created_at"`
@@ -283,9 +313,13 @@ func runAPIKeyList(args []string) {
 		if label == "" {
 			label = "(none)"
 		}
+		scope := k.Vault
+		if len(k.Vaults) > 0 {
+			scope = strings.Join(k.Vaults, ",")
+		}
 		fmt.Printf("  %-12s  %-16s  %-20s  %-8s  %-20s  %s\n",
 			k.ID,
-			k.Vault,
+			scope,
 			label,
 			k.Mode,
 			k.CreatedAt.Format("2006-01-02 15:04:05"),

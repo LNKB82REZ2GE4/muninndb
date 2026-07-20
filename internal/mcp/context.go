@@ -64,6 +64,7 @@ func authFromRequest(r *http.Request, requiredToken string, apiKeyStore apiKeyVa
 				Token:      token,
 				Authorized: true,
 				Vault:      key.Vault,
+				Scope:      key.Scope(),
 				Mode:       key.Mode,
 				IsAPIKey:   true,
 			}
@@ -139,6 +140,50 @@ func resolveVault(pinnedVault string, args map[string]any) (vault string, errMsg
 		// sensitive. The client already knows which vault they requested.
 		return "", "vault mismatch: this key is scoped to a specific vault — " +
 			"omit the vault arg or use a key scoped to the requested vault"
+	}
+
+	if hasArg && argVault != "" {
+		return argVault, ""
+	}
+	return "default", ""
+}
+
+// resolveVaultScoped determines the effective vault for a tool call from a
+// key's full vault scope (literals and/or "<prefix>*" globs), superseding
+// resolveVault for multi-vault keys. resolveVault is retained unchanged for
+// its existing single-vault callers and tests.
+//
+// Resolution order:
+//  1. scope non-empty (from mk_ key auth) + arg absent → default to the
+//     first scope entry, iff it is a literal; a glob-first scope has no
+//     default and the call errors.
+//  2. scope non-empty + arg present → allowed iff it matches any scope entry
+//     (literal equality or glob prefix); otherwise a mismatch error.
+//  3. No scope (static-token or open-server auth) + explicit arg → use arg.
+//  4. No scope + no arg → use "default".
+//
+// Returns (vault, errMsg). errMsg is non-empty on error. Never echoes scope
+// contents back to the caller.
+func resolveVaultScoped(scope []string, args map[string]any) (vault string, errMsg string) {
+	argVault, hasArg, invalidArg := vaultFromArgs(args)
+
+	if invalidArg {
+		return "", "invalid vault name: must be 1-64 lowercase alphanumeric, hyphen, or underscore characters"
+	}
+
+	if len(scope) > 0 {
+		reqVault := ""
+		if hasArg {
+			reqVault = argVault
+		}
+		if resolved, ok := auth.ResolveScopedVault(scope, reqVault); ok {
+			return resolved, ""
+		}
+		if reqVault == "" {
+			return "", "this key requires an explicit vault"
+		}
+		return "", "vault mismatch: this key is scoped to specific vault(s) — " +
+			"omit the vault arg or use a vault within the key's scope"
 	}
 
 	if hasArg && argVault != "" {

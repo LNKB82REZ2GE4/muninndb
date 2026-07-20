@@ -48,10 +48,14 @@ func (s *Server) scopeVault(ctx context.Context, reqVault string) (string, error
 	}
 
 	if sc.key != nil {
-		if reqVault != "" && reqVault != sc.key.Vault {
+		resolved, ok := auth.ResolveScopedVault(sc.key.Scope(), reqVault)
+		if !ok {
+			if reqVault == "" {
+				return "", fmt.Errorf("this key requires an explicit vault")
+			}
 			return "", fmt.Errorf("api key is not authorized for vault %q", reqVault)
 		}
-		return sc.key.Vault, nil
+		return resolved, nil
 	}
 
 	vault := reqVault
