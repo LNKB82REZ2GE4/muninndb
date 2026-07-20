@@ -27,6 +27,9 @@ type EngineAPI interface {
 	BatchWrite(ctx context.Context, req *pb.BatchWriteRequest) (*pb.BatchWriteResponse, error)
 	Read(ctx context.Context, req *pb.ReadRequest) (*pb.ReadResponse, error)
 	Activate(ctx context.Context, req *pb.ActivateRequest) (*pb.ActivateResponse, error)
+	// ActivateMulti runs a merged multi-vault recall (project-vaults phase 2).
+	// Every reqs[i].Vault must already have passed the caller's key-scope check.
+	ActivateMulti(ctx context.Context, reqs []*pb.ActivateRequest, weights []float64) (*pb.ActivateResponse, error)
 	Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkResponse, error)
 	Forget(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetResponse, error)
 	BatchForget(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error)
@@ -428,6 +431,30 @@ func (s *Server) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkRespons
 // Activate implements the Activate RPC (server-streaming).
 func (s *Server) Activate(req *pb.ActivateRequest, stream pb.MuninnDB_ActivateServer) error {
 	ctx := stream.Context()
+
+	// Multi-vault merged recall (project-vaults phase 2): "vaults" is
+	// mutually exclusive with "vault". Every entry must pass the caller's
+	// key-scope check; one failure fails the whole call, no scope leak.
+	if len(req.Vaults) > 0 {
+		if strings.TrimSpace(req.Vault) != "" {
+			return status.Error(codes.InvalidArgument, "'vault' and 'vaults' are mutually exclusive")
+		}
+		reqs, weights, err := s.resolveRequestVaultsMulti(ctx, req)
+		if err != nil {
+			return err
+		}
+		resp, err := s.engine.ActivateMulti(ctx, reqs, weights)
+		if err != nil {
+			slog.Error("activate multi failed", "error", err)
+			return err
+		}
+		if err := stream.Send(resp); err != nil {
+			slog.Error("send activate response failed", "error", err)
+			return err
+		}
+		return nil
+	}
+
 	vault, err := s.resolveRequestVault(ctx, req.Vault)
 	if err != nil {
 		return err
@@ -446,6 +473,49 @@ func (s *Server) Activate(req *pb.ActivateRequest, stream pb.MuninnDB_ActivateSe
 	}
 
 	return nil
+}
+
+// resolveRequestVaultsMulti validates every entry in req.Vaults against the
+// caller's key scope (fails closed, no leak — mirrors resolveRequestVault)
+// and builds one per-vault ActivateRequest plus the resolved weight list
+// (equal weighting when req.VaultWeights is omitted).
+func (s *Server) resolveRequestVaultsMulti(ctx context.Context, req *pb.ActivateRequest) ([]*pb.ActivateRequest, []float64, error) {
+	var scope []string
+	if key, ok := ctx.Value(auth.ContextAPIKey).(*auth.APIKey); ok && key != nil {
+		scope = key.Scope()
+	}
+
+	vaults := make([]string, len(req.Vaults))
+	for i, v := range req.Vaults {
+		if !auth.IsValidVaultName(v) {
+			return nil, nil, status.Errorf(codes.InvalidArgument, "invalid vault name in 'vaults': must be 1-64 lowercase alphanumeric, hyphen, or underscore characters")
+		}
+		if len(scope) > 0 && !auth.ScopeMatch(scope, v) {
+			return nil, nil, status.Error(codes.PermissionDenied, "vault mismatch: one or more requested vaults are outside this key's scope")
+		}
+		vaults[i] = v
+	}
+
+	weights := req.VaultWeights
+	if len(weights) == 0 {
+		weights = make([]float64, len(vaults))
+		eq := 1.0 / float64(len(vaults))
+		for i := range weights {
+			weights[i] = eq
+		}
+	} else if len(weights) != len(vaults) {
+		return nil, nil, status.Error(codes.InvalidArgument, "'vault_weights' must be the same length as 'vaults'")
+	}
+
+	reqs := make([]*pb.ActivateRequest, len(vaults))
+	for i, v := range vaults {
+		clone := *req
+		clone.Vault = v
+		clone.Vaults = nil
+		clone.VaultWeights = nil
+		reqs[i] = &clone
+	}
+	return reqs, weights, nil
 }
 
 // Subscribe implements the Subscribe RPC (bidirectional streaming).

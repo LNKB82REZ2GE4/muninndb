@@ -192,6 +192,72 @@ func resolveVaultScoped(scope []string, args map[string]any) (vault string, errM
 	return "default", ""
 }
 
+// isMultiVaultTool reports whether tool name accepts the optional "vaults"
+// array argument (mutually exclusive with "vault") for merged multi-vault
+// recall or fan-out remember. dispatchToolCall uses this to skip normal
+// single-vault resolution and defer vault resolution to the handler, which
+// validates every entry against the caller's key scope itself.
+func isMultiVaultTool(name string) bool {
+	switch name {
+	case "muninn_recall", "muninn_remember", "muninn_remember_batch":
+		return true
+	}
+	return false
+}
+
+// resolveVaultsWeighted extracts and validates the optional "vaults"/"weights"
+// arguments for multi-vault-capable tools. Returns present=false when "vaults"
+// is absent (callers should fall back to the normal single-vault path
+// unchanged). Every vault name is validated for grammar and, when scope is
+// non-empty, checked against it with auth.ScopeMatch — mirroring
+// resolveVaultScoped's no-leak error convention (never echoes scope contents).
+func resolveVaultsWeighted(scope []string, args map[string]any) (vaults []string, weights []float64, present bool, errMsg string) {
+	raw, hasVaults := args["vaults"]
+	if !hasVaults {
+		return nil, nil, false, ""
+	}
+	if _, hasVault := args["vault"]; hasVault {
+		return nil, nil, true, "'vault' and 'vaults' are mutually exclusive"
+	}
+	arr, ok := raw.([]any)
+	if !ok || len(arr) == 0 {
+		return nil, nil, true, "'vaults' must be a non-empty array of vault names"
+	}
+	vaults = make([]string, len(arr))
+	for i, v := range arr {
+		s, ok := v.(string)
+		if !ok || !auth.IsValidVaultName(s) {
+			return nil, nil, true, "invalid vault name in 'vaults': must be 1-64 lowercase alphanumeric, hyphen, or underscore characters"
+		}
+		if len(scope) > 0 && !auth.ScopeMatch(scope, s) {
+			return nil, nil, true, "vault mismatch: one or more requested vaults are outside this key's scope"
+		}
+		vaults[i] = s
+	}
+
+	if wraw, hasWeights := args["weights"]; hasWeights {
+		warr, ok := wraw.([]any)
+		if !ok || len(warr) != len(vaults) {
+			return nil, nil, true, "'weights' must be a numeric array the same length as 'vaults'"
+		}
+		weights = make([]float64, len(warr))
+		for i, wv := range warr {
+			f, ok := wv.(float64)
+			if !ok || f < 0 {
+				return nil, nil, true, "'weights' entries must be non-negative numbers"
+			}
+			weights[i] = f
+		}
+	} else {
+		weights = make([]float64, len(vaults))
+		eq := 1.0 / float64(len(vaults))
+		for i := range weights {
+			weights[i] = eq
+		}
+	}
+	return vaults, weights, true, ""
+}
+
 // isMutatingTool returns true for MCP tools that write, modify, or delete data.
 // Used to enforce mode restrictions when authenticating via an mk_ vault API key.
 //

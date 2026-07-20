@@ -56,6 +56,10 @@ func (m *mockEngine) Activate(ctx context.Context, req *rest.ActivateRequest) (*
 	return &rest.ActivateResponse{}, nil
 }
 
+func (m *mockEngine) ActivateMulti(ctx context.Context, reqs []*rest.ActivateRequest, weights []float64) (*rest.ActivateResponse, error) {
+	return &rest.ActivateResponse{}, nil
+}
+
 func (m *mockEngine) Link(ctx context.Context, req *mbp.LinkRequest) (*rest.LinkResponse, error) {
 	return &rest.LinkResponse{}, nil
 }

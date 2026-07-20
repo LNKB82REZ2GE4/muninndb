@@ -36,6 +36,21 @@ func (e *Engine) GetEntityAggregate(ctx context.Context, vault, entityName strin
 		limit = defaultEntityEngramLimit
 	}
 
+	ws := e.store.ResolveVaultPrefix(vault)
+
+	// The 0x1F entity registry is global/vault-agnostic (docs/plans/2026-07-19-
+	// project-vaults.md §4.1 correction), so gate on vault presence BEFORE
+	// reading or returning the global record — otherwise a caller could probe
+	// the existence, type, mention count, and first/last-seen timestamps of an
+	// entity that only appears in a vault they have no access to.
+	present, err := e.entityVisibleInVault(ctx, ws, entityName)
+	if err != nil {
+		return nil, err
+	}
+	if !present {
+		return nil, nil // not found (from this caller's vault's perspective)
+	}
+
 	// 1. Entity metadata record (global, vault-agnostic)
 	rec, err := e.store.GetEntityRecord(ctx, entityName)
 	if err != nil {
@@ -44,8 +59,6 @@ func (e *Engine) GetEntityAggregate(ctx context.Context, vault, entityName strin
 	if rec == nil {
 		return nil, nil // not found
 	}
-
-	ws := e.store.ResolveVaultPrefix(vault)
 
 	// 2. Engrams that mention this entity (vault-scoped via ScanEntityEngrams reverse index)
 	var engrams []*storage.Engram

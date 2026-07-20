@@ -176,6 +176,10 @@ type ActivateRequest struct {
 	Weights    *Weights  `protobuf:"bytes,7,opt,name=weights"`
 	Filters    []Filter  `protobuf:"bytes,8,rep,name=filters"`
 	Embedding  []float32 `protobuf:"fixed32,9,rep,name=embedding"`
+	// Vaults and VaultWeights request a merged multi-vault recall
+	// (project-vaults phase 2, RRF-fused). Mutually exclusive with Vault.
+	Vaults       []string  `protobuf:"bytes,10,rep,name=vaults"`
+	VaultWeights []float64 `protobuf:"fixed64,11,rep,name=vault_weights"`
 }
 
 // Weights message
@@ -203,6 +207,10 @@ type ActivateResponse struct {
 	LatencyMs   float64          `protobuf:"fixed64,4,opt,name=latency_ms"`
 	Frame       int32            `protobuf:"varint,5,opt,name=frame"`
 	TotalFrames int32            `protobuf:"varint,6,opt,name=total_frames"`
+	// DegradedVaults lists vaults in a multi-vault ActivateMulti call whose
+	// embedding dimension did not match the other requested vaults. Always
+	// empty for single-vault responses.
+	DegradedVaults []string `protobuf:"bytes,7,rep,name=degraded_vaults"`
 }
 
 // ActivationItem message
@@ -216,6 +224,9 @@ type ActivationItem struct {
 	Why             string           `protobuf:"bytes,7,opt,name=why"`
 	HopPath         []string         `protobuf:"bytes,8,rep,name=hop_path"`
 	Dormant         bool             `protobuf:"varint,9,opt,name=dormant"`
+	// Vault is the source vault this item was activated from. Only set by
+	// ActivateMulti (merged multi-vault recall).
+	Vault string `protobuf:"bytes,10,opt,name=vault"`
 }
 
 // ScoreComponents message

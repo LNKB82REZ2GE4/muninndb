@@ -29,6 +29,7 @@ type mockEngine struct {
 	batchWriteFn           func(ctx context.Context, req *pb.BatchWriteRequest) (*pb.BatchWriteResponse, error)
 	readFn                 func(ctx context.Context, req *pb.ReadRequest) (*pb.ReadResponse, error)
 	activateFn             func(ctx context.Context, req *pb.ActivateRequest) (*pb.ActivateResponse, error)
+	activateMultiFn        func(ctx context.Context, reqs []*pb.ActivateRequest, weights []float64) (*pb.ActivateResponse, error)
 	linkFn                 func(ctx context.Context, req *pb.LinkRequest) (*pb.LinkResponse, error)
 	forgetFn               func(ctx context.Context, req *pb.ForgetRequest) (*pb.ForgetResponse, error)
 	batchForgetFn          func(ctx context.Context, req *pb.BatchForgetRequest) (*pb.BatchForgetResponse, error)
@@ -77,6 +78,13 @@ func (m *mockEngine) Read(ctx context.Context, req *pb.ReadRequest) (*pb.ReadRes
 func (m *mockEngine) Activate(ctx context.Context, req *pb.ActivateRequest) (*pb.ActivateResponse, error) {
 	if m.activateFn != nil {
 		return m.activateFn(ctx, req)
+	}
+	return &pb.ActivateResponse{}, nil
+}
+
+func (m *mockEngine) ActivateMulti(ctx context.Context, reqs []*pb.ActivateRequest, weights []float64) (*pb.ActivateResponse, error) {
+	if m.activateMultiFn != nil {
+		return m.activateMultiFn(ctx, reqs, weights)
 	}
 	return &pb.ActivateResponse{}, nil
 }

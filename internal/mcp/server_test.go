@@ -34,6 +34,9 @@ func (f *fakeEngine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) (
 func (f *fakeEngine) Activate(ctx context.Context, req *mbp.ActivateRequest) (*mbp.ActivateResponse, error) {
 	return &mbp.ActivateResponse{}, nil
 }
+func (f *fakeEngine) ActivateMulti(ctx context.Context, reqs []*mbp.ActivateRequest, weights []float64) (*mbp.ActivateResponse, error) {
+	return &mbp.ActivateResponse{}, nil
+}
 func (f *fakeEngine) Read(ctx context.Context, req *mbp.ReadRequest) (*mbp.ReadResponse, error) {
 	return &mbp.ReadResponse{}, nil
 }
@@ -127,10 +130,10 @@ func (f *fakeEngine) CheckIdempotency(_ context.Context, _ string) (*storage.Ide
 func (f *fakeEngine) WriteIdempotency(_ context.Context, _, _ string) error {
 	return nil
 }
-func (f *fakeEngine) SetEntityState(_ context.Context, _, _, _, _ string) error {
+func (f *fakeEngine) SetEntityState(_ context.Context, _, _, _, _, _ string) error {
 	return nil
 }
-func (f *fakeEngine) SetEntityStateBatch(_ context.Context, ops []engine.EntityStateOp) []error {
+func (f *fakeEngine) SetEntityStateBatch(_ context.Context, _ string, ops []engine.EntityStateOp) []error {
 	return make([]error, len(ops))
 }
 func (f *fakeEngine) GetEntityClusters(_ context.Context, _ string, _, _ int) ([]EntityClusterResult, error) {

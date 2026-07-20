@@ -786,6 +786,9 @@ func (e *Engine) GetEngram(ctx context.Context, vault string, id storage.ULID) (
 // GetVaultEmbedDim returns the embedding vector dimension currently in use by vault.
 // Derived from the HNSW index — returns 0 if no embeddings have been stored yet.
 func (e *Engine) GetVaultEmbedDim(_ context.Context, vault string) int {
+	if e.hnswRegistry == nil {
+		return 0
+	}
 	ws := e.store.ResolveVaultPrefix(vault)
 	return e.hnswRegistry.VaultEmbedDim(ws)
 }
@@ -1971,6 +1974,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 		Profile:            req.Profile,
 		StructuredFilter:   structuredFilter,
 		CandidatesPerIndex: activation.CalcCandidatesPerIndex(vaultSize),
+		MaxBFSNodes:        req.BFSBudget,
 	}
 
 	// PAS: Predictive Activation Signal config from vault Plasticity.

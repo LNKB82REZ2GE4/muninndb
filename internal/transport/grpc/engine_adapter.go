@@ -115,17 +115,37 @@ func (a *grpcEngineAdapter) Activate(ctx context.Context, req *pb.ActivateReques
 	if err != nil {
 		return nil, err
 	}
+	return activateResponseToPB(resp), nil
+}
+
+func (a *grpcEngineAdapter) ActivateMulti(ctx context.Context, reqs []*pb.ActivateRequest, weights []float64) (*pb.ActivateResponse, error) {
+	mbpReqs := make([]*mbp.ActivateRequest, len(reqs))
+	for i, req := range reqs {
+		mbpReqs[i] = &mbp.ActivateRequest{
+			Context: req.Context, Threshold: req.Threshold, MaxResults: int(req.MaxResults),
+			MaxHops: int(req.MaxHops), IncludeWhy: req.IncludeWhy, Vault: req.Vault, Embedding: req.Embedding,
+		}
+	}
+	resp, err := a.eng.ActivateMulti(ctx, mbpReqs, weights)
+	if err != nil {
+		return nil, err
+	}
+	return activateResponseToPB(resp), nil
+}
+
+func activateResponseToPB(resp *mbp.ActivateResponse) *pb.ActivateResponse {
 	items := make([]pb.ActivationItem, len(resp.Activations))
 	for i, item := range resp.Activations {
 		items[i] = pb.ActivationItem{
 			ID: item.ID, Concept: item.Concept, Content: item.Content,
-			Score: item.Score, Why: item.Why,
+			Score: item.Score, Why: item.Why, Vault: item.Vault,
 		}
 	}
 	return &pb.ActivateResponse{
 		QueryID: resp.QueryID, TotalFound: int32(resp.TotalFound),
 		Activations: items, LatencyMs: resp.LatencyMs,
-	}, nil
+		DegradedVaults: resp.DegradedVaults,
+	}
 }
 
 func (a *grpcEngineAdapter) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkResponse, error) {

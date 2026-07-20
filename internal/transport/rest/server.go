@@ -212,6 +212,7 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 	mux.HandleFunc("GET /api/engrams/{id}/links", s.withMiddleware(auth.WriteOnlyGuard(s.handleGetEngramLinks)))
 	mux.HandleFunc("POST /api/engrams/links/batch", s.withMiddleware(auth.WriteOnlyGuard(s.handleBatchGetEngramLinks)))
 	mux.HandleFunc("GET /api/vaults", s.withMiddleware(auth.WriteOnlyGuard(s.handleListVaults)))
+	mux.HandleFunc("POST /api/vaults", s.withMiddleware(auth.ReadOnlyGuard(s.handleCreateVault(authStore))))
 	mux.HandleFunc("GET /api/vaults/stats", s.withAdminMiddleware(s.handleVaultStats()))
 	mux.HandleFunc("GET /api/session", s.withMiddleware(auth.WriteOnlyGuard(s.handleGetSession)))
 	mux.HandleFunc("GET /api/activity-counts", s.withMiddleware(auth.WriteOnlyGuard(s.handleGetActivityCounts)))
@@ -814,19 +815,25 @@ var activateTimeout = func() time.Duration {
 	return time.Duration(secs) * time.Second
 }()
 
+// scopeFromContext returns the authenticated caller's vault scope, or nil
+// when the request carries no scoped API key (static token / admin bypass /
+// public-vault path) — nil means "no scope restriction" to callers that
+// mirror resolveVaultScoped's convention.
+func scopeFromContext(ctx context.Context) []string {
+	if key, ok := ctx.Value(auth.ContextAPIKey).(*auth.APIKey); ok && key != nil {
+		return key.Scope()
+	}
+	return nil
+}
+
 func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 	var req ActivateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid request body")
 		return
 	}
-	vault, resolveErr := resolveHandlerVault(r, req.Vault)
-	if resolveErr != nil {
-		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, resolveErr.Error())
-		return
-	}
-	req.Vault = vault
-	// Apply recall mode preset if provided.
+
+	// Apply recall mode preset if provided (shared by single- and multi-vault paths).
 	if req.Mode != "" {
 		preset, err := auth.LookupRecallMode(req.Mode)
 		if err != nil {
@@ -835,6 +842,71 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		}
 		applyRecallModePreset(&req, preset)
 	}
+
+	// Multi-vault merged recall (project-vaults phase 2): "vaults" rides the
+	// body and is mutually exclusive with "vault". Every entry is validated
+	// against the caller's key scope; one failure fails the whole call with
+	// no scope leak (mirrors resolveVaultScoped's error convention).
+	if len(req.Vaults) > 0 {
+		if strings.TrimSpace(req.Vault) != "" {
+			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "'vault' and 'vaults' are mutually exclusive")
+			return
+		}
+		scope := scopeFromContext(r.Context())
+		vaults := make([]string, len(req.Vaults))
+		for i, v := range req.Vaults {
+			if !auth.IsValidVaultName(v) {
+				s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid vault name in 'vaults': must be 1-64 lowercase alphanumeric, hyphen, or underscore characters")
+				return
+			}
+			if len(scope) > 0 && !auth.ScopeMatch(scope, v) {
+				s.sendError(r, w, http.StatusForbidden, ErrVaultForbidden, "vault mismatch: one or more requested vaults are outside this key's scope")
+				return
+			}
+			vaults[i] = v
+		}
+		weights := req.VaultWeights
+		if len(weights) == 0 {
+			weights = make([]float64, len(vaults))
+			eq := 1.0 / float64(len(vaults))
+			for i := range weights {
+				weights[i] = eq
+			}
+		} else if len(weights) != len(vaults) {
+			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "'vault_weights' must be the same length as 'vaults'")
+			return
+		}
+
+		reqs := make([]*ActivateRequest, len(vaults))
+		for i, v := range vaults {
+			clone := req
+			clone.Vault = v
+			clone.Vaults = nil
+			clone.VaultWeights = nil
+			reqs[i] = &clone
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), activateTimeout)
+		defer cancel()
+		resp, err := s.engine.ActivateMulti(ctx, reqs, weights)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				s.sendError(r, w, http.StatusGatewayTimeout, ErrIndexError, "activation timeout: query took too long")
+				return
+			}
+			s.sendError(r, w, http.StatusInternalServerError, ErrIndexError, err.Error())
+			return
+		}
+		s.sendJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	vault, resolveErr := resolveHandlerVault(r, req.Vault)
+	if resolveErr != nil {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, resolveErr.Error())
+		return
+	}
+	req.Vault = vault
 	// Apply a hard activation timeout so deep BFS traversals on large vaults
 	// cannot run unbounded. MUNINN_ACTIVATE_TIMEOUT (default 30s) is capped
 	// to the outer WriteTimeout so we never wait longer than the HTTP server allows.

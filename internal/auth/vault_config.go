@@ -2,6 +2,7 @@ package auth
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -46,6 +47,22 @@ func (s *Store) GetVaultConfig(vault string) (VaultConfig, error) {
 		return VaultConfig{}, fmt.Errorf("corrupt vault config: %w", err)
 	}
 	return cfg, nil
+}
+
+// VaultConfigExists reports whether a vault has an explicitly persisted config,
+// as opposed to the fail-closed default GetVaultConfig synthesizes for
+// unconfigured vaults. Provisioning endpoints use this to implement
+// idempotent create (never clobber an existing config).
+func (s *Store) VaultConfigExists(name string) (bool, error) {
+	_, closer, err := s.db.Get(vaultConfigKey(name))
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	closer.Close()
+	return true, nil
 }
 
 // SetVaultConfig persists the vault configuration.

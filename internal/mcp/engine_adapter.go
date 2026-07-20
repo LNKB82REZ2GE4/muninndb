@@ -39,6 +39,9 @@ func (a *mcpEngineAdapter) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequ
 func (a *mcpEngineAdapter) Activate(ctx context.Context, req *mbp.ActivateRequest) (*mbp.ActivateResponse, error) {
 	return a.eng.Activate(ctx, req)
 }
+func (a *mcpEngineAdapter) ActivateMulti(ctx context.Context, reqs []*mbp.ActivateRequest, weights []float64) (*mbp.ActivateResponse, error) {
+	return a.eng.ActivateMulti(ctx, reqs, weights)
+}
 func (a *mcpEngineAdapter) Read(ctx context.Context, req *mbp.ReadRequest) (*mbp.ReadResponse, error) {
 	return a.eng.Read(ctx, req)
 }
@@ -327,12 +330,12 @@ func (a *mcpEngineAdapter) WriteIdempotency(ctx context.Context, opID, engramID 
 	return a.eng.WriteIdempotency(ctx, opID, engramID)
 }
 
-func (a *mcpEngineAdapter) SetEntityState(ctx context.Context, entityName, state, mergedInto, entityType string) error {
-	return a.eng.SetEntityState(ctx, entityName, state, mergedInto, entityType)
+func (a *mcpEngineAdapter) SetEntityState(ctx context.Context, vault, entityName, state, mergedInto, entityType string) error {
+	return a.eng.SetEntityState(ctx, vault, entityName, state, mergedInto, entityType)
 }
 
-func (a *mcpEngineAdapter) SetEntityStateBatch(ctx context.Context, ops []engine.EntityStateOp) []error {
-	return a.eng.SetEntityStateBatch(ctx, ops)
+func (a *mcpEngineAdapter) SetEntityStateBatch(ctx context.Context, vault string, ops []engine.EntityStateOp) []error {
+	return a.eng.SetEntityStateBatch(ctx, vault, ops)
 }
 
 func (a *mcpEngineAdapter) ExportGraph(ctx context.Context, vault string, includeEngrams bool) (*engine.ExportGraph, error) {

@@ -183,10 +183,21 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 	}
 
 	// Resolve vault — scoped to key's vault(s) when authenticated via mk_ API key.
-	vault, errMsg := resolveVaultScoped(a.Scope, args)
-	if errMsg != "" {
-		sendError(w, req.ID, -32602, "invalid params: "+errMsg)
-		return
+	// Multi-vault-capable tools that received a "vaults" array defer vault
+	// resolution to the handler itself (it validates every entry against
+	// a.Scope via resolveVaultsWeighted), so "vault" is left empty here.
+	var vault, errMsg string
+	if _, hasVaults := args["vaults"]; hasVaults && isMultiVaultTool(req.Params.Name) {
+		if _, hasVault := args["vault"]; hasVault {
+			sendError(w, req.ID, -32602, "invalid params: 'vault' and 'vaults' are mutually exclusive")
+			return
+		}
+	} else {
+		vault, errMsg = resolveVaultScoped(a.Scope, args)
+		if errMsg != "" {
+			sendError(w, req.ID, -32602, "invalid params: "+errMsg)
+			return
+		}
 	}
 
 	// Mode enforcement for mk_ vault keys.

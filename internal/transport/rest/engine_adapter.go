@@ -90,6 +90,19 @@ func (w *RESTEngineWrapper) Activate(ctx context.Context, req *ActivateRequest) 
 	return w.engine.Activate(ctx, req)
 }
 
+func (w *RESTEngineWrapper) ActivateMulti(ctx context.Context, reqs []*ActivateRequest, weights []float64) (*ActivateResponse, error) {
+	coerced := make([]*mbp.ActivateRequest, len(reqs))
+	for i, req := range reqs {
+		if len(req.Filters) > 0 {
+			reqCopy := *req
+			reqCopy.Filters = coerceFilterValues(req.Filters)
+			req = &reqCopy
+		}
+		coerced[i] = req
+	}
+	return w.engine.ActivateMulti(ctx, coerced, weights)
+}
+
 func (w *RESTEngineWrapper) Link(ctx context.Context, req *mbp.LinkRequest) (*LinkResponse, error) {
 	return w.engine.Link(ctx, req)
 }

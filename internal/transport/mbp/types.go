@@ -165,6 +165,19 @@ type ActivateRequest struct {
 	CallerOwner string `json:"caller_owner,omitempty" msgpack:"caller_owner,omitempty"`
 	// IncludeLeased disables lease-based visibility filtering (admin/debugging).
 	IncludeLeased bool `json:"include_leased,omitempty" msgpack:"include_leased,omitempty"`
+
+	// Vaults and VaultWeights request a merged multi-vault recall (project-vaults
+	// phase 2, RRF-fused). Mutually exclusive with Vault. Every entry must already
+	// have passed the caller's key-scope check before reaching the engine.
+	// VaultWeights is optional and, when omitted, defaults to equal weighting.
+	Vaults       []string  `json:"vaults,omitempty" msgpack:"vaults,omitempty"`
+	VaultWeights []float64 `json:"vault_weights,omitempty" msgpack:"vault_weights,omitempty"`
+
+	// BFSBudget overrides the per-activation BFS traversal node cap (normally a
+	// fixed constant, see architecture.md §3). Engine.ActivateMulti sets this to
+	// split one shared traversal budget across vaults; deliberately excluded from
+	// the wire so external callers cannot influence it directly.
+	BFSBudget int `json:"-" msgpack:"-"`
 }
 
 // Weights defines scoring weight distribution.
@@ -212,6 +225,11 @@ type ActivateResponse struct {
 	Frame       int              `msgpack:"frame,omitempty"        json:"frame,omitempty"`
 	TotalFrames int              `msgpack:"total_frames,omitempty" json:"total_frames,omitempty"`
 	Brief       []BriefSentence  `msgpack:"brief,omitempty"        json:"brief,omitempty"` // extractive activation brief
+	// DegradedVaults lists vaults included in a multi-vault ActivateMulti call whose
+	// embedding dimension did not match the other requested vaults, so recall fell
+	// back to BM25-only for that vault instead of being silently blended in. Always
+	// empty for single-vault Activate responses.
+	DegradedVaults []string `msgpack:"degraded_vaults,omitempty" json:"degraded_vaults,omitempty"`
 }
 
 // ActivationItem is a single activated engram.
@@ -235,6 +253,10 @@ type ActivationItem struct {
 	State uint8 `msgpack:"state,omitempty" json:"state,omitempty"`
 	// Trust is the TrustLevel uint8. omitempty intentional — see ReadResponse.Trust comment.
 	Trust uint8 `msgpack:"trust,omitempty" json:"trust,omitempty"`
+	// Vault is the source vault this item was activated from. Only set by
+	// Engine.ActivateMulti (merged multi-vault recall); omitted (empty) on
+	// single-vault Activate responses to keep them byte-identical to before.
+	Vault string `msgpack:"vault,omitempty" json:"vault,omitempty"`
 }
 
 // ScoreComponents breaks down the activation score.

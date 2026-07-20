@@ -72,6 +72,9 @@ type EngineAPI interface {
 	WriteBatch(ctx context.Context, reqs []*WriteRequest) ([]*WriteResponse, []error)
 	Read(ctx context.Context, req *ReadRequest) (*ReadResponse, error)
 	Activate(ctx context.Context, req *ActivateRequest) (*ActivateResponse, error)
+	// ActivateMulti runs a merged multi-vault recall (project-vaults phase 2).
+	// Every reqs[i].Vault must already have passed the caller's key-scope check.
+	ActivateMulti(ctx context.Context, reqs []*ActivateRequest, weights []float64) (*ActivateResponse, error)
 	Link(ctx context.Context, req *mbp.LinkRequest) (*LinkResponse, error)
 	Forget(ctx context.Context, req *ForgetRequest) (*ForgetResponse, error)
 	Stat(ctx context.Context, req *StatRequest) (*StatResponse, error)

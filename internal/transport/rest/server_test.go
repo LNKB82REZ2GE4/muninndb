@@ -90,6 +90,25 @@ func (m *MockEngine) Activate(ctx context.Context, req *ActivateRequest) (*Activ
 	}, nil
 }
 
+func (m *MockEngine) ActivateMulti(ctx context.Context, reqs []*ActivateRequest, weights []float64) (*ActivateResponse, error) {
+	var all []ActivationItem
+	for _, req := range reqs {
+		resp, err := m.Activate(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		for _, item := range resp.Activations {
+			item.Vault = req.Vault
+			all = append(all, item)
+		}
+	}
+	return &ActivateResponse{
+		QueryID:     "query-multi",
+		TotalFound:  len(all),
+		Activations: all,
+	}, nil
+}
+
 func (m *MockEngine) Link(ctx context.Context, req *mbp.LinkRequest) (*LinkResponse, error) {
 	return &LinkResponse{OK: true}, nil
 }

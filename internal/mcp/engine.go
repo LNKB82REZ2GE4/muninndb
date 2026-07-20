@@ -19,6 +19,9 @@ type EngineInterface interface {
 	Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteResponse, error)
 	WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*mbp.WriteResponse, []error)
 	Activate(ctx context.Context, req *mbp.ActivateRequest) (*mbp.ActivateResponse, error)
+	// ActivateMulti runs a merged multi-vault recall (project-vaults phase 2).
+	// Every reqs[i].Vault must already have passed the caller's key-scope check.
+	ActivateMulti(ctx context.Context, reqs []*mbp.ActivateRequest, weights []float64) (*mbp.ActivateResponse, error)
 	Read(ctx context.Context, req *mbp.ReadRequest) (*mbp.ReadResponse, error)
 	Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.ForgetResponse, error)
 	Link(ctx context.Context, req *mbp.LinkRequest) (*mbp.LinkResponse, error)
@@ -102,11 +105,11 @@ type EngineInterface interface {
 	// SetEntityState sets the lifecycle state of a named entity, and optionally
 	// corrects its type. entityType may be empty (preserves existing type).
 	// For state="merged", mergedInto must be the canonical entity name.
-	SetEntityState(ctx context.Context, entityName, state, mergedInto, entityType string) error
+	SetEntityState(ctx context.Context, vault, entityName, state, mergedInto, entityType string) error
 
 	// SetEntityStateBatch applies multiple entity state updates sequentially.
 	// Returns one error per operation (nil = success). Partial success is preserved.
-	SetEntityStateBatch(ctx context.Context, ops []engine.EntityStateOp) []error
+	SetEntityStateBatch(ctx context.Context, vault string, ops []engine.EntityStateOp) []error
 
 	// GetEntityClusters returns entity pairs that frequently co-occur in the same engrams,
 	// sorted by count descending. Only pairs with count >= minCount are returned.

@@ -30,7 +30,7 @@ func TestSetEntityState_PreservesTypeWhenNotProvided(t *testing.T) {
 	writeEntityForStateTest(t, eng, "default", "Modbus", "protocol")
 
 	// Change state only — entityType param is empty.
-	err := eng.SetEntityState(ctx, "Modbus", "deprecated", "", "")
+	err := eng.SetEntityState(ctx, "default", "Modbus", "deprecated", "", "")
 	require.NoError(t, err)
 
 	rec, err := eng.store.GetEntityRecord(ctx, "modbus")
@@ -49,7 +49,7 @@ func TestSetEntityState_UpdatesTypeWhenProvided(t *testing.T) {
 	writeEntityForStateTest(t, eng, "default", "2014/53/EU", "other")
 
 	// Correct the type while keeping state active.
-	err := eng.SetEntityState(ctx, "2014/53/EU", "active", "", "directive")
+	err := eng.SetEntityState(ctx, "default", "2014/53/EU", "active", "", "directive")
 	require.NoError(t, err)
 
 	rec, err := eng.store.GetEntityRecord(ctx, "2014/53/eu")
@@ -66,7 +66,7 @@ func TestSetEntityState_UpdatesBothStateAndType(t *testing.T) {
 
 	writeEntityForStateTest(t, eng, "default", "Bridge Dongle", "other")
 
-	err := eng.SetEntityState(ctx, "Bridge Dongle", "deprecated", "", "module")
+	err := eng.SetEntityState(ctx, "default", "Bridge Dongle", "deprecated", "", "module")
 	require.NoError(t, err)
 
 	rec, err := eng.store.GetEntityRecord(ctx, "bridge dongle")
@@ -81,7 +81,7 @@ func TestSetEntityState_NotFound(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	err := eng.SetEntityState(ctx, "ghost entity", "deprecated", "", "")
+	err := eng.SetEntityState(ctx, "default", "ghost entity", "deprecated", "", "")
 	require.Error(t, err, "should error for entity that does not exist")
 }
 
@@ -103,7 +103,7 @@ func TestSetEntityStateBatch_AllSucceed(t *testing.T) {
 		{EntityName: "2014/53/EU", State: "active", EntityType: "directive"},
 		{EntityName: "Bridge Dongle", State: "deprecated", EntityType: "module"},
 	}
-	errs := eng.SetEntityStateBatch(ctx, ops)
+	errs := eng.SetEntityStateBatch(ctx, "default", ops)
 	require.Len(t, errs, 3)
 	for i, err := range errs {
 		require.NoError(t, err, "op %d should succeed", i)
@@ -127,7 +127,7 @@ func TestSetEntityStateBatch_PartialFailure(t *testing.T) {
 		{EntityName: "ghost entity that does not exist", State: "deprecated"},
 		{EntityName: "Bridge Dongle", State: "deprecated"},
 	}
-	errs := eng.SetEntityStateBatch(ctx, ops)
+	errs := eng.SetEntityStateBatch(ctx, "default", ops)
 	require.Len(t, errs, 3)
 	require.NoError(t, errs[0], "first op should succeed")
 	require.Error(t, errs[1], "middle op should fail (entity not found)")
@@ -148,7 +148,7 @@ func TestSetEntityStateBatch_ContextCancellation(t *testing.T) {
 		{EntityName: "Modbus", State: "deprecated"},
 		{EntityName: "Bridge Dongle", State: "deprecated"},
 	}
-	errs := eng.SetEntityStateBatch(ctx, ops)
+	errs := eng.SetEntityStateBatch(ctx, "default", ops)
 	require.Len(t, errs, 2)
 	for i, err := range errs {
 		require.ErrorIs(t, err, context.Canceled, "op %d should get context.Canceled", i)
@@ -165,7 +165,7 @@ func TestSetEntityStateBatch_WithTypeCorrection(t *testing.T) {
 	ops := []EntityStateOp{
 		{EntityName: "EN 62368-1", State: "active", EntityType: "standard"},
 	}
-	errs := eng.SetEntityStateBatch(ctx, ops)
+	errs := eng.SetEntityStateBatch(ctx, "default", ops)
 	require.NoError(t, errs[0])
 
 	rec, err := eng.store.GetEntityRecord(ctx, "en 62368-1")

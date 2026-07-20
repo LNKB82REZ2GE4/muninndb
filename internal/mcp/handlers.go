@@ -118,6 +118,50 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 		req.Embedding = emb
 	}
 
+	// Multi-vault fan-out (project-vaults phase 2): "vaults" is mutually
+	// exclusive with "vault" and writes one independent engram per listed
+	// vault via this same single-vault Write path — separate IDs, separate
+	// fsyncs. Cross-vault engram links/consolidate/trees are not supported
+	// here; those stay single-vault by construction (this handler never
+	// builds association/link requests).
+	a := authFromContext(ctx)
+	vaults, _, isMulti, vaultsErr := resolveVaultsWeighted(a.Scope, args)
+	if vaultsErr != "" {
+		sendError(w, id, -32602, "invalid params: "+vaultsErr)
+		return
+	}
+	if isMulti {
+		type vaultWriteResult struct {
+			Vault string `json:"vault"`
+			WriteResult
+		}
+		results := make([]vaultWriteResult, 0, len(vaults))
+		for _, v := range vaults {
+			clone := *req
+			clone.Vault = v
+			if len(clone.Embedding) > 0 {
+				if vaultDim := s.engine.GetVaultEmbedDim(ctx, v); vaultDim > 0 && len(clone.Embedding) != vaultDim {
+					sendError(w, id, -32602, fmt.Sprintf("invalid params: embedding dimension %d does not match vault %q dimension %d", len(clone.Embedding), v, vaultDim))
+					return
+				}
+			}
+			vResp, err := s.engine.Write(ctx, &clone)
+			if err != nil {
+				sendError(w, id, -32000, "tool error: vault "+v+": "+err.Error())
+				return
+			}
+			if opID != "" {
+				vOpID := opID + "|" + v
+				if err := s.engine.WriteIdempotency(ctx, vOpID, vResp.ID); err != nil {
+					slog.Warn("mcp: failed to record idempotency receipt", "op_id", vOpID, "engram_id", vResp.ID, "err", err)
+				}
+			}
+			results = append(results, vaultWriteResult{Vault: v, WriteResult: WriteResult{ID: vResp.ID, Concept: clone.Concept}})
+		}
+		sendResult(w, id, textContent(mustJSON(map[string]any{"vaults": results})))
+		return
+	}
+
 	resp, err := s.engine.Write(ctx, req)
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
@@ -151,6 +195,16 @@ func (s *MCPServer) handleRememberBatch(ctx context.Context, w http.ResponseWrit
 	}
 	if len(memoriesAny) > 50 {
 		sendError(w, id, -32602, "invalid params: 'memories' exceeds maximum of 50")
+		return
+	}
+
+	// Multi-vault fan-out (project-vaults phase 2): "vaults" is mutually
+	// exclusive with "vault" and writes each memory independently into every
+	// listed vault via the same single-vault WriteBatch path.
+	a := authFromContext(ctx)
+	vaults, _, isMulti, vaultsErr := resolveVaultsWeighted(a.Scope, args)
+	if vaultsErr != "" {
+		sendError(w, id, -32602, "invalid params: "+vaultsErr)
 		return
 	}
 
@@ -214,6 +268,48 @@ func (s *MCPServer) handleRememberBatch(ctx context.Context, w http.ResponseWrit
 		}
 		reqs = append(reqs, req)
 		malformedCounts = append(malformedCounts, malformed)
+	}
+
+	if isMulti {
+		fanReqs := make([]*mbp.WriteRequest, 0, len(reqs)*len(vaults))
+		fanMemIdx := make([]int, 0, len(reqs)*len(vaults))
+		for mi, r := range reqs {
+			for _, v := range vaults {
+				clone := *r
+				clone.Vault = v
+				if len(clone.Embedding) > 0 {
+					if vaultDim := s.engine.GetVaultEmbedDim(ctx, v); vaultDim > 0 && len(clone.Embedding) != vaultDim {
+						sendError(w, id, -32602, fmt.Sprintf("invalid params: memories[%d].embedding dimension %d does not match vault %q dimension %d", mi, len(clone.Embedding), v, vaultDim))
+						return
+					}
+				}
+				fanReqs = append(fanReqs, &clone)
+				fanMemIdx = append(fanMemIdx, mi)
+			}
+		}
+		fanResponses, fanErrs := s.engine.WriteBatch(ctx, fanReqs)
+		type multiBatchItemResult struct {
+			Index   int    `json:"index"`
+			Vault   string `json:"vault"`
+			ID      string `json:"id,omitempty"`
+			Concept string `json:"concept,omitempty"`
+			Status  string `json:"status"`
+			Error   string `json:"error,omitempty"`
+		}
+		results := make([]multiBatchItemResult, len(fanReqs))
+		for i := range fanReqs {
+			mi := fanMemIdx[i]
+			if fanErrs[i] != nil {
+				results[i] = multiBatchItemResult{Index: mi, Vault: fanReqs[i].Vault, Status: "error", Error: fanErrs[i].Error()}
+			} else {
+				results[i] = multiBatchItemResult{Index: mi, Vault: fanReqs[i].Vault, ID: fanResponses[i].ID, Concept: fanReqs[i].Concept, Status: "ok"}
+			}
+		}
+		sendResult(w, id, textContent(mustJSON(map[string]any{
+			"results": results,
+			"total":   len(results),
+		})))
+		return
 	}
 
 	responses, errs := s.engine.WriteBatch(ctx, reqs)
@@ -424,7 +520,26 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 
 	annotate, _ := args["annotate"].(bool)
 
-	resp, err := s.engine.Activate(ctx, req)
+	a := authFromContext(ctx)
+	vaults, weights, isMulti, vaultsErr := resolveVaultsWeighted(a.Scope, args)
+	if vaultsErr != "" {
+		sendError(w, id, -32602, "invalid params: "+vaultsErr)
+		return
+	}
+
+	var resp *mbp.ActivateResponse
+	var err error
+	if isMulti {
+		reqs := make([]*mbp.ActivateRequest, len(vaults))
+		for i, v := range vaults {
+			clone := *req
+			clone.Vault = v
+			reqs[i] = &clone
+		}
+		resp, err = s.engine.ActivateMulti(ctx, reqs, weights)
+	} else {
+		resp, err = s.engine.Activate(ctx, req)
+	}
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return
@@ -437,7 +552,11 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 
 	if annotate {
 		for i, item := range resp.Activations {
-			ann, err := s.engine.GetAnnotations(ctx, vault, item.ID)
+			itemVault := vault
+			if isMulti && item.Vault != "" {
+				itemVault = item.Vault
+			}
+			ann, err := s.engine.GetAnnotations(ctx, itemVault, item.ID)
 			if err != nil || ann == nil {
 				// Non-fatal: log and skip annotations for this result.
 				slog.Warn("handleRecall: GetAnnotations failed", "id", item.ID, "err", err)
@@ -451,9 +570,16 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 		"memories": memories,
 		"total":    resp.TotalFound,
 	}
+	if len(resp.DegradedVaults) > 0 {
+		result["degraded_vaults"] = resp.DegradedVaults
+	}
 	if len(memories) == 0 {
 		hint := "No results matched. For session continuity try mode='recent', or use muninn_where_left_off. For semantic recall, provide more specific context."
-		if p, err := s.engine.GetVaultPlasticity(ctx, vault); err == nil && p != nil && p.MultiUser {
+		hintVault := vault
+		if isMulti && len(vaults) > 0 {
+			hintVault = vaults[0]
+		}
+		if p, err := s.engine.GetVaultPlasticity(ctx, hintVault); err == nil && p != nil && p.MultiUser {
 			hint = "No results matched. For session continuity try mode='recent' scoped to your per-user tag (this vault is shared; muninn_where_left_off is vault-global). For semantic recall, provide more specific context."
 		}
 		result["hint"] = hint
@@ -1080,7 +1206,7 @@ func (s *MCPServer) handleEntityState(ctx context.Context, w http.ResponseWriter
 	entityType, _ := args["type"].(string)
 	entityType = normalizeEntityType(entityType)
 
-	if err := s.engine.SetEntityState(ctx, entityName, state, mergedInto, entityType); err != nil {
+	if err := s.engine.SetEntityState(ctx, vault, entityName, state, mergedInto, entityType); err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return
 	}
@@ -1143,7 +1269,7 @@ func (s *MCPServer) handleEntityStateBatch(ctx context.Context, w http.ResponseW
 		})
 	}
 
-	errs := s.engine.SetEntityStateBatch(ctx, ops)
+	errs := s.engine.SetEntityStateBatch(ctx, vault, ops)
 
 	type batchItemResult struct {
 		Index  int    `json:"index"`

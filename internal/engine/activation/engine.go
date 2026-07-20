@@ -179,6 +179,11 @@ type ActivateRequest struct {
 	CallerOwner string
 	// IncludeLeased disables lease-based visibility filtering (admin/debugging).
 	IncludeLeased bool
+	// MaxBFSNodes overrides the Phase 5 BFS traversal node cap (default 500, see
+	// architecture.md §3). Zero means "use the default". Set by Engine.ActivateMulti
+	// to split one shared traversal budget across vaults instead of granting each
+	// vault its own full 500-node cap.
+	MaxBFSNodes int
 }
 
 // ActivateResult is what the transport layer serializes and returns.
@@ -994,12 +999,20 @@ func (e *ActivationEngine) phase5Traverse(
 	}
 
 	const (
-		hopPenalty      = 0.7
-		minHopScore     = 0.05
-		maxBFSNodes     = 500
-		maxEdgesPerNode = 10
-		maxSeeds        = 20
+		hopPenalty         = 0.7
+		minHopScore        = 0.05
+		defaultMaxBFSNodes = 500
+		maxEdgesPerNode    = 10
+		maxSeeds           = 20
 	)
+
+	// MaxBFSNodes lets callers share one traversal budget across several
+	// activations (e.g. Engine.ActivateMulti splitting the 500-node cap
+	// across vaults); zero means "use the default per-activation cap".
+	maxBFSNodes := req.MaxBFSNodes
+	if maxBFSNodes <= 0 {
+		maxBFSNodes = defaultMaxBFSNodes
+	}
 
 	seedCount := maxSeeds
 	if seedCount > len(candidates) {
