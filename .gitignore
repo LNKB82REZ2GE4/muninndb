@@ -76,3 +76,11 @@ sdk/muninndb/dist/
 sdk/muninndb/*.egg-info/
 sdk/php/vendor/
 .gitnexus
+
+# Local build artifacts, worker logs and tool caches (not source)
+/muninn-main
+/muninndb-server
+/promoter_stdout.log
+/promoter_stderr.log
+*.log
+.serena/
