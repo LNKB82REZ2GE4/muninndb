@@ -5,6 +5,22 @@ func allToolDefinitions() []ToolDefinition {
 		"type":        "string",
 		"description": "Vault name to scope the operation (default: 'default'). Optional when connected via a vault-pinned MCP session.",
 	}
+	// vaultsProp / weightsProp advertise the optional multi-vault fan-out
+	// arguments (mutually exclusive with 'vault') on the tools that support
+	// them. Declaring them here — as real array types — is what makes MCP
+	// clients send a native JSON array rather than coercing an undeclared
+	// property to a stringified array (which the server then rejects). See
+	// resolveVaultsWeighted in context.go.
+	vaultsProp := map[string]any{
+		"type":        "array",
+		"items":       map[string]any{"type": "string"},
+		"description": "Vault names for multi-vault fan-out (mutually exclusive with 'vault'). For recall, results are merged across these vaults; for remember, the memory is written to each. Inside a project, pass [\"<proj-vault>\", \"agent-memory\"].",
+	}
+	weightsProp := map[string]any{
+		"type":        "array",
+		"items":       map[string]any{"type": "number"},
+		"description": "Optional per-vault weights, same length and order as 'vaults' (recall only; controls merge ranking). Defaults to equal weighting.",
+	}
 	// entityTypeEnum lists the 14 recognised entity types (the single source of
 	// truth is validEntityTypes in handlers.go). Any other value is coerced to
 	// "other" on every user-facing write path, so advertising the enum lets MCP
@@ -22,6 +38,7 @@ func allToolDefinitions() []ToolDefinition {
 				"type": "object",
 				"properties": map[string]any{
 					"vault":      vaultProp,
+					"vaults":     vaultsProp,
 					"content":    map[string]any{"type": "string", "description": "The information to remember."},
 					"concept":    map[string]any{"type": "string", "description": "Short label for this memory."},
 					"tags":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional topic tags."},
@@ -89,6 +106,7 @@ func allToolDefinitions() []ToolDefinition {
 				"type": "object",
 				"properties": map[string]any{
 					"vault": vaultProp,
+					"vaults": vaultsProp,
 					"memories": map[string]any{
 						"type":        "array",
 						"description": "Array of memories to store (max 50).",
@@ -162,6 +180,8 @@ func allToolDefinitions() []ToolDefinition {
 				"type": "object",
 				"properties": map[string]any{
 					"vault":     vaultProp,
+					"vaults":    vaultsProp,
+					"weights":   weightsProp,
 					"context":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Search context phrases."},
 					"threshold": map[string]any{"type": "number", "description": "Minimum relevance score 0.0-1.0 (default 0.5)."},
 					"limit":     map[string]any{"type": "integer", "description": "Max results to return (default 10)."},
@@ -572,6 +592,7 @@ func allToolDefinitions() []ToolDefinition {
 				"type": "object",
 				"properties": map[string]any{
 					"vault": vaultProp,
+					"vaults": vaultsProp,
 					"limit": map[string]any{
 						"type":        "integer",
 						"description": "Max memories to return (default 10, max 50).",

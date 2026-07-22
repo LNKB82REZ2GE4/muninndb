@@ -51,6 +51,38 @@ func TestResolveVaultsWeighted_DefaultEqualWeights(t *testing.T) {
 	}
 }
 
+// TestResolveVaultsWeighted_StringifiedArrayAccepted guards the fix for MCP
+// clients that stringify array-valued arguments not declared in a tool's
+// advertised inputSchema: 'vaults' arriving as "[\"a\",\"b\"]" must be parsed
+// as a native array rather than rejected as non-array.
+func TestResolveVaultsWeighted_StringifiedArrayAccepted(t *testing.T) {
+	vaults, weights, present, errMsg := resolveVaultsWeighted(nil, map[string]any{
+		"vaults": `["a","b"]`,
+	})
+	if !present || errMsg != "" {
+		t.Fatalf("stringified vaults array rejected: present=%v err=%q", present, errMsg)
+	}
+	if len(vaults) != 2 || vaults[0] != "a" || vaults[1] != "b" {
+		t.Fatalf("vaults = %v, want [a b]", vaults)
+	}
+	if len(weights) != 2 {
+		t.Fatalf("weights = %v, want 2 equal defaults", weights)
+	}
+}
+
+func TestResolveVaultsWeighted_StringifiedWeightsAccepted(t *testing.T) {
+	vaults, weights, present, errMsg := resolveVaultsWeighted(nil, map[string]any{
+		"vaults":  `["a","b"]`,
+		"weights": `[0.7, 0.3]`,
+	})
+	if !present || errMsg != "" {
+		t.Fatalf("stringified weights rejected: present=%v err=%q", present, errMsg)
+	}
+	if len(vaults) != 2 || len(weights) != 2 || weights[0] != 0.7 || weights[1] != 0.3 {
+		t.Fatalf("vaults=%v weights=%v, want weights [0.7 0.3]", vaults, weights)
+	}
+}
+
 func TestResolveVaultsWeighted_ExplicitWeightsMustMatchLength(t *testing.T) {
 	_, _, present, errMsg := resolveVaultsWeighted(nil, map[string]any{
 		"vaults":  []any{"a", "b"},

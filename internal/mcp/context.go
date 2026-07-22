@@ -4,10 +4,49 @@ package mcp
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"net/http"
 
 	"github.com/scrypster/muninndb/internal/auth"
 )
+
+// coerceJSONArray returns v as a []any. It accepts a native JSON array
+// unchanged, and also tolerates a JSON-array encoded as a string (e.g.
+// "[\"a\",\"b\"]") — some MCP clients stringify array-valued arguments that
+// aren't declared in a tool's advertised inputSchema. Returns (nil, false)
+// when the value is neither.
+func coerceJSONArray(v any) ([]any, bool) {
+	if arr, ok := v.([]any); ok {
+		return arr, true
+	}
+	if s, ok := v.(string); ok {
+		var arr []any
+		if err := json.Unmarshal([]byte(s), &arr); err == nil {
+			return arr, true
+		}
+	}
+	return nil, false
+}
+
+// toFloat64 coerces a decoded-JSON numeric value to float64. Standard JSON
+// decoding yields float64, but json.Number and integer types are handled too
+// for robustness against alternate decoders.
+func toFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	}
+	return 0, false
+}
 
 const mcpSessionHeader = "Mcp-Session-Id"
 
@@ -199,7 +238,8 @@ func resolveVaultScoped(scope []string, args map[string]any) (vault string, errM
 // validates every entry against the caller's key scope itself.
 func isMultiVaultTool(name string) bool {
 	switch name {
-	case "muninn_recall", "muninn_remember", "muninn_remember_batch":
+	case "muninn_recall", "muninn_remember", "muninn_remember_batch",
+		"muninn_where_left_off":
 		return true
 	}
 	return false
@@ -219,7 +259,7 @@ func resolveVaultsWeighted(scope []string, args map[string]any) (vaults []string
 	if _, hasVault := args["vault"]; hasVault {
 		return nil, nil, true, "'vault' and 'vaults' are mutually exclusive"
 	}
-	arr, ok := raw.([]any)
+	arr, ok := coerceJSONArray(raw)
 	if !ok || len(arr) == 0 {
 		return nil, nil, true, "'vaults' must be a non-empty array of vault names"
 	}
@@ -236,13 +276,13 @@ func resolveVaultsWeighted(scope []string, args map[string]any) (vaults []string
 	}
 
 	if wraw, hasWeights := args["weights"]; hasWeights {
-		warr, ok := wraw.([]any)
+		warr, ok := coerceJSONArray(wraw)
 		if !ok || len(warr) != len(vaults) {
 			return nil, nil, true, "'weights' must be a numeric array the same length as 'vaults'"
 		}
 		weights = make([]float64, len(warr))
 		for i, wv := range warr {
-			f, ok := wv.(float64)
+			f, ok := toFloat64(wv)
 			if !ok || f < 0 {
 				return nil, nil, true, "'weights' entries must be non-negative numbers"
 			}

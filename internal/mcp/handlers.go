@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -984,6 +985,48 @@ func (s *MCPServer) handleWhereLeftOff(ctx context.Context, w http.ResponseWrite
 	}
 	if limit > 50 {
 		limit = 50
+	}
+
+	// Multi-vault fan-out: "where did I leave off" is only meaningful across
+	// BOTH tiers inside a project — the hooks store session turns to the
+	// project vault only, so an agent-memory-only answer surfaces promoted
+	// distillations instead of actual recent activity. Merging is a plain
+	// recency sort (unlike recall, which needs rank fusion), so results stay
+	// exactly comparable across vaults.
+	a := authFromContext(ctx)
+	mvVaults, _, isMulti, vaultsErr := resolveVaultsWeighted(a.Scope, args)
+	if vaultsErr != "" {
+		sendError(w, id, -32602, "invalid params: "+vaultsErr)
+		return
+	}
+	if isMulti {
+		type vaultEntry struct {
+			Vault string `json:"vault"`
+			WhereLeftOffEntry
+		}
+		merged := make([]vaultEntry, 0, limit*len(mvVaults))
+		for _, v := range mvVaults {
+			vEntries, err := s.engine.WhereLeftOff(ctx, v, limit)
+			if err != nil {
+				sendError(w, id, -32000, "tool error: vault "+v+": "+err.Error())
+				return
+			}
+			for _, e := range vEntries {
+				merged = append(merged, vaultEntry{Vault: v, WhereLeftOffEntry: e})
+			}
+		}
+		sort.SliceStable(merged, func(i, j int) bool {
+			return merged[i].LastAccess.After(merged[j].LastAccess)
+		})
+		if len(merged) > limit {
+			merged = merged[:limit]
+		}
+		sendResult(w, id, textContent(mustJSON(map[string]any{
+			"count":    len(merged),
+			"hint":     "Most recently accessed memories merged across the requested vaults, newest first. Each entry is labelled with its source vault.",
+			"memories": merged,
+		})))
+		return
 	}
 
 	entries, err := s.engine.WhereLeftOff(ctx, vault, limit)
