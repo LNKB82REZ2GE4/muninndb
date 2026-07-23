@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""
+muninn-distributor — routes deliberate agent-memory remembers into their
+owning project vault, ahead of an agent-memory cleanse.
+
+Sibling of muninn-promoter/muninn-contradictor, sharing their config file,
+LM Studio wrapper, sqlite-queue pattern, and thinking-off guard.
+
+Background: the ~500 deliberate `muninn_remember` engrams in agent-memory
+carry no mechanical project provenance and are not written into any project
+vault (dual-write to project vaults went live 2026-07-20; these predate it,
+and the transcript backfill only captures conversation turns, not API
+writes). Before an agent-memory cleanse, project-specific memories should
+live with their project (muninn-promoter will re-promote durable ones back
+out later); cross-project/general memories should stay in agent-memory.
+
+Candidate set: deliberate remembers in agent-memory — same discriminator as
+muninn-agentmem-cleanse's classify(): no 'op:*' tag, no 'backfill' tag, and
+not already 'promoted'/'source:promoter' — minus ones already processed by
+this worker (tagged distributed:to:* or distributed:general).
+
+Each candidate is judged by an LLM against the list of live proj-* vaults:
+route to a specific project vault only if clearly specific to that project's
+code/config/data/decisions; otherwise "general" (stays in agent-memory).
+Conservative — unsure defaults to "general".
+
+Copy path (--run only, target != general): GET the full source engram
+(summary/entities/entity_relationships if enriched), POST it into the target
+vault with those enrichment fields inline (bypasses re-enrichment for
+whichever stages were provided) plus a vault-salted idempotent_id, preserved
+created_at, original topic tags, and a `distributed:from:agent-memory` tag.
+Then tag the source engram `distributed:to:<target>`. target == general:
+tag the source `distributed:general`, no copy — it stays in agent-memory.
+
+  - Durable sqlite queue (resume-safe; classification cached, write deferred to --run)
+  - --dry-run performs zero writes, including tag writes.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_PATH = HOME / ".config" / "muninn-enricher.json"  # shared config
+STATE_DIR = HOME / ".local" / "share" / "muninn-distributor"
+DB_PATH = STATE_DIR / "queue.db"
+LOG_PATH = STATE_DIR / "distributor.log"
+
+SOURCE_VAULT = "agent-memory"
+GENERAL = "general"  # sentinel meaning "stays in agent-memory" — NOT the vault "proj-general"
+
+VALID_MEMORY_TYPES = {
+    "fact", "decision", "observation", "preference", "issue", "task",
+    "procedure", "event", "goal", "constraint", "identity", "reference",
+}
+
+DEFAULT_DISTRIBUTOR_CFG = {
+    "batch_size": 25,
+    "max_retries": 3,
+    "model": "standard",  # key into cfg["models"], same models the enricher uses
+    "reasoning": "off",
+    "scan_page": 200,
+    "vault_exclude_prefixes": ["proj-smoketest-"],
+}
+
+
+# ─── Config + logging ──────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except Exception as e:
+        log(f"config load failed: {e}; defaults")
+        return {}
+
+
+def distributor_cfg(cfg: dict) -> dict:
+    merged = dict(DEFAULT_DISTRIBUTOR_CFG)
+    merged.update(cfg.get("distributor", {}))
+    return merged
+
+
+def log(msg: str) -> None:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().isoformat()
+        with open(LOG_PATH, "a") as f:
+            f.write(f"{ts} {msg}\n")
+        if os.environ.get("MUNINN_DISTRIBUTOR_VERBOSE"):
+            print(f"[{ts}] {msg}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+# ─── LM Studio model manager (mirrors muninn-promoter) ─────────────────────
+
+class LMStudio:
+    """Wraps LM Studio's native v1 REST API for model management + chat."""
+
+    def __init__(self, cfg: dict):
+        self.base = cfg.get("base_url", "http://127.0.0.1:1234")
+        self.key = cfg["key"]
+        self.timeout = cfg.get("timeout_sec", 180)
+
+    def _req(self, path: str, body: dict | None = None, method: str = "GET", timeout: int | None = None) -> dict | None:
+        url = self.base + path
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read()[:300].decode(errors="replace")
+            except Exception:
+                err_body = ""
+            log(f"LM Studio {method} {path} HTTP {e.code}: {err_body}")
+            return {"_http_error": e.code, "_body": err_body}
+        except Exception as e:
+            log(f"LM Studio {method} {path} failed: {e}")
+            return None
+
+    def list_models(self) -> list[dict]:
+        res = self._req("/api/v1/models", timeout=15)
+        if not res or "_http_error" in res:
+            return []
+        return res.get("models", []) or []
+
+    def loaded(self) -> list[dict]:
+        out = []
+        for m in self.list_models():
+            for inst in m.get("loaded_instances", []) or []:
+                out.append({
+                    "key": m.get("key", ""),
+                    "instance_id": inst.get("id") or m.get("key", ""),
+                    "context_length": inst.get("config", {}).get("context_length"),
+                    "reasoning_default": (m.get("capabilities", {}) or {}).get("reasoning", {}).get("default"),
+                })
+        return out
+
+    def model_ready(self, model_id: str) -> tuple[bool, str]:
+        try:
+            req = urllib.request.Request(
+                self.base + "/api/v1/models",
+                headers={"Authorization": f"Bearer {self.key}", "Accept": "application/json"},
+                method="GET")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = json.loads(r.read())
+        except Exception as e:
+            return False, f"LM Studio unreachable: {e}"
+        loaded = [m.get("key") for m in d.get("models", []) if m.get("loaded_instances")]
+        if model_id in loaded:
+            return True, "ready"
+        return False, f"model {model_id} not loaded (have: {loaded or 'nothing'}); pausing until reloaded"
+
+    def probe_thinking_off(self, model_id: str) -> tuple[bool, int]:
+        """Cheap assertion — reasoning tokens > 0 despite requesting "off" would
+        mean the native API silently ignored the setting — should never happen."""
+        parsed, reasoning = self.chat_extract(
+            model_id, 200, 'Output exactly: {"x":1}', "ping",
+            temperature=0, reasoning="off")
+        if reasoning < 0:
+            return False, -1
+        return reasoning == 0, reasoning
+
+    def chat_extract(self, model_id: str, max_tokens: int, system: str, user: str,
+                      temperature: float = 0.0, reasoning: str = "off") -> tuple[dict | None, int]:
+        """Native /api/v1/chat call. `reasoning` is per-request
+        ("off"|"low"|"medium"|"high"|"on") and overrides the GUI toggle."""
+        payload = {
+            "model": model_id, "temperature": temperature, "max_output_tokens": max_tokens,
+            "input": user, "system_prompt": system, "reasoning": reasoning,
+        }
+        res = self._req("/api/v1/chat", body=payload, method="POST", timeout=self.timeout)
+        if not res or "_http_error" in res:
+            return None, -1
+        if "error" in res:
+            log(f"  LM Studio chat error: {res['error'].get('message','')[:150]}")
+            return None, -1
+        content = None
+        for item in res.get("output", []) or []:
+            if item.get("type") != "message":
+                continue
+            c = item.get("content")
+            if isinstance(c, str):
+                content = c
+            elif isinstance(c, list):
+                parts = [p.get("content", p.get("text", "")) for p in c if isinstance(p, dict)]
+                content = "".join(str(p) for p in parts)
+        if content is None:
+            return None, -1
+        content = content.strip()
+        reasoning_tokens = res.get("stats", {}).get("reasoning_output_tokens")
+        if reasoning_tokens is None:
+            reasoning_tokens = sum(
+                len(item.get("content", "")) for item in res.get("output", []) or []
+                if item.get("type") == "reasoning")
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        if not content.startswith("{"):
+            i, j = content.find("{"), content.rfind("}")
+            if i >= 0 and j > i:
+                content = content[i:j + 1]
+        try:
+            return json.loads(content), reasoning_tokens
+        except Exception as e:
+            log(f"  JSON parse failed: {e}; raw[:120]={content[:120]!r}")
+            return None, reasoning_tokens
+
+    def reasoning_allowed_options(self, model_id: str) -> list[str]:
+        for m in self.list_models():
+            if m.get("key") == model_id:
+                return ((m.get("capabilities", {}) or {}).get("reasoning", {}) or {}).get("allowed_options", []) or []
+        return []
+
+
+# ─── DB (durable queue) ────────────────────────────────────────────────────
+#
+# Caches the classification result (target vault + reason) so a --dry-run and
+# a later --run don't re-ask the LLM. Separate sqlite file from the other
+# workers (`~/.local/share/muninn-distributor/queue.db`).
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    concept TEXT,
+    created_at REAL,
+    status TEXT DEFAULT 'pending',
+    target TEXT,
+    reason TEXT,
+    retries INTEGER DEFAULT 0,
+    last_error TEXT,
+    queued_at REAL,
+    classified_at REAL,
+    applied_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_target ON jobs(target);
+"""
+
+
+def db_connect() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript(SCHEMA)
+    conn.commit()
+    return conn
+
+
+# ─── REST client ────────────────────────────────────────────────────────────
+
+class RestClient:
+    """Concurrency is intentionally 1: shares the server's per-IP rate limiter
+    with the other workers. `_retrying` backs off on 429 (honouring
+    Retry-After when present) instead of treating a transient rate-limit hit
+    as a hard failure."""
+
+    def __init__(self, endpoint: str, api_key: str):
+        self.endpoint = endpoint.rstrip("/")
+        self.api_key = api_key
+
+    def _retrying(self, do_request, label: str, max_attempts: int = 6):
+        delay = 0.5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return do_request()
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < max_attempts:
+                    retry_after = e.headers.get("Retry-After") if e.headers else None
+                    wait = float(retry_after) if retry_after else delay
+                    log(f"{label}: 429, backing off {wait:.1f}s (attempt {attempt}/{max_attempts})")
+                    time.sleep(wait)
+                    delay = min(delay * 2, 10.0)
+                    continue
+                try:
+                    body = e.read()[:300].decode(errors="replace")
+                except Exception:
+                    body = ""
+                log(f"{label} failed: HTTP {e.code}: {body}")
+                return None
+            except Exception as e:
+                log(f"{label} failed: {e}")
+                return None
+        return None
+
+    def _get(self, path: str, timeout: int = 15) -> dict | list | None:
+        def do():
+            req = urllib.request.Request(
+                f"{self.endpoint}{path}",
+                headers={"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        return self._retrying(do, f"GET {path}")
+
+    def _put(self, path: str, body: dict, timeout: int = 15) -> bool:
+        def do():
+            data = json.dumps(body).encode()
+            req = urllib.request.Request(
+                f"{self.endpoint}{path}", data=data, method="PUT",
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout):
+                return True
+        return bool(self._retrying(do, f"PUT {path}"))
+
+    def _post(self, path: str, body: dict, timeout: int = 20) -> dict | None:
+        def do():
+            data = json.dumps(body).encode()
+            req = urllib.request.Request(
+                f"{self.endpoint}{path}", data=data, method="POST",
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        return self._retrying(do, f"POST {path}")
+
+    def _delete(self, path: str, timeout: int = 15) -> bool:
+        def do():
+            req = urllib.request.Request(
+                f"{self.endpoint}{path}", method="DELETE",
+                headers={"Authorization": f"Bearer {self.api_key}"})
+            with urllib.request.urlopen(req, timeout=timeout):
+                return True
+        return bool(self._retrying(do, f"DELETE {path}"))
+
+    def discover_proj_vaults(self, exclude_prefixes: list[str]) -> list[str]:
+        """GET /api/vaults is scope-filtered server-side on this fork — it
+        already returns exactly the vaults this key can reach."""
+        all_vaults = self._get("/api/vaults")
+        if not isinstance(all_vaults, list):
+            log("GET /api/vaults failed or returned non-list; no proj-* vaults discovered")
+            return []
+        out = [v for v in all_vaults if v.startswith("proj-")]
+        out = [v for v in out if not any(v.startswith(p) for p in exclude_prefixes)]
+        return sorted(out)
+
+    def iter_engrams(self, vault: str, page: int = 200):
+        # The list endpoint caps limit at 200; advance the offset by the
+        # ACTUAL number returned (never the requested page size) or rows
+        # get silently skipped.
+        off = 0
+        while True:
+            p = self._get(f"/api/engrams?vault={vault}&limit={page}&offset={off}")
+            engs = (p or {}).get("engrams", []) if isinstance(p, dict) else []
+            if not engs:
+                break
+            for e in engs:
+                yield e
+            off += len(engs)
+
+    def get_engram(self, vault: str, engram_id: str) -> dict | None:
+        q = urllib.parse.urlencode({"vault": vault})
+        return self._get(f"/api/engrams/{engram_id}?{q}")
+
+    def set_tags(self, vault: str, engram_id: str, tags: list[str]) -> bool:
+        q = urllib.parse.urlencode({"vault": vault})
+        return self._put(f"/api/engrams/{engram_id}/tags?{q}", {"tags": tags, "vault": vault})
+
+    def create_engram(self, vault: str, body: dict) -> dict | None:
+        return self._post(f"/api/engrams?vault={vault}", body)
+
+    def delete_engram(self, vault: str, engram_id: str) -> bool:
+        return self._delete(f"/api/engrams/{engram_id}?vault={vault}")
+
+
+def _add_tags(rest: RestClient, vault: str, engram_id: str, add: list[str]) -> list[str]:
+    cur = rest.get_engram(vault, engram_id) or {}
+    tags = list(dict.fromkeys((cur.get("tags") or []) + add))
+    return tags
+
+
+# ─── Candidate selection ───────────────────────────────────────────────────
+
+def classify_source_tags(tags: list[str] | None) -> str:
+    """Same discriminator as muninn-agentmem-cleanse's classify(): the
+    deliberate-remember KEEP set (no op:*, no backfill, not promoted)."""
+    tags = tags or []
+    if "promoted" in tags or "source:promoter" in tags:
+        return "promotion"
+    has_op = any(t.startswith("op:") for t in tags)
+    if has_op or "backfill" in tags:
+        return "hook"
+    return "deliberate"
+
+
+def already_distributed(tags: list[str] | None) -> bool:
+    tags = tags or []
+    return any(t == "distributed:general" or t.startswith("distributed:to:") for t in tags)
+
+
+def select_candidates(rest: RestClient, page: int) -> list[dict]:
+    """List-endpoint entries carry tags but not summary/entities — full detail
+    is fetched lazily in run_pass only for engrams actually assessed this
+    pass, to avoid N extra GETs for engrams already cached/skipped."""
+    out = []
+    for item in rest.iter_engrams(SOURCE_VAULT, page=page):
+        tags = item.get("tags") or []
+        if classify_source_tags(tags) != "deliberate":
+            continue
+        if already_distributed(tags):
+            continue
+        out.append(item)
+    return out
+
+
+# ─── Classification ─────────────────────────────────────────────────────────
+
+SYS_PROMPT_ROUTE = (
+    'You route a deliberate personal-assistant memory ("engram") that currently lives in a '
+    'general cross-project memory store into either a SPECIFIC project vault or leaves it general.\n'
+    'You are given the memory (concept/summary/content/tags/entities) and a list of live project '
+    'vault names (slugs hint at the project, e.g. proj-thermography, proj-comfyui-<hash>).\n\n'
+    'Choose a specific project vault name ONLY if the memory is CLEARLY specific to that one '
+    'project — its code, its config, its data, or a decision made about it. If the memory is a '
+    'cross-project preference, a general environment/workflow fact, a technique that applies '
+    'broadly, or you are UNSURE which project it belongs to, choose "general" instead. Be '
+    'conservative: "general" is always safe (the memory simply stays where it is); a wrong '
+    'project assignment is not.\n\n'
+    'Output ONLY valid JSON, no prose, no markdown fences:\n'
+    '{\n'
+    '  "target": string (an EXACT vault name from the provided list, or the literal "general"),\n'
+    '  "reason": string (1 sentence)\n'
+    '}'
+)
+
+
+def build_route_user_prompt(engram: dict, vault_list: list[str]) -> str:
+    entity_names = [e.get("name", "") for e in (engram.get("entities") or []) if isinstance(e, dict)]
+    return (
+        f"Candidate project vaults:\n{json.dumps(vault_list)}\n\n"
+        f"Concept: {engram.get('concept','')}\n"
+        f"Summary: {engram.get('summary','')}\n"
+        f"Tags: {[t for t in (engram.get('tags') or []) if not t.startswith('op:')]}\n"
+        f"Entities: {entity_names}\n"
+        f"Content:\n{(engram.get('content') or '')[:2000]}"
+    )
+
+
+def coerce_target(t, vault_list: list[str]) -> str:
+    s = str(t or "").strip()
+    if s == GENERAL:
+        return GENERAL
+    return s if s in vault_list else GENERAL
+
+
+def classify_route(lm: LMStudio, model_id: str, max_tokens: int, temperature: float,
+                    engram: dict, vault_list: list[str], reasoning_mode: str) -> dict | None:
+    user = build_route_user_prompt(engram, vault_list)
+    parsed, reasoning = lm.chat_extract(model_id, max_tokens, SYS_PROMPT_ROUTE, user, temperature,
+                                         reasoning=reasoning_mode)
+    if parsed is None:
+        return None
+    if reasoning_mode == "off" and reasoning > 0:
+        log(f"  ⚠ classification used {reasoning} reasoning tokens despite reasoning=off — API may have ignored the setting")
+    target = coerce_target(parsed.get("target"), vault_list)
+    return {
+        "target": target,
+        "reason": (parsed.get("reason") or "").strip(),
+        "reasoning_tokens": reasoning,
+    }
+
+
+# ─── Copy + tag path (--run only, never invoked in --dry-run) ─────────────
+
+def op_hash(vault: str, content: str) -> str:
+    return hashlib.sha256((vault + "|" + content).encode()).hexdigest()[:8]
+
+
+def iso_from_engram_ts(raw) -> str | None:
+    """created_at from GET-by-id is epoch nanoseconds; the create endpoint's
+    WriteRequest.CreatedAt is a *time.Time and needs an RFC3339 string."""
+    if not raw:
+        return None
+    try:
+        return datetime.fromtimestamp(raw / 1e9, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def distribute_one(rest: RestClient, target_vault: str, source_id: str) -> tuple[bool, str]:
+    """Write path — gated behind --run, never called from --dry-run."""
+    full = rest.get_engram(SOURCE_VAULT, source_id)
+    if not full:
+        return False, "source GET failed"
+    content = full.get("content") or ""
+    op = op_hash(target_vault, content)
+    tags = list(dict.fromkeys(
+        [t for t in (full.get("tags") or []) if not t.startswith("op:")] + ["distributed:from:agent-memory"]
+    ))
+    body = {
+        "concept": full.get("concept", ""),
+        "content": content,
+        "type_label": full.get("type_label") or "fact",
+        "tags": tags,
+        "idempotent_id": f"op:{op}",
+    }
+    iso = iso_from_engram_ts(full.get("created_at"))
+    if iso:
+        body["created_at"] = iso
+    if full.get("summary"):
+        body["summary"] = full["summary"]
+    if full.get("entities"):
+        body["entities"] = full["entities"]
+    if full.get("entity_relationships"):
+        body["entity_relationships"] = full["entity_relationships"]
+
+    res = rest.create_engram(target_vault, body)
+    if not res or not res.get("id"):
+        return False, "create failed"
+    new_id = res["id"]
+
+    src_tags = _add_tags(rest, SOURCE_VAULT, source_id, [f"distributed:to:{target_vault}"])
+    ok = rest.set_tags(SOURCE_VAULT, source_id, src_tags)
+    if not ok:
+        return True, f"created {new_id} but source tag failed"
+    return True, f"created {new_id}, source tagged"
+
+
+def mark_general_only(rest: RestClient, source_id: str) -> bool:
+    tags = _add_tags(rest, SOURCE_VAULT, source_id, ["distributed:general"])
+    return rest.set_tags(SOURCE_VAULT, source_id, tags)
+
+
+# ─── Pipeline ──────────────────────────────────────────────────────────────
+
+def run_pass(cfg: dict, dcfg: dict, rest: RestClient, lm: LMStudio,
+             conn: sqlite3.Connection, limit: int, dry_run: bool) -> dict:
+    model_cfg = cfg["models"][dcfg["model"]]
+    reasoning_mode = dcfg.get("reasoning", "off")
+
+    vault_list = rest.discover_proj_vaults(dcfg["vault_exclude_prefixes"])
+    log(f"discovered {len(vault_list)} candidate project vault(s)")
+
+    totals = {"classified": 0, "project": 0, "general": 0, "errors": 0}
+    samples_project, samples_general = [], []
+    by_target: dict[str, int] = {}
+
+    list_items = select_candidates(rest, dcfg["scan_page"])
+    log(f"{len(list_items)} undistributed deliberate candidate(s) in {SOURCE_VAULT}")
+
+    n = 0
+    for item in list_items:
+        if n >= limit:
+            break
+        eid = item["id"]
+        row = conn.execute(
+            "SELECT target, reason FROM jobs WHERE id=? AND status='classified'", (eid,)
+        ).fetchone()
+        if row:
+            classification = {"target": row[0], "reason": row[1] or ""}
+        else:
+            full = rest.get_engram(SOURCE_VAULT, eid)
+            time.sleep(0.05)  # pace scanning — server shares its per-IP rate limit with other workers
+            if not full:
+                totals["errors"] += 1
+                continue
+            classification = classify_route(lm, model_cfg["id"], model_cfg["max_tokens"],
+                                             model_cfg.get("temperature", 0.0), full, vault_list,
+                                             reasoning_mode)
+            if classification is None:
+                totals["errors"] += 1
+                conn.execute(
+                    "INSERT OR REPLACE INTO jobs (id, concept, created_at, status, retries, "
+                    "last_error, queued_at) VALUES (?,?,?,?,?,?,?)",
+                    (eid, item.get("concept", "")[:200], time.time(), "error", 1,
+                     "classification failed", time.time()))
+                conn.commit()
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO jobs (id, concept, created_at, status, target, reason, "
+                "queued_at, classified_at) VALUES (?,?,?,?,?,?,?,?)",
+                (eid, item.get("concept", "")[:200], time.time(), "classified",
+                 classification["target"], classification["reason"], time.time(), time.time()))
+            conn.commit()
+
+        n += 1
+        totals["classified"] += 1
+        target = classification["target"]
+        by_target[target] = by_target.get(target, 0) + 1
+
+        if target != GENERAL:
+            totals["project"] += 1
+            if len(samples_project) < 12:
+                samples_project.append({
+                    "id": eid, "concept": item.get("concept", ""),
+                    "target": target, "reason": classification["reason"],
+                })
+            if not dry_run:
+                ok, result = distribute_one(rest, target, eid)
+                conn.execute("UPDATE jobs SET status=?, applied_at=? WHERE id=?",
+                             ("distributed" if ok else "distribute_failed", time.time(), eid))
+                conn.commit()
+                log(f"  {eid}: -> {target}: {result}")
+        else:
+            totals["general"] += 1
+            if len(samples_general) < 8:
+                samples_general.append({
+                    "id": eid, "concept": item.get("concept", ""),
+                    "reason": classification["reason"],
+                })
+            if not dry_run:
+                ok = mark_general_only(rest, eid)
+                conn.execute("UPDATE jobs SET status=?, applied_at=? WHERE id=?",
+                             ("tagged_general" if ok else "tag_failed", time.time(), eid))
+                conn.commit()
+                log(f"  {eid}: kept general — {classification['reason']}")
+
+    return {
+        "totals": totals, "by_target": by_target,
+        "samples_project": samples_project, "samples_general": samples_general,
+    }
+
+
+# ─── Entry ─────────────────────────────────────────────────────────────────
+
+def main():
+    cfg = load_config()
+    dcfg = distributor_cfg(cfg)
+    p = argparse.ArgumentParser(description="muninn-distributor: route deliberate agent-memory remembers into project vaults")
+    p.add_argument("--dry-run", action="store_true", help="classify and print, zero writes (no tags, no copies)")
+    p.add_argument("--run", action="store_true", help="classify and write copies + distributed:* tags")
+    p.add_argument("--limit", type=int, default=dcfg["batch_size"], help="max candidates this pass")
+    p.add_argument("--status", action="store_true", help="show queue status and exit")
+    p.add_argument("--fast", action="store_true", help="use the fast model instead of default")
+    args = p.parse_args()
+
+    conn = db_connect()
+
+    if args.status:
+        for status, n in conn.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status"):
+            print(f"  {status}: {n}")
+        print("  by target:")
+        for target, n in conn.execute(
+                "SELECT target, COUNT(*) AS n FROM jobs WHERE status='classified' OR status='distributed' "
+                "OR status='tagged_general' GROUP BY target ORDER BY n DESC"):
+            print(f"    {target}: {n}")
+        return
+
+    if not args.dry_run and not args.run:
+        print("specify --dry-run or --run")
+        sys.exit(1)
+    if args.dry_run and args.run:
+        print("--dry-run and --run are mutually exclusive")
+        sys.exit(1)
+
+    if "fast" in cfg.get("models", {}):
+        dcfg["model"] = "fast" if args.fast else dcfg["model"]
+    model_cfg = cfg["models"][dcfg["model"]]
+    lm = LMStudio(cfg["lmstudio"])
+
+    # exit 0 when the model isn't loaded — mirrors the enricher's daemon
+    # semantics so a systemd timer never reports a spurious failure.
+    ready, reason = lm.model_ready(model_cfg["id"])
+    if not ready:
+        log(f"skip: {reason}")
+        print(f"model not ready: {reason}")
+        sys.exit(0)
+
+    ok, reasoning = lm.probe_thinking_off(model_cfg["id"])
+    if reasoning < 0:
+        print("⚠ probe failed — is LM Studio reachable? Proceeding anyway (quality unverified).")
+    elif not ok:
+        print(f"✗ requesting reasoning=off used {reasoning} reasoning tokens — native API is not honoring the per-request override.")
+        sys.exit(1)
+
+    reasoning_mode = dcfg.get("reasoning", "off")
+    allowed = lm.reasoning_allowed_options(model_cfg["id"])
+    if allowed and reasoning_mode not in allowed:
+        print(f"✗ distributor.reasoning={reasoning_mode!r} not in {model_cfg['id']}'s allowed_options {allowed}")
+        sys.exit(1)
+
+    endpoint, api_key = cfg["endpoint"], cfg["apply_api_key"]
+    rest = RestClient(endpoint, api_key)
+
+    log(f"pass start (model={model_cfg['id']}, dry_run={args.dry_run}, limit={args.limit})")
+    result = run_pass(cfg, dcfg, rest, lm, conn, args.limit, dry_run=args.dry_run)
+
+    totals = result["totals"]
+    print(f"\n{'DRY RUN — zero writes' if args.dry_run else 'RUN'}")
+    print(f"classified={totals['classified']} project={totals['project']} general={totals['general']} errors={totals['errors']}")
+    if result["by_target"]:
+        print("\nby target:")
+        for target, n in sorted(result["by_target"].items(), key=lambda kv: -kv[1]):
+            print(f"  {target}: {n}")
+    print("\n--- PROJECT-routed samples ---")
+    for s in result["samples_project"]:
+        print(f"\n[{s['id']}] {s['concept']}")
+        print(f"  -> {s['target']}")
+        if s["reason"]:
+            print(f"  reason: {s['reason']}")
+    print("\n--- GENERAL (kept in agent-memory) samples ---")
+    for s in result["samples_general"]:
+        print(f"\n[{s['id']}] {s['concept']}")
+        if s["reason"]:
+            print(f"  reason: {s['reason']}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""muninn-pending-sweep — find engrams still carrying the `enrichment:pending`
+tag across all proj-* vaults (and agent-memory) and enqueue them into the
+muninn-enricher queue so the running daemon picks them up.
+
+Context: the enricher discovers work via muninn_get_enrichment_candidates, but a
+few engrams end up tagged `enrichment:pending` on store yet are never surfaced
+as candidates (e.g. trivially-short content the server's selector skips), so
+they sit pending forever and are never enriched — which also keeps them
+invisible to the promoter (it only assesses enriched engrams). This sweep
+force-enqueues them.
+
+Enqueue matches the enricher's own INSERT (jobs table): status='pending',
+missing_stages computed from what's actually absent, expected_updated_at set to
+the engram's updated_at for the apply_enrichment conflict check. INSERT OR
+IGNORE so re-runs and already-queued ids are no-ops. The running daemon claims
+them round-robin per vault on its next poll.
+
+  --dry-run   report what would be enqueued, write nothing
+  --apply     enqueue into the enricher queue
+  --vault V   restrict to one vault (default: all reachable)
+"""
+from __future__ import annotations
+import argparse, json, sqlite3, sys, time, urllib.error, urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+CFG = json.loads((HOME/".config"/"muninn-hook.json").read_text())
+EP = CFG["endpoint"].rstrip("/"); KEY = CFG["agents"]["claude"]["key"]
+ENR_CFG = json.loads((HOME/".config"/"muninn-enricher.json").read_text())
+MODEL = ENR_CFG["models"][ENR_CFG.get("default_model", "standard")]["id"]
+QUEUE = HOME/".local"/"share"/"muninn-enricher"/"queue.db"
+PENDING_TAG = "enrichment:pending"
+
+
+def req(path):
+    r = urllib.request.Request(EP+path, headers={"Authorization": f"Bearer {KEY}", "Accept": "application/json"})
+    for a in range(6):
+        try:
+            with urllib.request.urlopen(r, timeout=30) as x:
+                b = x.read(); return json.loads(b) if b else {}
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and a < 5:
+                time.sleep(2*(a+1)); continue
+            raise
+    return {}
+
+
+def list_vaults():
+    v = req("/api/vaults")
+    names = v if isinstance(v, list) else v.get("vaults", [])
+    names = [n.get("name") if isinstance(n, dict) else n for n in names]
+    # proj-* + agent-memory, skip smoketest
+    return [n for n in names if (n.startswith("proj-") or n == "agent-memory") and not n.startswith("proj-smoketest")]
+
+
+def missing_stages(e):
+    """What enrichment stages this engram still lacks. Kept minimal to the two
+    the model reliably produces from real content, so the enricher clears the
+    tag once done (missing ⊆ completed). classification is usually already set."""
+    m = []
+    if not (e.get("summary") or "").strip():
+        m.append("summary")
+    if not (e.get("entities") or []):
+        m.append("entities")
+    return m or ["summary", "entities"]
+
+
+def sweep(vaults, apply):
+    conn = sqlite3.connect(QUEUE) if apply else None
+    total_found = 0
+    total_enq = 0
+    per_vault = {}
+    for v in vaults:
+        found = []
+        off = 0
+        while True:
+            p = req(f"/api/engrams?vault={v}&limit=200&offset={off}")
+            engs = p.get("engrams", []) if isinstance(p, dict) else []
+            if not engs:
+                break
+            for e in engs:
+                if e.get("state") in (127, "soft_deleted", "SoftDeleted"):
+                    continue
+                if PENDING_TAG in (e.get("tags") or []):
+                    found.append(e)
+            off += len(engs)
+            time.sleep(0.03)
+        if not found:
+            continue
+        per_vault[v] = len(found)
+        total_found += len(found)
+        if apply:
+            now = time.time()
+            enq = 0
+            for e in found:
+                try:
+                    before = conn.total_changes
+                    conn.execute(
+                        "INSERT OR IGNORE INTO jobs (id, concept, missing_stages, expected_updated_at, status, model, queued_at, vault) "
+                        "VALUES (?,?,?,?, 'pending', ?, ?, ?)",
+                        (e["id"], (e.get("concept", "") or "")[:200], json.dumps(missing_stages(e)),
+                         e.get("updated_at", ""), MODEL, now, v))
+                    if conn.total_changes > before:
+                        enq += 1
+                except Exception as ex:
+                    print(f"  enqueue {e['id']} ({v}) failed: {ex}", file=sys.stderr)
+            conn.commit()
+            total_enq += enq
+            print(f"  [{v}] found {len(found)} pending, enqueued {enq} new")
+        else:
+            print(f"  [{v}] {len(found)} pending (sample: {[ (e.get('concept','') or '')[:40] for e in found[:3] ]})")
+    if conn:
+        conn.close()
+    print(f"\n{'ENQUEUED' if apply else 'DRY-RUN'}: {total_found} pending across {len(per_vault)} vault(s)"
+          + (f", {total_enq} newly enqueued" if apply else ""))
+    return total_found
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--vault")
+    args = ap.parse_args()
+    if not args.dry_run and not args.apply:
+        print("specify --dry-run or --apply"); sys.exit(1)
+    vaults = [args.vault] if args.vault else list_vaults()
+    print(f"sweeping {len(vaults)} vault(s) for '{PENDING_TAG}' (model={MODEL})")
+    sweep(vaults, apply=args.apply)
+
+
+if __name__ == "__main__":
+    main()

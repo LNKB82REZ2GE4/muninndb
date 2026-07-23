@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""
+muninn-promoter-recover — undo the promoter twin-collision corruption (2026-07-21).
+
+The promoter's evolve-on-near-duplicate path matched semantically-adjacent but
+DIFFERENT deliberate remembers as "twins" and evolved them — overwriting the
+original's content with an unrelated promoted distillation, keeping the
+original's concept+tags. evolve() soft-deletes the original (state 0x7F) and
+creates a new active engram with the foreign content.
+
+This tool, per near_duplicate evolve event:
+  1. RESTORE the original (soft-deleted twin_id) — correct content comes back.
+  2. SOFT-DELETE the corrupted new engram (active, content == the grafted
+     distillation, carrying the original's non-promoted tags).
+  3. RE-INSERT the promotion CLEANLY as a fresh agent-memory engram
+     (distilled_concept/content/type/tags + promoted/promoted:from/source:promoter
+      + vault-salted idempotent_id) — what should have happened instead of evolve.
+
+op_hash evolves (exact-content dups) are LEFT ALONE — no data was lost there.
+--dry-run validates every mapping and writes nothing.
+"""
+from __future__ import annotations
+import argparse, hashlib, json, re, sqlite3, sys, time, urllib.error, urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+HOOK_CFG = HOME / ".config" / "muninn-hook.json"
+PROMO_DB = HOME / ".local" / "share" / "muninn-promoter" / "queue.db"
+PROMO_LOG = HOME / ".local" / "share" / "muninn-promoter" / "promoter.log"
+REC_LOG = HOME / ".local" / "share" / "muninn-promoter" / "recover.log"
+AGENT = "agent-memory"
+
+
+def load():
+    c = json.loads(HOOK_CFG.read_text())
+    return c["endpoint"].rstrip("/"), c["agents"]["claude"]["key"]
+
+
+def req(endpoint, key, method, path, body=None):
+    url = endpoint + path
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {key}", "Content-Type": "application/json", "Accept": "application/json"})
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                b = resp.read()
+                return json.loads(b) if b else {}
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 3:
+                time.sleep(2 * (attempt + 1)); continue
+            return {"_err": e.code, "_body": e.read()[:200].decode(errors="replace")}
+        except Exception as e:
+            if attempt < 3:
+                time.sleep(1 + attempt); continue
+            return {"_err": -1, "_body": str(e)}
+
+
+def rlog(m):
+    with open(REC_LOG, "a") as f:
+        f.write(f"{time.time():.0f} {m}\n")
+
+
+# type_label -> memory_type uint8 (mirror server VALID types ordering is not needed; use type_label on write)
+def parse_events():
+    """Return list of (source_engram_id, twin_id) for near_duplicate evolves."""
+    txt = PROMO_LOG.read_text()
+    out = []
+    for m in re.finditer(r'(01K[A-Z0-9]{23}): promote -> evolved existing twin (01K[A-Z0-9]{23}) \(near_duplicate\)', txt):
+        out.append((m.group(1), m.group(2)))
+    # de-dup on twin_id (each original evolved once); keep first source seen
+    seen = {}
+    for src, twin in out:
+        seen.setdefault(twin, src)
+    return [(src, twin) for twin, src in seen.items()]
+
+
+def load_cache():
+    """source_engram_id -> distilled fields (from promoter queue)."""
+    conn = sqlite3.connect(PROMO_DB)
+    conn.row_factory = sqlite3.Row
+    d = {}
+    for r in conn.execute("SELECT id, vault, distilled_concept, distilled_content, distilled_type, distilled_tags "
+                          "FROM jobs WHERE promote=1"):
+        d[r["id"]] = dict(r)
+    conn.close()
+    return d
+
+
+def op_salt(vault, content):
+    return "op:" + hashlib.sha256((vault + "|" + content).encode()).hexdigest()[:8]
+
+
+def build_reverse_supersedes(endpoint, key):
+    """Ground-truth map: superseded_target_id -> superseding(corrupted) engram id.
+    Corrupted engrams inherit the original's deliberate-class tags (source:*, no
+    op:, no backfill), so we only scan that subset and read each one's links for
+    a supersedes(rel_type 4) edge. Reliable regardless of concept/content drift."""
+    rev = {}
+    scanned = 0
+    off = 0
+    while True:
+        p = req(endpoint, key, "GET", f"/api/engrams?vault={AGENT}&limit=200&offset={off}")
+        engs = (p or {}).get("engrams", []) if isinstance(p, dict) else []
+        if not engs:
+            break
+        for e in engs:
+            tags = e.get("tags") or []
+            if any(t.startswith("op:") for t in tags) or "backfill" in tags:
+                continue
+            if "promoted" in tags or "source:promoter" in tags:
+                continue
+            if not any(t.startswith("source:") for t in tags):
+                continue
+            scanned += 1
+            lk = req(endpoint, key, "GET", f"/api/engrams/{e['id']}/links?vault={AGENT}")
+            for l in (lk.get("links", []) if isinstance(lk, dict) else []):
+                if l.get("rel_type") == 4 and l.get("target_id"):
+                    rev[l["target_id"]] = e["id"]
+        off += len(engs)
+    print(f"  scanned {scanned} deliberate-class engrams; found {len(rev)} supersedes edges", file=sys.stderr)
+    return rev
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--execute", action="store_true")
+    ap.add_argument("--limit", type=int, default=0, help="cap items (0=all)")
+    args = ap.parse_args()
+    if not args.dry_run and not args.execute:
+        print("specify --dry-run or --execute"); sys.exit(1)
+    endpoint, key = load()
+    events = parse_events()
+    cache = load_cache()
+    if args.limit:
+        events = events[:args.limit]
+    print(f"near_duplicate corruption events (unique originals): {len(events)}")
+    missing_cache = [s for s, t in events if s not in cache]
+    print(f"events whose source is missing from promoter cache: {len(missing_cache)}")
+    # distilled content of the 266 corruptions (used for best-effort corrupted deletion)
+    corrupt_contents = {}
+    for src, twin in events:
+        c = cache.get(src)
+        if c and (c.get("distilled_content") or "").strip():
+            corrupt_contents[(c["distilled_content"]).strip()] = c
+
+    stats = {"restored": 0, "restore_noop": 0, "reinserted": 0, "corrupt_deleted": 0, "errors": 0}
+
+    # PASS 1 — restore originals + re-insert promotions cleanly (both reliable)
+    for i, (src, twin) in enumerate(events):
+        c = cache.get(src)
+        dc = (c or {}).get("distilled_content", "").strip()
+        if args.dry_run:
+            tw = req(endpoint, key, "GET", f"/api/engrams/{twin}?vault={AGENT}")
+            print(f"[{i+1}/{len(events)}] restore orig={twin[-6:]} state={tw.get('state')} "
+                  f"concept={(tw.get('concept') or '')[:38]!r}  reinsert={'yes' if dc else 'no-cache'}")
+            continue
+        try:
+            rr = req(endpoint, key, "POST", f"/api/engrams/{twin}/restore?vault={AGENT}")
+            if isinstance(rr, dict) and not rr.get("_err"):
+                stats["restored"] += 1
+            else:
+                stats["restore_noop"] += 1
+            if c and dc:
+                sv = c.get("vault") or "unknown"
+                tags = json.loads(c.get("distilled_tags") or "[]")
+                tags = list(dict.fromkeys(tags + ["promoted", f"promoted:from:{sv}", "source:promoter"]))
+                body = {"concept": (c.get("distilled_concept") or "")[:200], "content": dc,
+                        "type_label": c.get("distilled_type") or "fact", "tags": tags,
+                        "idempotent_id": "op:" + hashlib.sha256(dc.encode()).hexdigest()[:8]}
+                ir = req(endpoint, key, "POST", f"/api/engrams?vault={AGENT}", body)
+                if isinstance(ir, dict) and ir.get("id"):
+                    stats["reinserted"] += 1
+            if (i + 1) % 25 == 0:
+                print(f"  restore/reinsert {i+1}/{len(events)}", file=sys.stderr)
+            time.sleep(0.03)
+        except Exception as e:
+            stats["errors"] += 1; rlog(f"restore/reinsert {twin} ERROR {e}")
+
+    if args.dry_run:
+        print(f"\nDRY-RUN: {len(events)} originals to restore, {len(corrupt_contents)} distinct promotions to re-insert")
+        return
+
+    # PASS 2 — best-effort delete of corrupted engrams: active, NON-promoted,
+    # content == one of the corruption distillations (catches whatever survived
+    # chaining with an intact distillation content). Soft-delete = reversible.
+    print("scanning for corrupted engrams to remove (content-match, non-promoted)...", file=sys.stderr)
+    off = 0
+    while True:
+        p = req(endpoint, key, "GET", f"/api/engrams?vault={AGENT}&limit=200&offset={off}")
+        engs = (p or {}).get("engrams", []) if isinstance(p, dict) else []
+        if not engs:
+            break
+        for e in engs:
+            tags = e.get("tags") or []
+            if "promoted" in tags or "source:promoter" in tags:
+                continue  # legit promotion (incl. our re-inserts) — keep
+            if (e.get("content") or "").strip() in corrupt_contents:
+                dr = req(endpoint, key, "DELETE", f"/api/engrams/{e['id']}?vault={AGENT}")
+                if isinstance(dr, dict) and not dr.get("_err"):
+                    stats["corrupt_deleted"] += 1
+                    rlog(f"deleted corrupted {e['id']}")
+        off += len(engs)
+    print(f"\nEXECUTED: {json.dumps(stats)}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# muninn-phd-add — give a PhD project its OWN vault and add it to the
+# consolidated PhD recall group, then backfill its history.
+#
+# Usage: muninn-phd-add <path> [vault]
+#   <path>  project root (git or plain dir); subfolders inherit automatically
+#   [vault] the project's own vault name (default: proj-<slug-of-basename>)
+#
+# Effect:
+#   1. registry entry  <path> -> <vault>   (isolated project memory)
+#   2. <vault> appended to recall_groups["proj-phd-writing"] so PhD Draft /
+#      PhD-Papers sessions recall across it (consolidated view)
+#   3. provisions <vault> and backfills the path's session history into it
+#
+# Idempotent and safe to re-run. The PhD *writing* dirs (PhD Draft/PhD-Papers)
+# themselves map to proj-phd-writing — this tool is for the analysis repos that
+# feed the consolidated recall.
+set -euo pipefail
+
+CFG="$HOME/.config/muninn-hook.json"
+GROUP="proj-phd-writing"        # the recall-group key (the writing store vault)
+PATH_ARG="${1:?usage: muninn-phd-add <path> [vault]}"
+
+ABS=$(realpath -m "$PATH_ARG")
+[ -d "$ABS" ] || { echo "error: $ABS is not a directory" >&2; exit 1; }
+
+# Derive a default vault name from the basename if not supplied.
+if [ "${2:-}" ]; then
+  VAULT="$2"
+else
+  slug=$(basename "$ABS" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')
+  VAULT="proj-${slug}"
+fi
+
+# 1. registry entry (path -> own vault)
+existing=$(jq -r --arg p "$ABS" '.projects[$p] // empty' "$CFG")
+if [ "$existing" = "$VAULT" ]; then
+  echo "already registered: $ABS -> $VAULT"
+elif [ -n "$existing" ]; then
+  echo "note: $ABS was mapped to $existing; remapping to $VAULT"
+  tmp=$(mktemp); jq --arg p "$ABS" --arg v "$VAULT" '.projects[$p] = $v' "$CFG" > "$tmp" && mv "$tmp" "$CFG"
+else
+  tmp=$(mktemp); jq --arg p "$ABS" --arg v "$VAULT" '.projects[$p] = $v' "$CFG" > "$tmp" && mv "$tmp" "$CFG"
+  echo "registered: $ABS -> $VAULT"
+fi
+
+# 2. add vault to the consolidated PhD recall group (idempotent; create group if absent)
+tmp=$(mktemp)
+jq --arg g "$GROUP" --arg v "$VAULT" '
+  .recall_groups //= {} |
+  .recall_groups[$g] //= [$g] |
+  if (.recall_groups[$g] | index($v)) then . else .recall_groups[$g] += [$v] end
+' "$CFG" > "$tmp" && mv "$tmp" "$CFG"
+echo "recall group $GROUP now includes: $(jq -r --arg g "$GROUP" '.recall_groups[$g] | join(", ")' "$CFG")"
+
+# Verify resolution through the live hook logic (catches typos / shadowed prefixes).
+resolved=$(python3 - "$ABS" <<'EOF'
+import importlib.machinery, json, sys
+mod = importlib.machinery.SourceFileLoader("mh", "/home/jake/.local/bin/muninn-hook").load_module()
+cfg = json.load(open("/home/jake/.config/muninn-hook.json"))
+print(mod.resolve_project(sys.argv[1], cfg))
+EOF
+)
+echo "resolves to: $resolved"
+[ "$resolved" = "$VAULT" ] || { echo "warning: resolution mismatch (a longer registry prefix may shadow this path)" >&2; exit 1; }
+
+# 2.5. provision the vault (idempotent — server create-if-missing). REQUIRED
+# before backfill: writes to a vault that doesn't exist yet fail server-side
+# (ErrVaultNotFound) rather than auto-creating it.
+CLAUDE_KEY=$(jq -r '.agents.claude.key' "$CFG")
+ENDPOINT=$(jq -r '.endpoint' "$CFG")
+provision_payload=$(jq -n --arg name "$VAULT" '{
+  name: $name,
+  template: "knowledge-graph",
+  multi_user: false,
+  behavior_instructions: ("This is a project vault (project-vaults design), part of the proj-phd-writing consolidated recall_groups tier. Hook auto-stores (turns, compactions, subagent output) land here only. Deliberate muninn_remember calls should target both this vault and agent-memory, unless the fact is purely project-local.")
+}')
+if ! curl -sf -o /dev/null -X POST "$ENDPOINT/api/vaults" \
+     -H "Authorization: Bearer $CLAUDE_KEY" -H "Content-Type: application/json" \
+     -d "$provision_payload"; then
+  echo "note: vault provisioning request did not return success (likely already exists) — continuing" >&2
+fi
+
+# 3. backfill this path's history into its own vault (idempotent)
+echo "backfilling sessions for $VAULT (idempotent)..."
+muninn-backfill --project-discover --only-project "$ABS"
+muninn-backfill --project-run --only-project "$ABS"
+echo "done. $ABS now has its own vault ($VAULT), joined to the $GROUP consolidated recall."

@@ -1,0 +1,824 @@
+#!/usr/bin/env python3
+"""
+muninn-promoter — retroactive project→general knowledge distillation worker.
+
+Sibling of muninn-enricher, sharing its config file, LM Studio wrapper, sqlite-
+queue pattern, and thinking-off guard (see muninn-enricher for full commentary
+on the thinking-off requirement).
+
+Sweeps every proj-* vault for engrams that are enriched (entities/summary
+exist), lack a `promotion:assessed` tag, and are older than a settling window.
+Each candidate is judged by an LLM: "would this matter in a different project
+or in six months?" Only durable, general knowledge (decisions+rationale, user
+preferences, reusable fixes/procedures, environment constraints) is promoted —
+rewritten into general form, never copied verbatim — into agent-memory.
+
+Design (project-vaults phase 6, docs/plans/2026-07-19-project-vaults.md §5.4):
+  - Durable sqlite queue (resume-safe; assessment cached, write deferred to --run)
+  - Twin-collision check before writing: op:hash match, then near-duplicate
+    activate() against agent-memory — prefer evolving an existing twin over
+    inserting a new engram (the "remember goes to both" path means a twin is
+    the common case, not the exception).
+  - Contradictions check against agent-memory after each --run batch via
+    REST GET /api/contradictions?vault=agent-memory.
+  - Never mints custom entity-relationship types.
+  - --dry-run performs zero writes, including tag writes.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_PATH = HOME / ".config" / "muninn-enricher.json"  # shared config, see §5.4
+STATE_DIR = HOME / ".local" / "share" / "muninn-promoter"
+DB_PATH = STATE_DIR / "queue.db"
+LOG_PATH = STATE_DIR / "promoter.log"
+
+VALID_MEMORY_TYPES = {
+    "fact", "decision", "observation", "preference", "issue", "task",
+    "procedure", "event", "goal", "constraint", "identity", "reference",
+}
+ENTITY_TYPES = {
+    "person", "organization", "location", "concept", "technology", "project",
+    "tool", "database", "service", "framework", "language", "product", "event", "other",
+}
+
+DEFAULT_PROMOTER_CFG = {
+    "target_vault": "agent-memory",
+    "settling_hours": 24,
+    "scan_limit_per_vault": 300,
+    "batch_size": 25,
+    "max_retries": 3,
+    "model": "standard",  # key into cfg["models"], same models the enricher uses
+    "twin_similarity_threshold": 0.75,
+    "reasoning": "off",  # "off"|"low"|"medium"|"high"|"on"; validated against the model's advertised allowed_options
+}
+
+
+# ─── Config + logging ──────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except Exception as e:
+        log(f"config load failed: {e}; defaults")
+        return {}
+
+
+def promoter_cfg(cfg: dict) -> dict:
+    merged = dict(DEFAULT_PROMOTER_CFG)
+    merged.update(cfg.get("promoter", {}))
+    return merged
+
+
+def log(msg: str) -> None:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().isoformat()
+        with open(LOG_PATH, "a") as f:
+            f.write(f"{ts} {msg}\n")
+        if os.environ.get("MUNINN_PROMOTER_VERBOSE"):
+            print(f"[{ts}] {msg}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+# ─── LM Studio model manager (mirrors muninn-enricher) ─────────────────────
+
+class LMStudio:
+    """Wraps LM Studio's native v1 REST API for model management + chat."""
+
+    def __init__(self, cfg: dict):
+        self.base = cfg.get("base_url", "http://127.0.0.1:1234")
+        self.key = cfg["key"]
+        self.timeout = cfg.get("timeout_sec", 180)
+
+    def _req(self, path: str, body: dict | None = None, method: str = "GET", timeout: int | None = None) -> dict | None:
+        url = self.base + path
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read()[:300].decode(errors="replace")
+            except Exception:
+                err_body = ""
+            log(f"LM Studio {method} {path} HTTP {e.code}: {err_body}")
+            return {"_http_error": e.code, "_body": err_body}
+        except Exception as e:
+            log(f"LM Studio {method} {path} failed: {e}")
+            return None
+
+    def list_models(self) -> list[dict]:
+        res = self._req("/api/v1/models", timeout=15)
+        if not res or "_http_error" in res:
+            return []
+        return res.get("models", []) or []
+
+    def loaded(self) -> list[dict]:
+        out = []
+        for m in self.list_models():
+            for inst in m.get("loaded_instances", []) or []:
+                out.append({
+                    "key": m.get("key", ""),
+                    "instance_id": inst.get("id") or m.get("key", ""),
+                    "context_length": inst.get("config", {}).get("context_length"),
+                    "reasoning_default": (m.get("capabilities", {}) or {}).get("reasoning", {}).get("default"),
+                })
+        return out
+
+    def is_loaded(self, model_id: str) -> bool:
+        return any(m["key"] == model_id for m in self.loaded())
+
+    def model_ready(self, model_id: str) -> tuple[bool, str]:
+        try:
+            req = urllib.request.Request(
+                self.base + "/api/v1/models",
+                headers={"Authorization": f"Bearer {self.key}", "Accept": "application/json"},
+                method="GET")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = json.loads(r.read())
+        except Exception as e:
+            return False, f"LM Studio unreachable: {e}"
+        loaded = [m.get("key") for m in d.get("models", []) if m.get("loaded_instances")]
+        if model_id in loaded:
+            return True, "ready"
+        return False, f"model {model_id} not loaded (have: {loaded or 'nothing'}); pausing until reloaded"
+
+    def probe_thinking_off(self, model_id: str) -> tuple[bool, int]:
+        """Cheap assertion (see muninn-enricher for full rationale). Reasoning
+        tokens > 0 despite requesting "off" would mean the native API silently
+        ignored the setting — should never happen."""
+        parsed, reasoning = self.chat_extract(
+            model_id, 200, 'Output exactly: {"x":1}', "ping",
+            temperature=0, reasoning="off")
+        if reasoning < 0:
+            return False, -1
+        return reasoning == 0, reasoning
+
+    def chat_extract(self, model_id: str, max_tokens: int, system: str, user: str,
+                      temperature: float = 0.0, reasoning: str = "off") -> tuple[dict | None, int]:
+        """Native /api/v1/chat call (see muninn-enricher for full rationale).
+        `reasoning` is per-request ("off"|"low"|"medium"|"high"|"on") and
+        overrides the GUI toggle entirely."""
+        payload = {
+            "model": model_id, "temperature": temperature, "max_output_tokens": max_tokens,
+            "input": user, "system_prompt": system, "reasoning": reasoning,
+        }
+        res = self._req("/api/v1/chat", body=payload, method="POST", timeout=self.timeout)
+        if not res or "_http_error" in res:
+            return None, -1
+        if "error" in res:
+            log(f"  LM Studio chat error: {res['error'].get('message','')[:150]}")
+            return None, -1
+        content = None
+        for item in res.get("output", []) or []:
+            if item.get("type") != "message":
+                continue
+            c = item.get("content")
+            if isinstance(c, str):
+                content = c
+            elif isinstance(c, list):
+                parts = [p.get("content", p.get("text", "")) for p in c if isinstance(p, dict)]
+                content = "".join(str(p) for p in parts)
+        if content is None:
+            return None, -1
+        content = content.strip()
+        reasoning_tokens = res.get("stats", {}).get("reasoning_output_tokens")
+        if reasoning_tokens is None:
+            reasoning_tokens = sum(
+                len(item.get("content", "")) for item in res.get("output", []) or []
+                if item.get("type") == "reasoning")
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        if not content.startswith("{"):
+            i, j = content.find("{"), content.rfind("}")
+            if i >= 0 and j > i:
+                content = content[i:j + 1]
+        try:
+            return json.loads(content), reasoning_tokens
+        except Exception as e:
+            log(f"  JSON parse failed: {e}; raw[:120]={content[:120]!r}")
+            return None, reasoning_tokens
+
+    def reasoning_allowed_options(self, model_id: str) -> list[str]:
+        for m in self.list_models():
+            if m.get("key") == model_id:
+                return ((m.get("capabilities", {}) or {}).get("reasoning", {}) or {}).get("allowed_options", []) or []
+        return []
+
+
+# ─── DB (durable queue) ────────────────────────────────────────────────────
+#
+# The queue caches assessment results (separate from the enricher's job
+# queue — separate sqlite file, `~/.local/share/muninn-promoter/queue.db`)
+# so a `--dry-run` and a later `--run` don't have to re-ask the LLM: the
+# assessment is what's expensive and non-deterministic-adjacent (temp=0, but
+# still a model call); the write itself is cheap and deterministic given the
+# assessment.
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    vault TEXT,
+    concept TEXT,
+    created_at REAL,
+    status TEXT DEFAULT 'pending',
+    promote INTEGER,
+    distilled_concept TEXT,
+    distilled_content TEXT,
+    distilled_type TEXT,
+    distilled_tags TEXT,
+    reject_reason TEXT,
+    op_hash TEXT,
+    retries INTEGER DEFAULT 0,
+    last_error TEXT,
+    queued_at REAL,
+    assessed_at REAL,
+    promoted_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_status_vault ON jobs(status, vault);
+"""
+
+
+def db_connect() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript(SCHEMA)
+    conn.commit()
+    return conn
+
+
+# ─── REST client (candidate selection, twin/contradiction checks) ─────────
+
+class RestClient:
+    """Concurrency is intentionally 1 (see main()): the promoter shares the
+    server's per-IP rate limiter with the enricher's polling loop, which is
+    typically mid-backlog. `_retrying` backs off on 429 (honouring
+    Retry-After when present) instead of treating a transient rate-limit hit
+    as a hard failure."""
+
+    def __init__(self, endpoint: str, api_key: str):
+        self.endpoint = endpoint.rstrip("/")
+        self.api_key = api_key
+
+    def _retrying(self, do_request, label: str, max_attempts: int = 6):
+        delay = 0.5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return do_request()
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < max_attempts:
+                    retry_after = e.headers.get("Retry-After") if e.headers else None
+                    wait = float(retry_after) if retry_after else delay
+                    log(f"{label}: 429, backing off {wait:.1f}s (attempt {attempt}/{max_attempts})")
+                    time.sleep(wait)
+                    delay = min(delay * 2, 10.0)
+                    continue
+                log(f"{label} failed: HTTP {e.code}")
+                return None
+            except Exception as e:
+                log(f"{label} failed: {e}")
+                return None
+        return None
+
+    def _get(self, path: str, timeout: int = 15) -> dict | list | None:
+        def do():
+            req = urllib.request.Request(
+                f"{self.endpoint}{path}",
+                headers={"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        return self._retrying(do, f"GET {path}")
+
+    def _put(self, path: str, body: dict, timeout: int = 15) -> bool:
+        def do():
+            data = json.dumps(body).encode()
+            req = urllib.request.Request(
+                f"{self.endpoint}{path}", data=data, method="PUT",
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout):
+                return True
+        return bool(self._retrying(do, f"PUT {path}"))
+
+    def _post(self, path: str, body: dict, timeout: int = 20) -> dict | None:
+        def do():
+            data = json.dumps(body).encode()
+            req = urllib.request.Request(
+                f"{self.endpoint}{path}", data=data, method="POST",
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        return self._retrying(do, f"POST {path}")
+
+    def discover_proj_vaults(self) -> list[str]:
+        """GET /api/vaults is scope-filtered server-side on this fork — it
+        already returns exactly the vaults the promoter's key can reach."""
+        all_vaults = self._get("/api/vaults")
+        if not isinstance(all_vaults, list):
+            log("GET /api/vaults failed or returned non-list; no proj-* vaults discovered")
+            return []
+        return sorted(v for v in all_vaults if v.startswith("proj-"))
+
+    def list_engrams_page(self, vault: str, limit: int, offset: int) -> dict | None:
+        q = urllib.parse.urlencode({"vault": vault, "limit": limit, "offset": offset, "sort": "created"})
+        return self._get(f"/api/engrams?{q}")
+
+    def get_engram(self, vault: str, engram_id: str) -> dict | None:
+        q = urllib.parse.urlencode({"vault": vault})
+        return self._get(f"/api/engrams/{engram_id}?{q}")
+
+    def find_by_tag(self, vault: str, tag: str, limit: int = 5) -> list[dict]:
+        q = urllib.parse.urlencode({"vault": vault, "tags": tag, "limit": limit})
+        res = self._get(f"/api/engrams?{q}")
+        if not res or not isinstance(res, dict):
+            return []
+        return res.get("engrams", []) or []
+
+    def set_tags(self, vault: str, engram_id: str, tags: list[str]) -> bool:
+        q = urllib.parse.urlencode({"vault": vault})
+        return self._put(f"/api/engrams/{engram_id}/tags?{q}", {"tags": tags, "vault": vault})
+
+    def activate(self, vault: str, context: list[str], max_results: int = 5) -> dict | None:
+        return self._post("/api/activate", {
+            "vault": vault, "context": context, "max_results": max_results, "disable_hops": True,
+        })
+
+    def contradictions(self, vault: str) -> dict | None:
+        q = urllib.parse.urlencode({"vault": vault})
+        return self._get(f"/api/contradictions?{q}")
+
+
+# ─── MCP client (writes: remember + evolve + tag source engram) ───────────
+
+class MuninnMCP:
+    def __init__(self, cfg: dict):
+        self.url = cfg.get("mcp_endpoint", "http://127.0.0.1:8750/mcp")
+        self.token = cfg["mcp_token"]
+        self.req_id = 0
+
+    def _call(self, method: str, params: dict) -> dict | None:
+        self.req_id += 1
+        payload = {"jsonrpc": "2.0", "id": self.req_id, "method": method, "params": params}
+        req = urllib.request.Request(self.url, data=json.dumps(payload).encode(), headers={
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read().decode()
+        except Exception as e:
+            log(f"MCP {method} failed: {e}")
+            return None
+        if raw.startswith("event:") or raw.startswith("data:"):
+            for line in raw.split("\n"):
+                if line.startswith("data:"):
+                    raw = line[5:].strip()
+                    break
+        try:
+            d = json.loads(raw)
+        except Exception:
+            return None
+        if "error" in d:
+            log(f"MCP {method} error: {d['error']}")
+            return None
+        return d.get("result", {})
+
+    def _text(self, result: dict) -> str:
+        for c in result.get("content", []):
+            if c.get("type") == "text":
+                return c.get("text", "")
+        return ""
+
+    def remember(self, vault: str, concept: str, content: str, tags: list[str],
+                 memory_type: str, entities: list[dict], op_id: str) -> str | None:
+        """Write a promoted engram. Never mints custom entity-relationship
+        types (§5.4) — entity_relationships is deliberately omitted here."""
+        args = {
+            "vault": vault, "concept": concept, "content": content, "tags": tags,
+            "type": memory_type, "op_id": op_id,
+        }
+        if entities:
+            args["entities"] = entities
+        res = self._call("tools/call", {"name": "muninn_remember", "arguments": args})
+        if not res:
+            return None
+        try:
+            return json.loads(self._text(res)).get("id")
+        except Exception:
+            return None
+
+    def evolve(self, vault: str, engram_id: str, new_content: str, reason: str) -> bool:
+        res = self._call("tools/call", {
+            "name": "muninn_evolve",
+            "arguments": {"vault": vault, "id": engram_id, "new_content": new_content, "reason": reason},
+        })
+        return bool(res)
+
+
+# ─── Candidate selection ───────────────────────────────────────────────────
+
+def is_enriched(engram: dict) -> bool:
+    """Enriched = entities or summary exist (background enrichment has run,
+    or the engram was inline-enriched at write time)."""
+    return bool(engram.get("summary")) or bool(engram.get("entities"))
+
+
+def select_candidates(rest: RestClient, vault: str, settling_cutoff_ts: float,
+                       scan_limit: int, want: int) -> list[dict]:
+    """Page through the vault oldest-first, filtering to engrams that are
+    enriched, unassessed, and past the settling window. Stops once `want`
+    candidates are found or `scan_limit` engrams have been scanned (whichever
+    first — a scan cap so a single huge vault can't stall the whole sweep)."""
+    out = []
+    scanned = 0
+    page_size = 50
+    # The list endpoint only serves newest-first; page from the tail backwards
+    # so the settling-window-eligible (oldest) engrams are reached first even
+    # in vaults where recent activity would exhaust the scan cap.
+    head = rest.list_engrams_page(vault, 1, 0)
+    if not head or not isinstance(head, dict):
+        return out
+    total = int(head.get("total") or 0)
+    offset = max(0, total - page_size)
+    while scanned < scan_limit and len(out) < want:
+        page = rest.list_engrams_page(vault, page_size, offset)
+        if not page or not isinstance(page, dict):
+            break
+        items = list(reversed(page.get("engrams", []) or []))
+        if not items:
+            break
+        for item in items:
+            scanned += 1
+            if scanned > scan_limit:
+                break
+            tags = item.get("tags") or []
+            if "promotion:assessed" in tags:
+                continue
+            # created_at units vary by endpoint: list returns epoch seconds,
+            # GET-by-id returns nanoseconds. Normalise by magnitude.
+            raw = item.get("created_at") or 0
+            if raw > 1e17:
+                created_s = raw / 1e9   # ns
+            elif raw > 1e14:
+                created_s = raw / 1e6   # µs
+            elif raw > 1e11:
+                created_s = raw / 1e3   # ms
+            else:
+                created_s = float(raw)  # s
+            if created_s <= 0 or created_s > settling_cutoff_ts:
+                continue  # too young (or bad timestamp) — recency bias hurts judgement
+            full = rest.get_engram(vault, item["id"])
+            time.sleep(0.05)  # pace scanning — server shares its per-IP rate limit with the enricher
+            if not full or not is_enriched(full):
+                continue
+            full["vault"] = vault
+            out.append(full)
+            if len(out) >= want:
+                break
+        if offset == 0:
+            break
+        offset = max(0, offset - page_size)
+    return out
+
+
+# ─── Assessment ─────────────────────────────────────────────────────────────
+
+SYS_PROMPT_PROMOTE = (
+    'You judge whether a project-scoped memory should be promoted into general, '
+    'cross-project long-term memory. Ask: "Would this matter in a DIFFERENT project '
+    'or in SIX MONTHS?" Promote only durable, general knowledge:\n'
+    '  - decisions with their rationale\n'
+    '  - user preferences (how the person likes to work, communicate, be corrected)\n'
+    '  - reusable fixes or procedures (a bug pattern, a workflow, a debugging technique)\n'
+    '  - environment/constraint facts that hold beyond this one project\n'
+    'NEVER promote:\n'
+    '  - session narration ("then I read the file", "next I ran the tests")\n'
+    '  - project-local file paths, line numbers, or repo-specific identifiers stated as facts\n'
+    '  - transient state (in-progress task status, a bug that is now fixed, a branch name)\n'
+    '  - implementation inventories: if the memory is itself a status report, changelog, '
+    'phase summary, or announcement of completed work, do NOT promote "we implemented X '
+    'using Y" — promote ONLY if it contains a decision WITH its rationale, or a technique '
+    'reusable verbatim elsewhere. A list of what was built is project history, not knowledge.\n'
+    'If you promote, REWRITE the memory into its general form — strip project-specific '
+    'nouns/paths, generalize the claim, keep only what would still be true and useful '
+    'in an unrelated project. Do not copy the original text verbatim. The distilled text '
+    'must contain ZERO repo-specific identifiers: no hex constants or prefix bytes, no '
+    'file/module names, no commit/branch names, no internal codenames. If generalizing '
+    'strips so much that only a truism remains ("keep docs updated", "use consistent '
+    'naming"), reject instead — truisms are not worth storing.\n\n'
+    'Output ONLY valid JSON, no prose, no markdown fences:\n'
+    '{\n'
+    '  "promote": boolean,\n'
+    '  "distilled_concept": string (<=80 chars, only meaningful if promote=true),\n'
+    '  "distilled_content": string (the rewritten, general-form fact/decision; only if promote=true),\n'
+    '  "type": one of [fact,decision,observation,preference,issue,task,procedure,event,goal,constraint,identity,reference],\n'
+    '  "tags": [string, ...] (2-5 topic tags, lowercase, only if promote=true),\n'
+    '  "reason": string (1 sentence — why promoted or why rejected)\n'
+    '}\n'
+    'If promote=false, still fill "reason" and "type"; leave distilled_concept/'
+    'distilled_content/tags empty strings/array.'
+)
+
+
+def coerce_memory_type(t) -> str:
+    s = str(t or "").strip().lower()
+    return s if s in VALID_MEMORY_TYPES else "fact"
+
+
+def assess(lm: LMStudio, model_id: str, max_tokens: int, temperature: float, engram: dict,
+           reasoning_mode: str = "on") -> dict | None:
+    user = (
+        f"Source vault: {engram.get('vault','')}\n"
+        f"Concept: {engram.get('concept','')}\n"
+        f"Summary: {engram.get('summary','')}\n"
+        f"Content:\n{(engram.get('content') or '')[:2500]}"
+    )
+    parsed, reasoning = lm.chat_extract(model_id, max_tokens, SYS_PROMPT_PROMOTE, user, temperature,
+                                         reasoning=reasoning_mode)
+    if parsed is None:
+        return None
+    if reasoning_mode == "off" and reasoning > 0:
+        log(f"  ⚠ assessment used {reasoning} reasoning tokens despite reasoning=off — API may have ignored the setting")
+    promote = bool(parsed.get("promote"))
+    tags = [t.strip().lower() for t in (parsed.get("tags") or []) if isinstance(t, str) and t.strip()]
+    return {
+        "promote": promote,
+        "distilled_concept": (parsed.get("distilled_concept") or "").strip()[:80],
+        "distilled_content": (parsed.get("distilled_content") or "").strip(),
+        "type": coerce_memory_type(parsed.get("type")),
+        "tags": tags,
+        "reason": (parsed.get("reason") or "").strip(),
+        "reasoning_tokens": reasoning,
+    }
+
+
+# ─── Twin-collision + write path (--run only, never invoked in --dry-run) ─
+
+def op_hash(distilled_content: str) -> str:
+    return hashlib.sha256(distilled_content.encode()).hexdigest()[:8]
+
+
+def find_twin(rest: RestClient, target_vault: str, op: str, distilled_content: str,
+              similarity_threshold: float) -> dict | None:
+    """Return a twin to EVOLVE only on an EXACT content match (op:hash), which
+    can only be a prior promotion of the identical distilled content — safe to
+    consolidate. The former semantic near-duplicate branch is REMOVED: it
+    matched semantically-adjacent-but-different memories (e.g. two unrelated
+    "user preference" engrams) and evolve() OVERWRITES the target's content,
+    which corrupted 266 deliberate remembers on 2026-07-21. Semantic similarity
+    is NOT identity — on no exact match we return None and the caller inserts a
+    fresh engram instead of overwriting anything."""
+    exact = rest.find_by_tag(target_vault, f"op:{op}", limit=1)
+    if exact:
+        # extra guard: only evolve a prior promotion, never a deliberate remember
+        e = exact[0]
+        tags = e.get("tags") or []
+        if "promoted" in tags or "source:promoter" in tags or f"op:{op}" in tags:
+            return {"id": e["id"], "match": "op_hash"}
+    return None
+
+
+def promote_one(rest: RestClient, muninn: MuninnMCP, target_vault: str, source_vault: str,
+                 source_id: str, assessment: dict, twin_threshold: float) -> tuple[bool, str]:
+    """Write path — gated behind --run, never called from --dry-run."""
+    content = assessment["distilled_content"]
+    op = op_hash(content)
+    twin = find_twin(rest, target_vault, op, content, twin_threshold)
+    tags = list(dict.fromkeys(
+        assessment["tags"] + ["promoted", f"promoted:from:{source_vault}", "source:promoter", f"op:{op}"]
+    ))
+    if twin:
+        ok = muninn.evolve(target_vault, twin["id"], content,
+                            f"consolidated with promoted twin from {source_vault} ({twin['match']})")
+        result = f"evolved existing twin {twin['id']} ({twin['match']})" if ok else "evolve failed"
+    else:
+        new_id = muninn.remember(target_vault, assessment["distilled_concept"], content, tags,
+                                  assessment["type"], entities=[], op_id=op)
+        ok = bool(new_id)
+        result = f"created {new_id}" if ok else "remember failed"
+    if not ok:
+        return False, result
+    src_tags_ok = rest.set_tags(source_vault, source_id,
+                                 _add_tags(rest, source_vault, source_id, ["promotion:assessed", "promotion:promoted"]))
+    return True, result
+
+
+def _add_tags(rest: RestClient, vault: str, engram_id: str, add: list[str]) -> list[str]:
+    cur = rest.get_engram(vault, engram_id) or {}
+    tags = list(dict.fromkeys((cur.get("tags") or []) + add))
+    return tags
+
+
+def mark_assessed_only(rest: RestClient, vault: str, engram_id: str) -> bool:
+    """Rejected candidates still get `promotion:assessed` so they aren't re-judged forever."""
+    tags = _add_tags(rest, vault, engram_id, ["promotion:assessed"])
+    return rest.set_tags(vault, engram_id, tags)
+
+
+# ─── Pipeline ──────────────────────────────────────────────────────────────
+
+def run_pass(cfg: dict, pcfg: dict, rest: RestClient, muninn: MuninnMCP, lm: LMStudio,
+             conn: sqlite3.Connection, vaults: list[str], limit: int, dry_run: bool) -> dict:
+    model_cfg = cfg["models"][pcfg["model"]]
+    settling_cutoff = time.time() - pcfg["settling_hours"] * 3600
+    scan_limit = pcfg["scan_limit_per_vault"]
+    target_vault = pcfg["target_vault"]
+    twin_threshold = pcfg["twin_similarity_threshold"]
+    reasoning_mode = pcfg.get("reasoning", "off")
+
+    totals = {"assessed": 0, "promote": 0, "reject": 0, "errors": 0}
+    samples_promote, samples_reject = [], []
+
+    per_vault_limit = max(1, limit // max(1, len(vaults)))
+    for vault in vaults:
+        candidates = select_candidates(rest, vault, settling_cutoff, scan_limit, per_vault_limit)
+        log(f"[{vault}] {len(candidates)} candidate(s) (scan cap={scan_limit}, settling>={pcfg['settling_hours']}h)")
+        for engram in candidates:
+            eid = engram["id"]
+            row = conn.execute("SELECT promote, distilled_content, distilled_concept, distilled_type, "
+                                "distilled_tags, reject_reason FROM jobs WHERE id=? AND status='assessed'",
+                                (eid,)).fetchone()
+            if row:
+                assessment = {
+                    "promote": bool(row[0]), "distilled_content": row[1] or "",
+                    "distilled_concept": row[2] or "", "type": row[3] or "fact",
+                    "tags": json.loads(row[4] or "[]"), "reason": row[5] or "",
+                }
+            else:
+                assessment = assess(lm, model_cfg["id"], model_cfg["max_tokens"],
+                                     model_cfg.get("temperature", 0.0), engram,
+                                     reasoning_mode=reasoning_mode)
+                if assessment is None:
+                    totals["errors"] += 1
+                    conn.execute(
+                        "INSERT OR REPLACE INTO jobs (id, vault, concept, created_at, status, "
+                        "retries, last_error, queued_at) VALUES (?,?,?,?,?,?,?,?)",
+                        (eid, vault, engram.get("concept", "")[:200], time.time(), "error",
+                         1, "assessment failed", time.time()))
+                    conn.commit()
+                    continue
+                conn.execute(
+                    "INSERT OR REPLACE INTO jobs (id, vault, concept, created_at, status, promote, "
+                    "distilled_concept, distilled_content, distilled_type, distilled_tags, "
+                    "reject_reason, queued_at, assessed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (eid, vault, engram.get("concept", "")[:200], time.time(), "assessed",
+                     int(assessment["promote"]), assessment["distilled_concept"],
+                     assessment["distilled_content"], assessment["type"],
+                     json.dumps(assessment["tags"]), assessment["reason"], time.time(), time.time()))
+                conn.commit()
+
+            totals["assessed"] += 1
+            if assessment["promote"] and assessment["distilled_content"]:
+                totals["promote"] += 1
+                if len(samples_promote) < 6:
+                    samples_promote.append({
+                        "source_vault": vault, "source_id": eid,
+                        "source_concept": engram.get("concept", ""),
+                        "distilled_concept": assessment["distilled_concept"],
+                        "distilled_content": assessment["distilled_content"],
+                        "type": assessment["type"], "tags": assessment["tags"],
+                        "reason": assessment["reason"],
+                    })
+                if not dry_run:
+                    ok, result = promote_one(rest, muninn, target_vault, vault, eid, assessment, twin_threshold)
+                    conn.execute("UPDATE jobs SET status=?, promoted_at=? WHERE id=?",
+                                 ("promoted" if ok else "promote_failed", time.time(), eid))
+                    conn.commit()
+                    log(f"  [{vault}] {eid}: promote -> {result}")
+            else:
+                totals["reject"] += 1
+                if len(samples_reject) < 4:
+                    samples_reject.append({
+                        "source_vault": vault, "source_id": eid,
+                        "source_concept": engram.get("concept", ""),
+                        "reason": assessment["reason"],
+                    })
+                if not dry_run:
+                    mark_assessed_only(rest, vault, eid)
+                    log(f"  [{vault}] {eid}: rejected — {assessment['reason']}")
+
+    if not dry_run and totals["promote"] > 0:
+        contra = rest.contradictions(target_vault)
+        if contra is None:
+            log("post-batch contradictions check failed (unreachable)")
+        else:
+            n = len(contra.get("contradictions", []) or [])
+            log(f"post-batch contradictions check on {target_vault}: {n} pair(s) found")
+
+    return {"totals": totals, "samples_promote": samples_promote, "samples_reject": samples_reject}
+
+
+# ─── Entry ─────────────────────────────────────────────────────────────────
+
+def main():
+    cfg = load_config()
+    pcfg = promoter_cfg(cfg)
+    p = argparse.ArgumentParser(description="muninn-promoter: project→general knowledge distillation")
+    p.add_argument("--dry-run", action="store_true", help="assess and print, zero writes (no tags either)")
+    p.add_argument("--run", action="store_true", help="assess and write promotions + assessed tags")
+    p.add_argument("--vault", help="restrict to a single proj-* vault")
+    p.add_argument("--limit", type=int, default=pcfg["batch_size"], help="max candidates this pass (total, across vaults)")
+    p.add_argument("--settling-hours", type=float, default=None,
+                   help="override the settling window (0 = assess everything regardless of age; default from config)")
+    p.add_argument("--scan-limit", type=int, default=None,
+                   help="override scan_limit_per_vault (engrams scanned per vault per pass; raise to reach past already-assessed engrams in a big vault)")
+    p.add_argument("--status", action="store_true", help="show queue status and exit")
+    p.add_argument("--fast", action="store_true", help="use the fast model instead of default")
+    args = p.parse_args()
+    if args.settling_hours is not None:
+        pcfg["settling_hours"] = args.settling_hours
+    if args.scan_limit is not None:
+        pcfg["scan_limit_per_vault"] = args.scan_limit
+
+    conn = db_connect()
+
+    if args.status:
+        for status, n in conn.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status"):
+            print(f"  {status}: {n}")
+        print("  by vault:")
+        for vault, n in conn.execute("SELECT vault, COUNT(*) AS n FROM jobs GROUP BY vault ORDER BY n DESC"):
+            print(f"    {vault}: {n}")
+        return
+
+    if not args.dry_run and not args.run:
+        print("specify --dry-run or --run")
+        sys.exit(1)
+    if args.dry_run and args.run:
+        print("--dry-run and --run are mutually exclusive")
+        sys.exit(1)
+
+    if "fast" in cfg.get("models", {}):
+        pcfg["model"] = "fast" if args.fast else pcfg["model"]
+    model_cfg = cfg["models"][pcfg["model"]]
+    lm = LMStudio(cfg["lmstudio"])
+
+    # exit 0 when the model isn't loaded — mirrors the enricher's daemon
+    # semantics so a systemd timer never reports a spurious failure.
+    ready, reason = lm.model_ready(model_cfg["id"])
+    if not ready:
+        log(f"skip: {reason}")
+        print(f"model not ready: {reason}")
+        sys.exit(0)
+
+    ok, reasoning = lm.probe_thinking_off(model_cfg["id"])
+    if reasoning < 0:
+        print("⚠ probe failed — is LM Studio reachable? Proceeding anyway (quality unverified).")
+    elif not ok:
+        print(f"✗ requesting reasoning=off used {reasoning} reasoning tokens — native API is not honoring the per-request override.")
+        sys.exit(1)
+
+    reasoning_mode = pcfg.get("reasoning", "off")
+    allowed = lm.reasoning_allowed_options(model_cfg["id"])
+    if allowed and reasoning_mode not in allowed:
+        print(f"✗ promoter.reasoning={reasoning_mode!r} not in {model_cfg['id']}'s allowed_options {allowed}")
+        sys.exit(1)
+
+    endpoint, api_key = cfg["endpoint"], cfg["apply_api_key"]
+    rest = RestClient(endpoint, api_key)
+    muninn = MuninnMCP(cfg)
+
+    vaults = [args.vault] if args.vault else rest.discover_proj_vaults()
+    if not vaults:
+        print("no proj-* vaults reachable")
+        return
+    log(f"sweeping {len(vaults)} vault(s): {vaults} (model={model_cfg['id']}, dry_run={args.dry_run})")
+
+    result = run_pass(cfg, pcfg, rest, muninn, lm, conn, vaults, args.limit, dry_run=args.dry_run)
+
+    totals = result["totals"]
+    print(f"\n{'DRY RUN — zero writes' if args.dry_run else 'RUN'}")
+    print(f"assessed={totals['assessed']} promote={totals['promote']} reject={totals['reject']} errors={totals['errors']}")
+    print("\n--- PROMOTE samples ---")
+    for s in result["samples_promote"]:
+        print(f"\n[{s['source_vault']}] {s['source_id']}  ({s['source_concept']})")
+        print(f"  -> {s['distilled_concept']}  [{s['type']}]  tags={s['tags']}")
+        print(f"  {s['distilled_content']}")
+        if s["reason"]:
+            print(f"  reason: {s['reason']}")
+    print("\n--- REJECT samples ---")
+    for s in result["samples_reject"]:
+        print(f"\n[{s['source_vault']}] {s['source_id']}  ({s['source_concept']})")
+        print(f"  reason: {s['reason']}")
+
+
+if __name__ == "__main__":
+    main()

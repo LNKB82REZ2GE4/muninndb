@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# muninn-promoter-loop — run the promoter continuously to clear the backlog.
+# Each pass assesses ALL enriched+unassessed engrams (no settling window, no
+# scan cap); between passes it waits, so as the enricher produces newly-enriched
+# engrams the next pass picks them up. Graceful when LM Studio is stopped
+# (promoter exits 0 -> loop backs off). Stop with:
+#   systemctl --user stop muninn-promoter-loop
+set -uo pipefail
+LOG="$HOME/.local/share/muninn-promoter/loop.log"
+say(){ echo "$(date -Is) [loop] $*" >> "$LOG"; }
+say "start: continuous backlog-clear (settling=0, scan-limit unbounded)"
+while true; do
+  out=$(muninn-promoter --run --settling-hours 0 --scan-limit 100000000 --limit 100000000 2>&1)
+  summary=$(printf '%s\n' "$out" | grep -E 'assessed=|model not ready' | tail -1)
+  say "pass done: ${summary:-<no summary>}"
+  if printf '%s' "$out" | grep -q 'model not ready'; then
+    say "model absent (LM Studio stopped?) - backing off 300s"
+    sleep 300
+  else
+    sleep 45
+  fi
+done

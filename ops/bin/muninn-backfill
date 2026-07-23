@@ -1,0 +1,904 @@
+#!/usr/bin/env python3
+"""
+muninn-backfill — seed agent-memory / project vaults from historical
+Pi/Claude/Codex sessions.
+
+Architecture: mirrors live writes EXACTLY. Pure structural ingestion — no LLM.
+The running enricher daemon (muninn-enricher) handles all LLM extraction
+uniformly, treating backfilled engrams identically to live-captured ones.
+
+  Backfill (this tool):  parse → noise-filter → batch-write structural engrams
+  Enricher (separate):   discover pending → LM extraction → apply enrichment
+
+Two independent, resumable sqlite queues:
+
+  `sessions`          — original pass, one row per transcript, target vault is
+                         fixed (agent-memory, via vault-pinned per-source keys).
+  `project_sessions`  — v2 pass (project-vaults phase 4, design §5.2): routes
+                         each session by its recorded cwd to a project vault via
+                         `resolve_project` (imported from muninn-hook, not
+                         reimplemented), using relaxed completeness filtering.
+                         Sessions with no resolvable project are skipped (their
+                         content already reached agent-memory via the original
+                         pass).
+
+Idempotency: every engram carries both a `op:<sha8(content)>` tag (legacy,
+kept for the enricher/graph-provenance contract) and the first-class
+`idempotent_id` field (`op:<sha8(content)>` — same value, real dedup key).
+Server-side content dedup plus this key makes re-running either pass, or
+overlapping the transcript pass with the `--from-vault` gap-fill pass, safe.
+
+Auth: per-source mk_ keys. The original pass uses the legacy vault-pinned
+keys (SOURCES below) — untouched. The project pass uses the re-scoped
+`agent-memory,proj-*` keys from ~/.config/muninn-hook.json (project-vaults
+phase 1), since only those can write proj-* vaults.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_PATH = HOME / ".config" / "muninn-enricher.json"  # share endpoint config
+HOOK_PATH = HOME / ".local" / "bin" / "muninn-hook"
+HOOK_CONFIG_PATH = HOME / ".config" / "muninn-hook.json"
+STATE_DIR = HOME / ".local" / "share" / "muninn-enricher"
+DB_PATH = STATE_DIR / "backfill.db"
+LOG_PATH = STATE_DIR / "backfill.log"
+
+SOURCES = {
+    "pi": {
+        "glob": str(HOME / ".pi/agent/sessions/**/*.jsonl"),
+        "key": "mk_REDACTED_SET_YOUR_SCOPED_KEY",
+        "marker": "source:pi",
+    },
+    "claude": {
+        "glob": str(HOME / ".claude/projects/**/*.jsonl"),
+        "key": "mk_REDACTED_SET_YOUR_SCOPED_KEY",
+        "marker": "source:claude",
+    },
+    "codex": {
+        "glob": str(HOME / ".codex/sessions/**/rollout-*.jsonl"),
+        "key": "mk_REDACTED_SET_YOUR_SCOPED_KEY",
+        "marker": "source:codex",
+    },
+    "pi-discord": {
+        "glob": str(HOME / ".pi/discord-daemon/sessions/**/*.jsonl"),
+        "key": "mk_REDACTED_SET_YOUR_SCOPED_KEY",
+        "marker": "source:pi-discord",
+    },
+}
+
+# Agent name in muninn-hook.json's `agents` map for each backfill source
+# (pi-discord shares the pi agent's key, same as its legacy mk_ key above).
+HOOK_AGENT_FOR_SOURCE = {"pi": "pi", "claude": "claude", "codex": "codex", "pi-discord": "pi"}
+
+MIN_MSG_CHARS = 40  # user messages can be shorter than assistant ones; strict/original pass
+
+# Relaxed completeness filter for the project pass (design §5.2): project
+# vaults are meant to be complete, so the noise cost is contained to that
+# tier. min-chars matches muninn-hook's own live-capture threshold
+# (min_content_chars=15 in muninn-hook.json defaults) so backfilled detail
+# granularity matches what's captured going forward. The noise *pattern* set
+# drops only the two patterns that discard short but potentially decision-
+# bearing turns (bare affirmations, "here's the X" lead-ins) — structural
+# noise (tool calls, injections, shell prompt echoes) is still stripped.
+RELAXED_MIN_MSG_CHARS = 15
+
+# Noise filter — aggressive for backfill. Drops filler/preamble/UI residue.
+INJECTION_RE = re.compile(
+    r"<(?:lnk-memory-context|hybrid-memory-context|agent-memory-recall|agent-memory-context)>.*?</(?:lnk-memory-context|hybrid-memory-context|agent-memory-recall|agent-memory-context)>",
+    re.DOTALL,
+)
+NOISE_RE = re.compile(
+    r"^(\s*"
+    r"(\[tool(call|result)[\s\]])"
+    r"|/lnk-memory-"
+    r"|/skill-"
+    r"|interactive_shell.*exited"
+    r"|\$\w"
+    r"|Caveat:.*Claude"
+    r"|^(ok|sure|got it|let me|let's|i'll|i will|i'm going to|checking|looking|reading|done!|done\.|yes|yep|no|y|n|go|continue|proceed)\b"
+    r"|^(here'?s|here are|the (file|result|output) is)\b.{0,30}$"
+    r"|^(#|//)"
+    r")",
+    re.IGNORECASE,
+)
+RELAXED_NOISE_RE = re.compile(
+    r"^(\s*"
+    r"(\[tool(call|result)[\s\]])"
+    r"|/lnk-memory-"
+    r"|/skill-"
+    r"|interactive_shell.*exited"
+    r"|\$\w"
+    r"|Caveat:.*Claude"
+    r"|^(#|//)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def log(msg: str) -> None:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().isoformat()
+        with open(LOG_PATH, "a") as f:
+            f.write(f"{ts} {msg}\n")
+        if os.environ.get("MUNINN_BACKFILL_VERBOSE"):
+            print(f"[{ts}] {msg}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+def load_config() -> dict:
+    return json.loads(CONFIG_PATH.read_text())
+
+
+def sha8(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+# ─── muninn-hook reuse (project-vaults phase 4: resolve_project etc.) ──────
+
+_hook_mod = None
+
+
+def hook_module():
+    """Lazily import muninn-hook as a module so resolve_project/project_vault_name/
+    agent_config stay single-sourced (design §5.2: 'same code as the hook')."""
+    global _hook_mod
+    if _hook_mod is None:
+        loader = SourceFileLoader("muninn_hook", str(HOOK_PATH))
+        spec = importlib.util.spec_from_loader("muninn_hook", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        _hook_mod = mod
+    return _hook_mod
+
+
+def load_hook_config() -> dict:
+    try:
+        return json.loads(HOOK_CONFIG_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def hook_key_for_source(hook_cfg: dict, source: str) -> str | None:
+    mod = hook_module()
+    agent = HOOK_AGENT_FOR_SOURCE.get(source, source)
+    agents = hook_cfg.get("agents", {})
+    if agent not in agents:
+        return None
+    key, _ = mod.agent_config(hook_cfg, agent)
+    return key
+
+
+# ─── cwd extraction (design §5.2 — per source, mirrors transcript formats) ─
+
+def _claude_cwd_from_dirname(path: str) -> str | None:
+    """Fallback when no line in the transcript carries a `cwd` field: decode
+    the ~/.claude/projects/<slug> directory name. Lossy for repo basenames
+    containing dashes, but safe — resolve_project's git rev-parse simply
+    fails closed (session skipped) on a wrong decode."""
+    parent = Path(path).parent.name
+    if parent.startswith("-"):
+        return "/" + parent[1:].replace("-", "/")
+    return None
+
+
+def session_cwd(source: str, path: str) -> str | None:
+    try:
+        if source == "claude":
+            for line in open(path, errors="replace"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                cwd = o.get("cwd")
+                if cwd:
+                    return cwd
+            return _claude_cwd_from_dirname(path)
+        elif source in ("pi", "pi-discord"):
+            first = open(path, errors="replace").readline().strip()
+            o = json.loads(first)
+            if o.get("type") == "session":
+                return o.get("cwd")
+            return None
+        elif source == "codex":
+            first = open(path, errors="replace").readline().strip()
+            o = json.loads(first)
+            if o.get("type") == "session_meta":
+                return o.get("payload", {}).get("cwd")
+            return None
+    except Exception:
+        return None
+    return None
+
+
+# ─── Noise filtering (mirrors muninn-hook, slightly more aggressive) ────────
+
+def strip_injections(t: str) -> str:
+    return INJECTION_RE.sub("", t).strip()
+
+
+def is_noise(text: str, min_chars: int = MIN_MSG_CHARS, noise_re: re.Pattern = NOISE_RE) -> bool:
+    t = text.strip()
+    if len(t) < min_chars:
+        return True
+    if noise_re.match(t):
+        return True
+    if len(strip_injections(t)) < min_chars:
+        return True
+    return False
+
+
+# ─── Transcript parsers (mirror muninn-hook — return [{text, ts}]) ─────────
+
+def parse_claude(path: str, min_chars: int = MIN_MSG_CHARS, noise_re: re.Pattern = NOISE_RE) -> list[dict]:
+    out = []
+    for line in open(path, errors="replace"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if o.get("type") not in ("assistant", "user"):
+            continue
+        is_user = o.get("type") == "user"
+        msg = o.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+        # user-role check for user entries
+        if is_user and msg.get("role") not in ("user", None):
+            continue
+        content = msg.get("content", [])
+        # user content may be a plain string
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            texts = [c.get("text", "") for c in content
+                     if isinstance(c, dict) and c.get("type") == "text" and c.get("text", "").strip()]
+            text = "\n".join(texts).strip()
+        else:
+            continue
+        text = strip_injections(text)
+        if not text or is_noise(text, min_chars, noise_re):
+            continue
+        out.append({"text": text, "ts": o.get("timestamp", ""), "role": "user" if is_user else "assistant"})
+    return out
+
+
+def parse_pi(path: str, min_chars: int = MIN_MSG_CHARS, noise_re: re.Pattern = NOISE_RE) -> list[dict]:
+    out = []
+    for line in open(path, errors="replace"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if o.get("type") != "message":
+            continue
+        msg = o.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in ("assistant", "user"):
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            text = "\n".join(c.get("text", "") for c in content
+                             if isinstance(c, dict) and c.get("text", "").strip()).strip()
+        else:
+            continue
+        text = strip_injections(text)
+        if not text or is_noise(text, min_chars, noise_re):
+            continue
+        out.append({"text": text, "ts": o.get("timestamp", ""), "role": role})
+    return out
+
+
+def parse_codex(path: str, min_chars: int = MIN_MSG_CHARS, noise_re: re.Pattern = NOISE_RE) -> list[dict]:
+    out = []
+    for line in open(path, errors="replace"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if o.get("type") != "response_item":
+            continue
+        p = o.get("payload", {})
+        if not isinstance(p, dict) or p.get("type") != "message":
+            continue
+        role = p.get("role")
+        if role not in ("assistant", "user"):
+            continue
+        # codex developer/system roles carry injected instructions — skip those
+        content = p.get("content", [])
+        if not isinstance(content, list):
+            continue
+        texts = [c.get("text", "") for c in content
+                 if isinstance(c, dict) and c.get("text", "").strip()]
+        text = strip_injections("\n".join(texts))
+        if not text or is_noise(text, min_chars, noise_re):
+            continue
+        out.append({"text": text, "ts": o.get("timestamp", ""), "role": role})
+    return out
+
+
+PARSERS = {"pi": parse_pi, "claude": parse_claude, "codex": parse_codex, "pi-discord": parse_pi}
+
+
+# ─── Engram builder (mirrors muninn-hook build_engram exactly) ─────────────
+
+def derive_concept(content: str) -> str:
+    t = content.strip().split("\n")[0]
+    for sep in (". ", "! ", "? "):
+        i = t.find(sep)
+        if 20 < i < 80:
+            t = t[:i + 1]
+            break
+    return re.sub(r"\s+", " ", t).strip()[:80]
+
+
+def yyyy_mm_from(ts: str) -> str:
+    if ts:
+        try:
+            s = ts.strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            return datetime.fromisoformat(s).strftime("%Y-%m")
+        except Exception:
+            pass
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def build_engram(text: str, source: str, session_path: str, entry_idx: int, ts: str,
+                  role: str = "assistant", extra_tags: list[str] | None = None,
+                  idempotent_salt: str | None = None) -> dict:
+    """Structural engram — mirrors muninn-hook contract; role-aware type_label.
+    Always sets idempotent_id (first-class dedup key, design §5.2) alongside
+    the legacy op: tag — same value by default, so transcript-pass and
+    vault-copy-pass collide by design and server dedup makes both idempotent.
+
+    `idempotent_salt` (project-vaults topology split, 2026-07-21): the global
+    idempotency receipt (internal/storage/keys.go IdempotencyKey, 0x19 prefix)
+    has NO vault/workspace component — it's a bare siphash of idempotent_id.
+    Content already backfilled into proj-phd-shared would otherwise dedupe
+    globally and land EMPTY in a freshly-split per-repo vault. Passing the
+    target vault name as the salt makes the idempotency key effectively
+    per-vault (same content, different vault → different key) while staying
+    itself idempotent (same content + same vault, re-run → same key, no dup).
+    The legacy `op:` tag stays unsalted (content-only) — it's a
+    provenance/dedup-within-vault contract, not the routing mechanism."""
+    session_base = Path(session_path).stem
+    is_user = role == "user"
+    op = sha8(text)
+    idempotent_op = sha8(f"{idempotent_salt}|{text}") if idempotent_salt else op
+    tags = [
+        f"source:{source}",
+        f"session:{session_base}",
+        f"entry:{entry_idx}",
+        f"role:{role}",
+        f"op:{op}",
+        yyyy_mm_from(ts),
+        "enrichment:pending",  # ← enricher daemon picks this up
+        "backfill",            # ← distinguish from live captures (provenance)
+    ]
+    if extra_tags:
+        tags.extend(extra_tags)
+    return {
+        "concept": derive_concept(text),
+        "content": text,
+        "type": "observation" if is_user else "observation",  # provisional; enricher refines
+        "type_label": "user_message" if is_user else "assistant_message",
+        "tags": tags,
+        "confidence": 0.7,
+        "created_at": ts or datetime.now(timezone.utc).isoformat(),
+        "idempotent_id": f"op:{idempotent_op}",
+    }
+
+
+# ─── DB (resumable queues) ──────────────────────────────────────────────────
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    path TEXT PRIMARY KEY,
+    source TEXT,
+    status TEXT DEFAULT 'pending',  -- pending|done|empty|failed
+    n_messages INTEGER,
+    n_written INTEGER,
+    retries INTEGER DEFAULT 0,
+    last_error TEXT,
+    mtime REAL,
+    processed_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+
+CREATE TABLE IF NOT EXISTS project_sessions (
+    path TEXT PRIMARY KEY,
+    source TEXT,
+    cwd TEXT,
+    vault TEXT,
+    status TEXT DEFAULT 'pending',  -- pending|done|empty|no_project|failed
+    n_messages INTEGER,
+    n_written INTEGER,
+    retries INTEGER DEFAULT 0,
+    last_error TEXT,
+    mtime REAL,
+    processed_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_project_sessions_status ON project_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_project_sessions_vault ON project_sessions(vault);
+"""
+
+
+def db_connect() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def discover(conn) -> int:
+    added = 0
+    for source, cfg in SOURCES.items():
+        for p in glob.glob(cfg["glob"], recursive=True):
+            try:
+                mtime = os.path.getmtime(p)
+            except Exception:
+                continue
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO sessions (path, source, status, mtime) "
+                    "VALUES (?,?, 'pending', ?)", (p, source, mtime))
+                if conn.total_changes:
+                    added += 1
+            except Exception:
+                pass
+    conn.commit()
+    return added
+
+
+def claim_next(conn, source_filter: str | None = None):
+    if source_filter:
+        row = conn.execute(
+            "SELECT path, source FROM sessions WHERE status='pending' AND source=? "
+            "ORDER BY mtime DESC LIMIT 1", (source_filter,)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT path, source FROM sessions WHERE status='pending' "
+            "ORDER BY mtime DESC LIMIT 1").fetchone()
+    if not row:
+        return None
+    conn.execute("UPDATE sessions SET status='processing' WHERE path=?", (row[0],))
+    conn.commit()
+    return {"path": row[0], "source": row[1]}
+
+
+# ─── Project-pass discovery/queue (design §5.2 vault routing) ─────────────
+
+def discover_project(conn, hook_cfg: dict, only_project_vault: str | None) -> tuple[int, int]:
+    """Scan all sources, resolve each session's cwd → project vault, and queue
+    those matching `only_project_vault` (or all resolvable ones if None —
+    fleet-wide; never invoked that way by this pilot). Sessions with no
+    resolvable project are recorded as status='no_project' and skipped by
+    processing (their content already reached agent-memory originally)."""
+    mod = hook_module()
+    added = 0
+    skipped_other = 0
+    for source, cfg in SOURCES.items():
+        for p in glob.glob(cfg["glob"], recursive=True):
+            try:
+                mtime = os.path.getmtime(p)
+            except Exception:
+                continue
+            existing = conn.execute("SELECT 1 FROM project_sessions WHERE path=?", (p,)).fetchone()
+            if existing:
+                continue
+            cwd = session_cwd(source, p)
+            # resolve_store_vault honors the general_vault fallback, so
+            # non-project ("no_project") sessions route into proj-general
+            # instead of being skipped (prep for an agent-memory cleanse).
+            vault = mod.resolve_store_vault(hook_cfg, cwd) if cwd else None
+            if vault is None:
+                conn.execute(
+                    "INSERT OR IGNORE INTO project_sessions (path, source, cwd, vault, status, mtime) "
+                    "VALUES (?,?,?,?, 'no_project', ?)", (p, source, cwd, None, mtime))
+                continue
+            if only_project_vault and vault != only_project_vault:
+                skipped_other += 1
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO project_sessions (path, source, cwd, vault, status, mtime) "
+                "VALUES (?,?,?,?, 'pending', ?)", (p, source, cwd, vault, mtime))
+            added += 1
+    conn.commit()
+    return added, skipped_other
+
+
+def reconcile_project_sessions(conn, hook_cfg: dict) -> int:
+    """Project-vaults topology split (2026-07-21): proj-phd-shared was split
+    into per-repo vaults. Rows already recorded in `project_sessions` (esp.
+    status='done') still point at the OLD resolved vault — `discover_project`
+    uses INSERT OR IGNORE keyed on `path`, so it never revisits them. Recompute
+    each row's vault under the CURRENT registry; any row whose vault changed
+    gets requeued (status→'pending', counters cleared) so --project-run
+    re-routes it. Idempotency is per-vault (see build_engram idempotent_salt),
+    so re-running a requeued row only affects its (new) vault and is itself
+    a no-op on subsequent runs. Rows mid-flight ('processing') are left alone."""
+    mod = hook_module()
+    rows = conn.execute(
+        "SELECT path, cwd, vault, status FROM project_sessions "
+        "WHERE cwd IS NOT NULL AND status != 'processing'"
+    ).fetchall()
+    changed = 0
+    for path, cwd, old_vault, status in rows:
+        new_vault = mod.resolve_store_vault(hook_cfg, cwd)
+        if new_vault != old_vault:
+            conn.execute(
+                "UPDATE project_sessions SET vault=?, status='pending', n_messages=NULL, "
+                "n_written=NULL, last_error=NULL, processed_at=NULL WHERE path=?",
+                (new_vault, path))
+            changed += 1
+    conn.commit()
+    return changed
+
+
+def claim_next_project(conn, source_filter: str | None = None):
+    if source_filter:
+        row = conn.execute(
+            "SELECT path, source, vault FROM project_sessions WHERE status='pending' AND source=? "
+            "ORDER BY mtime DESC LIMIT 1", (source_filter,)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT path, source, vault FROM project_sessions WHERE status='pending' "
+            "ORDER BY mtime DESC LIMIT 1").fetchone()
+    if not row:
+        return None
+    conn.execute("UPDATE project_sessions SET status='processing' WHERE path=?", (row[0],))
+    conn.commit()
+    return {"path": row[0], "source": row[1], "vault": row[2]}
+
+
+# ─── REST batch write ──────────────────────────────────────────────────────
+
+def write_batch(endpoint: str, key: str, engrams: list[dict], vault: str | None = None,
+                 pause_sec: float = 0.0) -> int:
+    written = 0
+    url = f"{endpoint}/api/engrams/batch"
+    if vault:
+        url += f"?vault={urllib.parse.quote(vault)}"
+    for i in range(0, len(engrams), 50):
+        batch = engrams[i:i + 50]
+        body = json.dumps({"engrams": batch}).encode()
+        req = urllib.request.Request(url, data=body, headers={
+            "Authorization": f"Bearer {key}", "Content-Type": "application/json"
+        }, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                res = json.loads(r.read())
+                written += sum(1 for x in res.get("results", []) if x.get("status") == "ok")
+        except Exception as e:
+            log(f"  batch write failed: {e}")
+        if pause_sec:
+            time.sleep(pause_sec)
+    return written
+
+
+# ─── Pipeline (original agent-memory pass — unchanged) ─────────────────────
+
+def process_session(conn, endpoint: str, job) -> None:
+    path, source = job["path"], job["source"]
+    parser = PARSERS[source]
+    try:
+        messages = parser(path)
+    except Exception as e:
+        conn.execute("UPDATE sessions SET status='failed', last_error=? WHERE path=?",
+                     (f"parse: {e}"[:200], path))
+        conn.commit()
+        return
+
+    if not messages:
+        conn.execute("UPDATE sessions SET status='empty', n_messages=0 WHERE path=?", (path,))
+        conn.commit()
+        return
+
+    src_cfg = SOURCES[source]
+    engrams = [build_engram(m["text"], source, path, idx, m["ts"], m.get("role", "assistant"))
+               for idx, m in enumerate(messages)]
+    written = write_batch(endpoint, src_cfg["key"], engrams)
+
+    conn.execute(
+        "UPDATE sessions SET status='done', n_messages=?, n_written=?, processed_at=? WHERE path=?",
+        (len(messages), written, time.time(), path))
+    conn.commit()
+    log(f"✓ {source}/{Path(path).name}: {len(messages)} msgs → {written} engrams written")
+
+
+def run_backfill(conn, endpoint, limit=None, source_filter=None) -> int:
+    n = 0
+    while True:
+        if limit and n >= limit:
+            break
+        job = claim_next(conn, source_filter)
+        if not job:
+            break
+        process_session(conn, endpoint, job)
+        n += 1
+    return n
+
+
+# ─── Pipeline (project pass — relaxed filter, resolved-vault routing) ─────
+
+def process_project_session(conn, endpoint: str, hook_cfg: dict, job,
+                             min_chars: int, noise_re: re.Pattern, pause_sec: float) -> None:
+    path, source, vault = job["path"], job["source"], job["vault"]
+    parser = PARSERS[source]
+    try:
+        messages = parser(path, min_chars, noise_re)
+    except Exception as e:
+        conn.execute("UPDATE project_sessions SET status='failed', last_error=? WHERE path=?",
+                     (f"parse: {e}"[:200], path))
+        conn.commit()
+        return
+
+    if not messages:
+        conn.execute("UPDATE project_sessions SET status='empty', n_messages=0 WHERE path=?", (path,))
+        conn.commit()
+        return
+
+    key = hook_key_for_source(hook_cfg, source)
+    if not key:
+        conn.execute("UPDATE project_sessions SET status='failed', last_error=? WHERE path=?",
+                     (f"no hook key for source {source}", path))
+        conn.commit()
+        return
+
+    extra_tags = [f"project:{vault}"]
+    engrams = [build_engram(m["text"], source, path, idx, m["ts"], m.get("role", "assistant"),
+                             extra_tags, idempotent_salt=vault)
+               for idx, m in enumerate(messages)]
+    written = write_batch(endpoint, key, engrams, vault=vault, pause_sec=pause_sec)
+
+    conn.execute(
+        "UPDATE project_sessions SET status='done', n_messages=?, n_written=?, processed_at=? WHERE path=?",
+        (len(messages), written, time.time(), path))
+    conn.commit()
+    log(f"✓ project/{source}/{Path(path).name} → {vault}: {len(messages)} msgs → {written} engrams written")
+
+
+def run_project_backfill(conn, endpoint, hook_cfg, min_chars, noise_re, pause_sec,
+                          limit=None, source_filter=None) -> int:
+    n = 0
+    while True:
+        if limit and n >= limit:
+            break
+        job = claim_next_project(conn, source_filter)
+        if not job:
+            break
+        process_project_session(conn, endpoint, hook_cfg, job, min_chars, noise_re, pause_sec)
+        n += 1
+    return n
+
+
+# ─── --from-vault gap-fill pass (design §5.2 point 3) ──────────────────────
+#
+# NOT wired into the pilot run (see final report). Implemented for
+# completeness and future use once a safer project-identification heuristic
+# exists. Current heuristic (tag `project:<vault>` exact match) only catches
+# engrams written *after* project-vaults phase 3 went live — those are
+# already primary-sourced in the project vault directly, so copying them
+# here would be pure duplication, not gap-filling. Pre-phase-3 agent-memory
+# engrams carry no project attribution: entities are absent (bulk of
+# agent-memory is still tagged enrichment:pending, so there is no entity
+# graph to match against) and cwd is not recoverable once the source
+# transcript is gone, so a content-substring fallback would be a guess, not
+# a fact. Given backfill fidelity is the entire point, guessing project
+# attribution here is the wrong tradeoff — skip until a real heuristic
+# exists (e.g. once the enricher has caught up on agent-memory and entities
+# are populated).
+
+def gap_fill_from_vault(endpoint: str, key: str, from_vault: str, to_vault: str,
+                         pause_sec: float, dry_run: bool = True) -> dict:
+    """Copy engrams from `from_vault` tagged `project:<to_vault>` into
+    `to_vault`, keeping created_at and gaining `backfill:vault-copy`.
+    idempotent_id is salted by `to_vault` (same reasoning as build_engram's
+    idempotent_salt) so a copy landing in a freshly-split vault doesn't
+    globally dedupe against identical content still sitting in the vault it
+    was split from."""
+    tag = f"project:{to_vault}"
+    url = f"{endpoint}/api/engrams?vault={urllib.parse.quote(from_vault)}&tag={urllib.parse.quote(tag)}&limit=1000"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read())
+    except Exception as e:
+        log(f"gap_fill_from_vault: list failed: {e}")
+        return {"candidates": 0, "written": 0}
+    candidates = data.get("engrams", [])
+    if dry_run:
+        return {"candidates": len(candidates), "written": 0}
+    engrams = []
+    for e in candidates:
+        tags = list(e.get("tags", []))
+        if "backfill:vault-copy" not in tags:
+            tags.append("backfill:vault-copy")
+        op_tag = next((t for t in tags if t.startswith("op:")), None)
+        engrams.append({
+            "concept": e.get("concept", ""),
+            "content": e.get("content", ""),
+            "type": e.get("type", "observation"),
+            "type_label": e.get("type_label", ""),
+            "tags": tags,
+            "confidence": e.get("confidence", 0.7),
+            "created_at": e.get("created_at"),
+            "idempotent_id": f"op:{sha8(to_vault + '|' + (op_tag or sha8(e.get('content', ''))))}",
+        })
+    written = write_batch(endpoint, key, engrams, vault=to_vault, pause_sec=pause_sec)
+    return {"candidates": len(candidates), "written": written}
+
+
+# ─── Entry ─────────────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(description="muninn-backfill: structural-only ingestion (no LLM)")
+    p.add_argument("--discover", action="store_true", help="scan for sessions and queue them (agent-memory pass)")
+    p.add_argument("--run", nargs="?", const="all", help="process pending (default all; or N)")
+    p.add_argument("--source", choices=["pi", "claude", "codex", "pi-discord"], help="limit to one source")
+    p.add_argument("--status", action="store_true")
+    p.add_argument("--limit", type=int, help="max sessions to process")
+
+    # Project pass (design §5.2 / phase 4)
+    p.add_argument("--only-project", metavar="PATH",
+                    help="restrict the project pass to the vault resolve_project(PATH) maps to "
+                         "(pilot mode — required to avoid a fleet-wide project run)")
+    p.add_argument("--project-discover", action="store_true",
+                    help="scan for sessions, resolve project vaults, queue matching ones")
+    p.add_argument("--project-run", nargs="?", const="all",
+                    help="process pending project-pass sessions (default all; or N)")
+    p.add_argument("--project-status", action="store_true")
+    p.add_argument("--min-chars", type=int, default=RELAXED_MIN_MSG_CHARS,
+                    help=f"min message chars for the project pass (default {RELAXED_MIN_MSG_CHARS}, "
+                         "matches muninn-hook's live min_content_chars)")
+    p.add_argument("--noise-mode", choices=["relaxed", "strict"], default="relaxed",
+                    help="noise filter for the project pass (default relaxed — design §5.2)")
+    p.add_argument("--pause-sec", type=float, default=1.0,
+                    help="sleep after each 50-engram batch write, to avoid overrunning the "
+                         "auto-assoc worker pool's 1024-job buffer (default 1.0s)")
+
+    # Gap-fill pass (implemented, not wired into the pilot — see module docstring)
+    p.add_argument("--from-vault", metavar="VAULT",
+                    help="copy project-tagged engrams from VAULT into --only-project's vault")
+    p.add_argument("--gap-fill-dry-run", action="store_true", default=True,
+                    help="list gap-fill candidates without writing (default true; pass --gap-fill-write to write)")
+    p.add_argument("--gap-fill-write", dest="gap_fill_dry_run", action="store_false")
+
+    args = p.parse_args()
+
+    cfg = load_config()
+    endpoint = cfg["endpoint"]
+    conn = db_connect()
+
+    if args.status:
+        rows = conn.execute(
+            "SELECT status, COUNT(*), COALESCE(SUM(n_written),0), COALESCE(SUM(n_messages),0) "
+            "FROM sessions GROUP BY status").fetchall()
+        if not rows:
+            print("  (no sessions discovered — run --discover)")
+        for status, n, written, msgs in rows:
+            print(f"  {status}: {n} sessions, {msgs} msgs parsed, {written} engrams written")
+        return
+
+    if args.project_status:
+        rows = conn.execute(
+            "SELECT vault, status, COUNT(*), COALESCE(SUM(n_written),0), COALESCE(SUM(n_messages),0) "
+            "FROM project_sessions GROUP BY vault, status").fetchall()
+        if not rows:
+            print("  (no project sessions discovered — run --project-discover --only-project PATH)")
+        for vault, status, n, written, msgs in rows:
+            print(f"  {vault or '(none)'} / {status}: {n} sessions, {msgs} msgs parsed, {written} engrams written")
+        return
+
+    if args.discover:
+        added = discover(conn)
+        total = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        by_src = conn.execute("SELECT source, COUNT(*) FROM sessions GROUP BY source").fetchall()
+        print(f"discovered + queued {added} new ({total} total)")
+        for s, c in by_src:
+            print(f"  {s}: {c}")
+        return
+
+    if args.run is not None:
+        discover(conn)
+        limit = args.limit if args.limit else (int(args.run) if args.run.isdigit() else None)
+        print(f"starting backfill (source={args.source or 'all'}, limit={limit or 'none'})")
+        print(f"  → writes structural engrams tagged 'enrichment:pending'")
+        print(f"  → the enricher daemon will pick them up for LLM extraction")
+        n = run_backfill(conn, endpoint, limit=limit, source_filter=args.source)
+        print(f"done: processed {n} sessions")
+        rows = conn.execute(
+            "SELECT status, COUNT(*), COALESCE(SUM(n_written),0) FROM sessions GROUP BY status").fetchall()
+        for status, cnt, written in rows:
+            print(f"  {status}: {cnt} sessions, {written} engrams")
+        return
+
+    if args.project_discover or args.project_run is not None:
+        hook_cfg = load_hook_config()
+        mod = hook_module()
+        only_vault = None
+        if args.only_project:
+            only_vault = mod.resolve_project(os.path.realpath(args.only_project), hook_cfg)
+            if not only_vault:
+                print(f"error: {args.only_project} does not resolve to a project vault (not a git repo?)")
+                sys.exit(1)
+        else:
+            print("WARNING: no --only-project given — this queues sessions for EVERY resolvable "
+                  "project vault (fleet-wide). Ctrl-C now unless that is intended.")
+
+        if args.project_discover or args.project_run is not None:
+            reconciled = reconcile_project_sessions(conn, hook_cfg)
+            if reconciled:
+                print(f"reconcile: requeued {reconciled} session(s) whose resolved vault changed "
+                      f"under the current registry")
+            added, skipped_other = discover_project(conn, hook_cfg, only_vault)
+            print(f"project-discover: queued {added} new"
+                  + (f" (skipped {skipped_other} resolving to other projects)" if only_vault else ""))
+
+        if args.project_run is not None:
+            limit = args.limit if args.limit else (int(args.project_run) if args.project_run.isdigit() else None)
+            noise_re = RELAXED_NOISE_RE if args.noise_mode == "relaxed" else NOISE_RE
+            print(f"starting project backfill (vault={only_vault or 'all'}, source={args.source or 'all'}, "
+                  f"limit={limit or 'none'}, min_chars={args.min_chars}, noise_mode={args.noise_mode}, "
+                  f"pause_sec={args.pause_sec})")
+            n = run_project_backfill(conn, endpoint, hook_cfg, args.min_chars, noise_re, args.pause_sec,
+                                      limit=limit, source_filter=args.source)
+            print(f"done: processed {n} sessions")
+            rows = conn.execute(
+                "SELECT vault, status, COUNT(*), COALESCE(SUM(n_written),0) FROM project_sessions "
+                "GROUP BY vault, status").fetchall()
+            for vault, status, cnt, written in rows:
+                print(f"  {vault or '(none)'} / {status}: {cnt} sessions, {written} engrams")
+
+        if args.from_vault:
+            if not only_vault:
+                print("error: --from-vault requires --only-project (gap-fill is per-project)")
+                sys.exit(1)
+            key = hook_key_for_source(hook_cfg, "claude")  # any scoped agent key works — same scope
+            result = gap_fill_from_vault(endpoint, key, args.from_vault, only_vault,
+                                          args.pause_sec, dry_run=args.gap_fill_dry_run)
+            mode = "dry-run (candidates only)" if args.gap_fill_dry_run else "write"
+            print(f"gap-fill [{mode}]: {result['candidates']} candidates in {args.from_vault} "
+                  f"tagged project:{only_vault}, {result['written']} written")
+        return
+
+    print("usage: muninn-backfill --discover | --run [N] [--source pi|claude|codex] | --status")
+    print("       muninn-backfill --project-discover --project-run [N] --only-project PATH [--project-status]")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+"""
+muninn-enricher — background deferred-enrichment worker for the agent-memory vault.
+
+Pulls engrams missing semantic stages (entities/relationships/summary) from
+muninn via muninn_get_enrichment_candidates, extracts structured knowledge with
+LM Studio, and persists via muninn_apply_enrichment.
+
+Models (per benchmark 2026-06-17, same pinned engram, 3 runs each):
+  standard = google/gemma-4-31b-qat  (thinking OFF): 19s, 6 ent / 5 rel, deterministic
+  fast     = google/gemma-4-26b-a4b-qat (thinking OFF): 3s, 6 ent / 2 rel
+
+CRITICAL: thinking must be OFF for the loaded model. LM Studio defaults thinking
+to ON for Gemma 4 on every load and the API has no reasoning parameter (verified
+against the /api/v1/models/load endpoint + bug-tracker #988). The GUI toggle is
+the only lever. This worker PROBES for thinking-off before processing and aborts
+with a clear instruction if thinking is on (otherwise it'd burn ~2000 wasted
+reasoning tokens/call and produce truncated/invalid output).
+
+Design (see muninn-integration-plan.md §5 + §9):
+  - Durable sqlite queue (resume-safe; re-runnable)
+  - Graceful degradation: LM Studio offline → backoff + retry, never crashes
+  - Model management: detect loaded model; optionally load/unload via REST API
+  - Thinking-off guard: probe before processing
+  - Exactly-once via muninn's digest_flags (apply is idempotent by stage)
+  - Clears `enrichment:pending` tag once all stages complete
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_PATH = HOME / ".config" / "muninn-enricher.json"
+STATE_DIR = HOME / ".local" / "share" / "muninn-enricher"
+DB_PATH = STATE_DIR / "queue.db"
+LOG_PATH = STATE_DIR / "enricher.log"
+
+ENTITY_TYPES = {
+    "person", "organization", "location", "concept", "technology", "project",
+    "tool", "database", "service", "framework", "language", "product", "event", "other",
+}
+
+# ─── Config + logging ──────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except Exception as e:
+        log(f"config load failed: {e}; defaults")
+        return {}
+
+
+def log(msg: str) -> None:
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().isoformat()
+        with open(LOG_PATH, "a") as f:
+            f.write(f"{ts} {msg}\n")
+        if os.environ.get("MUNINN_ENRICHER_VERBOSE"):
+            print(f"[{ts}] {msg}", file=sys.stderr)
+    except Exception:
+        pass
+
+
+# ─── LM Studio model manager ───────────────────────────────────────────────
+
+class LMStudio:
+    """Wraps LM Studio's native v1 REST API for model management + chat."""
+
+    def __init__(self, cfg: dict):
+        self.base = cfg.get("base_url", "http://127.0.0.1:1234")
+        self.key = cfg["key"]
+        self.timeout = cfg.get("timeout_sec", 180)
+
+    def _req(self, path: str, body: dict | None = None, method: str = "GET", timeout: int | None = None) -> dict | None:
+        url = self.base + path
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read()[:300].decode(errors="replace")
+            except Exception:
+                err_body = ""
+            log(f"LM Studio {method} {path} HTTP {e.code}: {err_body}")
+            return {"_http_error": e.code, "_body": err_body}
+        except Exception as e:
+            log(f"LM Studio {method} {path} failed: {e}")
+            return None
+
+    def list_models(self) -> list[dict]:
+        """GET /api/v1/models — returns all known models with loaded_instances."""
+        res = self._req("/api/v1/models", timeout=15)
+        if not res or "_http_error" in res:
+            return []
+        return res.get("models", []) or []
+
+    def loaded(self) -> list[dict]:
+        """Return models currently loaded in memory (with instance ids)."""
+        out = []
+        for m in self.list_models():
+            for inst in m.get("loaded_instances", []) or []:
+                out.append({
+                    "key": m.get("key", ""),
+                    "instance_id": inst.get("id") or m.get("key", ""),
+                    "context_length": inst.get("config", {}).get("context_length"),
+                    "reasoning_default": (m.get("capabilities", {}) or {}).get("reasoning", {}).get("default"),
+                })
+        return out
+
+    def is_loaded(self, model_id: str) -> bool:
+        return any(m["key"] == model_id for m in self.loaded())
+
+    def model_ready(self, model_id: str) -> tuple[bool, str]:
+        """Check whether the target model is loaded and LM Studio is reachable.
+        Returns (ready, reason). Used by the daemon to decide whether to run a
+        pass or pause (e.g. when the user has unloaded the model to free GPU).
+        """
+        try:
+            req = urllib.request.Request(
+                self.base + "/api/v1/models",
+                headers={"Authorization": f"Bearer {self.key}", "Accept": "application/json"},
+                method="GET")
+            with urllib.request.urlopen(req, timeout=10) as r:
+                d = json.loads(r.read())
+        except Exception as e:
+            return False, f"LM Studio unreachable: {e}"
+        loaded = [m.get("key") for m in d.get("models", []) if m.get("loaded_instances")]
+        if model_id in loaded:
+            return True, "ready"
+        return False, f"model {model_id} not loaded (have: {loaded or 'nothing'}); pausing until reloaded"
+
+    def unload(self, instance_id: str) -> bool:
+        res = self._req("/api/v1/models/unload", body={"instance_id": instance_id}, method="POST", timeout=60)
+        return bool(res) and "_http_error" not in res
+
+    def unload_all(self) -> int:
+        """Unload every loaded model instance. Returns count unloaded."""
+        loaded = self.loaded()
+        n = 0
+        for m in loaded:
+            if self.unload(m["instance_id"]):
+                n += 1
+                log(f"  unloaded {m['instance_id']}")
+                time.sleep(2)  # let VRAM free
+        return n
+
+    def load(self, model_id: str, context_length: int) -> bool:
+        """Load a model. NOTE: reasoning defaults to ON for Gemma 4 — caller must probe thinking-off after."""
+        res = self._req("/api/v1/models/load", body={
+            "model": model_id,
+            "context_length": context_length,
+        }, method="POST", timeout=300)
+        if not res or "_http_error" in res:
+            return False
+        log(f"  loaded {model_id} (ctx={context_length}) in {res.get('load_time_seconds','?')}s")
+        return True
+
+    def ensure_loaded(self, model_id: str, context_length: int, allow_swap: bool = True) -> tuple[bool, str]:
+        """Ensure the target model is loaded. Returns (ok, message).
+        If a different model is loaded and allow_swap, unload it first.
+        """
+        loaded = self.loaded()
+        target_loaded = any(m["key"] == model_id for m in loaded)
+        if target_loaded:
+            return True, f"{model_id} already loaded"
+        if not loaded:
+            # nothing loaded — load target (but warn thinking will default ON)
+            ok = self.load(model_id, context_length)
+            if not ok:
+                return False, f"failed to load {model_id}"
+            return True, f"loaded {model_id} (REASONING DEFAULTS TO ON — toggle off in LM Studio GUI)"
+        others = [m for m in loaded if m["key"] != model_id]
+        if others and not allow_swap:
+            names = ", ".join(m["key"] for m in others)
+            return False, f"target not loaded; others present ({names}) and --no-swap set"
+        if others:
+            log(f"unloading {len(others)} other model(s) to make room…")
+            for m in others:
+                self.unload(m["instance_id"])
+                time.sleep(2)
+        ok = self.load(model_id, context_length)
+        if not ok:
+            return False, f"failed to load {model_id}"
+        return True, f"swapped to {model_id} (REASONING DEFAULTS TO ON — toggle off in LM Studio GUI)"
+
+    def probe_thinking_off(self, model_id: str) -> tuple[bool, int]:
+        """Cheap assertion that reasoning:"off" is actually honored. Reasoning
+        tokens > 0 despite requesting "off" would mean the native API silently
+        ignored the setting — should never happen (verified 2026-07-20), but
+        this guard aborts loudly if it ever does rather than burning wasted
+        reasoning tokens / producing truncated output."""
+        parsed, reasoning = self.chat_extract(
+            model_id, 200, 'Output exactly: {"x":1}', "ping",
+            temperature=0, reasoning="off")
+        if reasoning < 0:
+            return False, -1  # can't determine
+        return reasoning == 0, reasoning
+
+    def chat_extract(self, model_id: str, max_tokens: int, system: str, user: str,
+                      temperature: float = 0.0, reasoning: str = "off") -> tuple[dict | None, int]:
+        """Run an extraction chat via the native /api/v1/chat endpoint.
+        Returns (parsed_response | None, reasoning_tokens).
+
+        temperature defaults to 0.0 (greedy) for deterministic extraction — verified
+        by the temperature sweep benchmark (Jaccard 0.91, std=0 on entity counts).
+        This is set per-request so the LM Studio GUI's temperature setting does NOT
+        affect enrichment; users can leave the GUI at higher temps for chat/other work.
+
+        `reasoning` is per-request and overrides the GUI toggle entirely (verified
+        2026-07-20: off -> no reasoning item, on -> reasoning item, same loaded model).
+        """
+        payload = {
+            "model": model_id, "temperature": temperature, "max_output_tokens": max_tokens,
+            "input": user, "system_prompt": system, "reasoning": reasoning,
+        }
+        res = self._req("/api/v1/chat", body=payload, method="POST", timeout=self.timeout)
+        if not res or "_http_error" in res:
+            return None, -1
+        if "error" in res:
+            log(f"  LM Studio chat error: {res['error'].get('message','')[:150]}")
+            return None, -1
+        content = None
+        for item in res.get("output", []) or []:
+            if item.get("type") != "message":
+                continue
+            c = item.get("content")
+            if isinstance(c, str):
+                content = c
+            elif isinstance(c, list):
+                parts = [p.get("content", p.get("text", "")) for p in c if isinstance(p, dict)]
+                content = "".join(str(p) for p in parts)
+        if content is None:
+            return None, -1
+        content = content.strip()
+        reasoning_tokens = res.get("stats", {}).get("reasoning_output_tokens")
+        if reasoning_tokens is None:
+            reasoning_tokens = sum(
+                len(item.get("content", "")) for item in res.get("output", []) or []
+                if item.get("type") == "reasoning")
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        if not content.startswith("{"):
+            i, j = content.find("{"), content.rfind("}")
+            if i >= 0 and j > i:
+                content = content[i:j + 1]
+        try:
+            return json.loads(content), reasoning_tokens
+        except Exception as e:
+            log(f"  JSON parse failed: {e}; raw[:120]={content[:120]!r}")
+            return None, reasoning_tokens
+
+
+# ─── DB (durable queue) ────────────────────────────────────────────────────
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    concept TEXT,
+    missing_stages TEXT,
+    expected_updated_at TEXT,
+    status TEXT DEFAULT 'pending',
+    model TEXT,
+    retries INTEGER DEFAULT 0,
+    last_error TEXT,
+    queued_at REAL,
+    processed_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_status ON jobs(status);
+"""
+
+
+def migrate_schema(conn: sqlite3.Connection) -> None:
+    """project-vaults phase 5: jobs gain a `vault` column (default agent-memory
+    so pre-migration rows — all of which were agent-memory-only — keep their
+    identity and are never reprocessed)."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "vault" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN vault TEXT DEFAULT 'agent-memory'")
+        conn.commit()
+        log("migrated jobs table: added vault column (default agent-memory)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_status_vault ON jobs(status, vault)")
+    conn.commit()
+
+
+def db_connect() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript(SCHEMA)
+    migrate_schema(conn)
+    return conn
+
+
+# ─── Vault discovery ───────────────────────────────────────────────────────
+
+def discover_vaults(cfg: dict, endpoint: str, api_key: str) -> list[str]:
+    """Enumerate vaults the enricher's key is scoped for: agent-memory plus
+    every proj-*. Tries GET /api/vaults (unfiltered by key scope on this
+    fork — filtering here is what actually enforces the scope), falls back
+    to the muninn-hook provisioning cache, then to the configured default.
+    """
+    base = cfg.get("vault", "agent-memory")
+    try:
+        req = urllib.request.Request(
+            f"{endpoint}/api/vaults",
+            headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            all_vaults = json.loads(r.read())
+        vaults = [v for v in all_vaults if v == base or v.startswith("proj-")]
+        if vaults:
+            return sorted(vaults)
+        log("GET /api/vaults returned no matching vaults; falling back to default")
+    except Exception as e:
+        log(f"GET /api/vaults failed: {e}; falling back to hook provisioning cache")
+
+    cache_dir = HOME / ".local" / "share" / "muninn-hook" / "projects"
+    vaults = {base}
+    try:
+        for f in cache_dir.glob("proj-*.json"):
+            vaults.add(f.stem)
+    except Exception as e:
+        log(f"provisioning cache scan failed: {e}")
+    return sorted(vaults)
+
+
+# ─── MCP client ────────────────────────────────────────────────────────────
+
+class MuninnMCP:
+    def __init__(self, cfg: dict):
+        self.url = cfg.get("mcp_endpoint", "http://127.0.0.1:8750/mcp")
+        self.token = cfg["mcp_token"]
+        self.req_id = 0
+
+    def _call(self, method: str, params: dict) -> dict | None:
+        self.req_id += 1
+        payload = {"jsonrpc": "2.0", "id": self.req_id, "method": method, "params": params}
+        req = urllib.request.Request(self.url, data=json.dumps(payload).encode(), headers={
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                raw = r.read().decode()
+        except Exception as e:
+            log(f"MCP {method} failed: {e}")
+            return None
+        if raw.startswith("event:") or raw.startswith("data:"):
+            for line in raw.split("\n"):
+                if line.startswith("data:"):
+                    raw = line[5:].strip()
+                    break
+        try:
+            d = json.loads(raw)
+        except Exception:
+            return None
+        if "error" in d:
+            log(f"MCP {method} error: {d['error']}")
+            return None
+        return d.get("result", {})
+
+    def _text(self, result: dict) -> str:
+        for c in result.get("content", []):
+            if c.get("type") == "text":
+                return c.get("text", "")
+        return ""
+
+    def get_candidates(self, vault: str, limit: int) -> list[dict]:
+        res = self._call("tools/call", {
+            "name": "muninn_get_enrichment_candidates",
+            "arguments": {"vault": vault, "stage": "entities", "limit": limit},
+        })
+        if not res:
+            return []
+        txt = self._text(res)
+        try:
+            data = json.loads(txt)
+            return data.get("items", []) if isinstance(data, dict) else data
+        except Exception:
+            log(f"couldn't parse candidates: {txt[:200]}")
+            return []
+
+    def apply(self, vault: str, engram_id: str, expected_updated_at: str, enrichment: dict) -> bool:
+        args = {"vault": vault, "id": engram_id, "expected_updated_at": expected_updated_at,
+                "stages_completed": enrichment.get("stages_completed", [])}
+        if enrichment.get("summary"):
+            args["summary"] = enrichment["summary"]
+        if enrichment.get("key_points"):
+            args["key_points"] = enrichment["key_points"]
+        if enrichment.get("memory_type"):
+            args["memory_type"] = enrichment["memory_type"]
+        if enrichment.get("type_label"):
+            args["type_label"] = enrichment["type_label"]
+        if enrichment.get("entities"):
+            args["entities"] = enrichment["entities"]
+        if enrichment.get("relationships"):
+            args["relationships"] = enrichment["relationships"]
+        return bool(self._call("tools/call", {"name": "muninn_apply_enrichment", "arguments": args}))
+
+
+def clear_pending_tag(endpoint: str, api_key: str, engram_id: str, vault: str = "agent-memory") -> bool:
+    """Remove the enrichment:pending tag via PUT /api/engrams/{id}/tags."""
+    get_url = f"{endpoint}/api/engrams/{engram_id}?vault={urllib.parse.quote(vault)}"
+    try:
+        req = urllib.request.Request(get_url, headers={"Authorization": f"Bearer {api_key}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            cur = json.loads(r.read())
+    except Exception as e:
+        log(f"clear_pending_tag {engram_id} read failed: {e}")
+        return False
+    tags = cur.get("tags", [])
+    new_tags = [t for t in tags if t != "enrichment:pending"]
+    if len(new_tags) == len(tags):
+        return True  # nothing to clear
+    # Correct endpoint: PUT /api/engrams/{id}/tags (replaces full tag set)
+    put_url = f"{endpoint}/api/engrams/{engram_id}/tags?vault={urllib.parse.quote(vault)}"
+    body = json.dumps({"tags": new_tags, "vault": vault}).encode()
+    req = urllib.request.Request(put_url, data=body, headers={
+        "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"
+    }, method="PUT")
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        return True
+    except Exception as e:
+        log(f"clear_pending_tag {engram_id} PUT failed: {e}")
+        return False
+
+
+# ─── Extraction ────────────────────────────────────────────────────────────
+
+SYS_PROMPT = (
+    'You extract structured knowledge from agent-memory entries in a single pass. '
+    'Output ONLY valid JSON — no prose, no markdown fences. Schema:\n'
+    '{\n'
+    '  "summary": string (1-3 sentence abstractive summary, present tense for facts),\n'
+    '  "key_points": [string, ...] (3-7 self-contained facts/decisions, each a complete statement),\n'
+    '  "memory_type": one of [fact,decision,observation,preference,issue,task,procedure,event,goal,constraint,identity,reference],\n'
+    '  "type_label": string (specific snake_case label, e.g. architectural_decision, api_discovery, bug_report),\n'
+    '  "entities": [{"name": string, "type": one of [person,organization,location,concept,technology,project,tool,database,service,framework,language,product,event,other], "confidence": 0-1}],\n'
+    '  "relationships": [{"from_entity": string, "to_entity": string, "rel_type": string, "weight": 0-1}]\n'
+    '}\n'
+    'Rules:\n'
+    '- Extract max 8 concrete identifiable entities. Use the most specific name (e.g. "PostgreSQL" not "database").\n'
+    '- Common rel_types: uses,depends_on,implements,manages,extends,contradicts,supports,belongs_to,part_of,integrates_with,created_by,deployed_on.\n'
+    '- Confidence: 1.0=explicit, 0.7=implied, 0.4=loosely mentioned.\n'
+    '- Choose the single best memory_type. Key_points must each be standalone (not fragments).\n'
+    '- If nothing durable, return all arrays empty and summary empty.\n'
+    '- Return ONLY the JSON object.'
+)
+
+
+def coerce_entity_type(t: str) -> str:
+    t = (t or "other").strip().lower()
+    return t if t in ENTITY_TYPES else "other"
+
+
+VALID_MEMORY_TYPES = {
+    "fact", "decision", "observation", "preference", "issue", "task",
+    "procedure", "event", "goal", "constraint", "identity", "reference",
+}
+
+
+def coerce_memory_type(t) -> str:
+    s = str(t or "").strip().lower()
+    aliases = {"bugfix": "issue", "bug_report": "issue", "experience": "event", "choice": "decision"}
+    s = aliases.get(s, s)
+    return s if s in VALID_MEMORY_TYPES else "" 
+
+
+def _to_rfc3339nano(updated_at) -> str | None:
+    """Convert updated_at (int ns, possibly negative for Go zero-value timestamps)
+    to an RFC3339Nano string with FULL nanosecond precision.
+
+    The server's ApplyEnrichment does time.Time.Equal() which requires exact ns
+    match — Python's datetime only tracks microseconds, so we format directly
+    from the integer. Python floor-division (//) handles negatives correctly:
+    divmod(-6795364578871345152, 1e9) → (-6795364579, 128654848), which matches
+    Go's normalized 1754-08-30T22:43:41.128654848Z exactly.
+    """
+    if updated_at is None or isinstance(updated_at, bool):
+        return None
+    if isinstance(updated_at, str):
+        return updated_at
+    try:
+        ns = int(updated_at)
+    except (ValueError, TypeError):
+        return None
+    from datetime import datetime, timedelta, timezone
+    sec, frac_ns = divmod(ns, 1_000_000_000)  # floor div → frac_ns always in [0, 1e9)
+    try:
+        dt = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=sec)
+    except (OverflowError, ValueError):
+        return None
+    return (f"{dt.year:04d}-{dt.month:02d}-{dt.day:02d}"
+            f"T{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}.{frac_ns:09d}Z")
+
+
+def normalize(parsed: dict) -> dict:
+    entities, seen_e = [], set()
+    for e in parsed.get("entities", []) or []:
+        if not isinstance(e, dict):
+            continue  # LLM occasionally returns a bare string; skip it
+        name = (e.get("name") or "").strip()
+        if not name or name.lower() in seen_e:
+            continue
+        seen_e.add(name.lower())
+        try:
+            conf = max(0.0, min(1.0, float(e.get("confidence", 0.7))))
+        except (TypeError, ValueError):
+            conf = 0.7
+        entities.append({"name": name[:120], "type": coerce_entity_type(e.get("type")),
+                         "confidence": conf})
+    rels, seen_r = [], set()
+    for r in parsed.get("relationships", []) or []:
+        if not isinstance(r, dict):
+            continue
+        fr, to, rt = (r.get("from_entity") or "").strip(), (r.get("to_entity") or "").strip(), (r.get("rel_type") or "").strip()
+        if not fr or not to or not rt:
+            continue
+        key = (fr.lower(), to.lower(), rt.lower())
+        if key in seen_r:
+            continue
+        seen_r.add(key)
+        try:
+            w = max(0.0, min(1.0, float(r.get("weight", 0.7))))
+        except (TypeError, ValueError):
+            w = 0.7
+        rels.append({"from_entity": fr[:120], "to_entity": to[:120], "rel_type": rt[:60], "weight": w})
+    summary = (parsed.get("summary") or "").strip()
+    key_points = [kp.strip() for kp in (parsed.get("key_points") or []) if isinstance(kp, str) and kp.strip()]
+    memory_type = coerce_memory_type(parsed.get("memory_type"))
+    type_label = (parsed.get("type_label") or "").strip()
+    # CRITICAL: report ALL attempted stages as completed, even if empty.
+    # muninn_get_enrichment_candidates re-surfaces any engram missing a stage;
+    # if we omit a stage here (because extraction yielded nothing), the daemon
+    # busy-spins forever re-discovering the same engrams. Empty is a valid
+    # "attempted, nothing to report" result.
+    stages = ["entities", "relationships", "summary", "classification"]
+    return {
+        "summary": summary, "key_points": key_points, "memory_type": memory_type,
+        "type_label": type_label, "entities": entities, "relationships": rels,
+        "stages_completed": stages,
+    }
+
+
+# ─── Queue ops ─────────────────────────────────────────────────────────────
+
+def enqueue(conn, candidates, model, vault):
+    now = time.time()
+    added = 0
+    for c in candidates:
+        eid = c.get("id")
+        if not eid:
+            continue
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO jobs (id, concept, missing_stages, expected_updated_at, status, model, queued_at, vault) "
+                "VALUES (?,?,?,?, 'pending', ?, ?, ?)",
+                (eid, c.get("concept", "")[:200], json.dumps(c.get("missing_stages", [])),
+                 c.get("updated_at", ""), model, now, vault))
+            added += conn.total_changes and 1
+        except Exception as e:
+            log(f"enqueue {eid} ({vault}) failed: {e}")
+    conn.commit()
+    return added
+
+
+def claim_next(conn, vault):
+    """Claim the oldest pending job for one specific vault — the caller
+    round-robins across vaults so a huge backlog in one vault can't starve
+    the others (see run_once)."""
+    row = conn.execute(
+        "SELECT id, concept, missing_stages, expected_updated_at, retries FROM jobs "
+        "WHERE status='pending' AND vault=? ORDER BY queued_at LIMIT 1", (vault,)).fetchone()
+    if not row:
+        return None
+    conn.execute("UPDATE jobs SET status='processing' WHERE id=?", (row[0],))
+    conn.commit()
+    return {"id": row[0], "concept": row[1], "missing_stages": json.loads(row[2] or "[]"),
+            "expected_updated_at": row[3], "retries": row[4]}
+
+
+def mark_done(conn, eid):
+    conn.execute("UPDATE jobs SET status='done', processed_at=? WHERE id=?", (time.time(), eid))
+    conn.commit()
+
+
+def mark_failed(conn, eid, err, max_retries):
+    conn.execute("UPDATE jobs SET status=CASE WHEN retries+1>=? THEN 'failed' ELSE 'pending' END, "
+                 "retries=retries+1, last_error=? WHERE id=?", (max_retries, err[:300], eid))
+    conn.commit()
+
+
+# ─── Pipeline ──────────────────────────────────────────────────────────────
+
+def process_job(conn, muninn, lm, model_cfg, endpoint, api_key, vault, max_retries, job) -> None:
+    eid = job["id"]
+    log(f"processing [{vault}] {eid}: {job['concept'][:50]}")
+
+    url = f"{endpoint}/api/engrams/{eid}?vault={urllib.parse.quote(vault)}"
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            engram = json.loads(r.read())
+    except Exception as e:
+        mark_failed(conn, eid, f"fetch failed: {e}", max_retries)
+        return True
+
+    content = (engram.get("content") or "").strip()
+    # Use the ACTUAL stored updated_at from the fetched engram (not the candidate's
+    # value, which can be stale/wrong — and many backfilled engrams have a
+    # corrupt zero-value updated_at stored as negative ns). apply_enrichment
+    # wants RFC3339Nano; GET returns int ns. Convert carefully.
+    actual_updated_at = _to_rfc3339nano(engram.get("updated_at")) or job["expected_updated_at"]
+
+    def apply_with_refresh(enrichment):
+        """Apply enrichment; on conflict, refetch fresh updated_at and retry once."""
+        nonlocal_retry_count = [0]
+        if muninn.apply(vault, eid, actual_updated_at, enrichment):
+            return True
+        if nonlocal_retry_count[0] > 0:
+            return False
+        nonlocal_retry_count[0] += 1
+        # refetch and retry with the freshest updated_at
+        try:
+            req2 = urllib.request.Request(url, headers={"Authorization": f"Bearer {api_key}"})
+            with urllib.request.urlopen(req2, timeout=10) as r2:
+                fresh = _to_rfc3339nano(json.loads(r2.read()).get("updated_at"))
+            if fresh and muninn.apply(vault, eid, fresh, enrichment):
+                return True
+        except Exception:
+            pass
+        return False
+
+    if not content:
+        apply_with_refresh({"stages_completed": [], "summary": ""})
+        mark_done(conn, eid)
+        return True
+
+    parsed, reasoning = lm.chat_extract(
+        model_cfg["id"], model_cfg["max_tokens"], SYS_PROMPT,
+        f"Concept: {engram.get('concept','')}\n\nContent:\n{content[:3000]}",
+        temperature=model_cfg.get("temperature", 0.0))
+    if parsed is None:
+        mark_failed(conn, eid, "extraction failed (no/invalid JSON)", max_retries)
+        return True
+    if reasoning > 50:
+        log(f"  ⚠ {eid}: model used {reasoning} reasoning tokens — thinking may be ON; quality may suffer")
+
+    enrichment = normalize(parsed)
+    if not enrichment["stages_completed"]:
+        log(f"  {eid}: nothing to extract")
+        apply_with_refresh({"stages_completed": [], "summary": ""})
+        mark_done(conn, eid)
+        return True
+
+    if not apply_with_refresh(enrichment):
+        mark_failed(conn, eid, "apply_enrichment failed (updated_at conflict)", max_retries)
+        return True
+
+    missing = set(job["missing_stages"])
+    completed = set(enrichment["stages_completed"])
+    if missing.issubset(completed) or (missing - completed) <= {"classification"}:
+        clear_pending_tag(endpoint, api_key, eid, vault)
+
+    mark_done(conn, eid)
+    log(f"  ✓ {eid}: {len(enrichment['entities'])} ent, {len(enrichment['relationships'])} rel, "
+        f"summary={'y' if enrichment['summary'] else 'n'} (reason={reasoning})")
+    return
+
+
+def run_once(cfg, muninn, lm, conn, model_key) -> int:
+    endpoint, api_key = cfg["endpoint"], cfg["apply_api_key"]
+    model_cfg = cfg["models"][model_key]
+    poll = cfg.get("poll", {})
+    batch, max_retries = poll.get("batch_size", 100), poll.get("max_retries", 3)
+
+    vaults = discover_vaults(cfg, endpoint, api_key)
+    log(f"sweeping {len(vaults)} vault(s): {vaults} (model={model_cfg['id']})")
+
+    for vault in vaults:
+        candidates = muninn.get_candidates(vault, batch)
+        added = enqueue(conn, candidates, model_cfg["id"], vault)
+        log(f"  [{vault}] queued {added} new (candidates: {len(candidates)})")
+
+        # STALL GUARD: if muninn keeps returning candidates that are all locally
+        # 'done'/'failed', the local queue is out of sync with muninn's view
+        # (e.g. an engram extracted entities but reported no relationships, so
+        # muninn still wants 'relationships'). Reset those to pending so they
+        # get reprocessed — with the normalize() fix they'll now report all
+        # stages complete and muninn will stop re-surfacing them.
+        if candidates and added == 0:
+            cand_ids = [c.get("id") for c in candidates if c.get("id")]
+            if cand_ids:
+                placeholders = ",".join("?" * len(cand_ids))
+                stale = conn.execute(
+                    f"SELECT COUNT(*) FROM jobs WHERE id IN ({placeholders}) AND vault=? "
+                    f"AND status IN ('done','failed')", cand_ids + [vault]).fetchone()[0]
+                if stale > 0:
+                    log(f"  [{vault}] stall detected: {stale} candidates locally done/failed but "
+                        f"muninn still wants them — resetting to pending")
+                    conn.execute(
+                        f"UPDATE jobs SET status='pending', retries=0 WHERE id IN ({placeholders}) "
+                        f"AND vault=? AND status IN ('done','failed')", cand_ids + [vault])
+                    conn.commit()
+
+    # Fair round-robin across vaults: claim and process one job per vault per
+    # round, so a huge single-vault backlog (e.g. 23k pre-existing
+    # agent-memory rows) can never starve the smaller project vaults that
+    # were just discovered this cycle.
+    n = 0
+    active = list(vaults)
+    while active:
+        progressed = False
+        for vault in list(active):
+            job = claim_next(conn, vault)
+            if not job:
+                active.remove(vault)
+                continue
+            process_job(conn, muninn, lm, model_cfg, endpoint, api_key, vault, max_retries, job)
+            n += 1
+            progressed = True
+        if not progressed:
+            break
+    log(f"processed {n} this pass across {len(vaults)} vault(s)")
+    return n
+
+
+# ─── Entry ─────────────────────────────────────────────────────────────────
+
+def main():
+    cfg = load_config()
+    p = argparse.ArgumentParser(description="muninn-enricher: deferred LLM enrichment worker")
+    p.add_argument("--once", action="store_true", help="process one batch then exit")
+    p.add_argument("--daemon", action="store_true", help="poll forever (default)")
+    p.add_argument("--fast", action="store_true", help="use fast model (26b-a4b) instead of standard (31b)")
+    p.add_argument("--check", action="store_true", help="show loaded models + thinking state, then exit")
+    p.add_argument("--probe", action="store_true", help="probe thinking-off for the selected model")
+    p.add_argument("--load", action="store_true", help="ensure the selected model is loaded (will swap)")
+    p.add_argument("--status", action="store_true", help="show queue status and exit")
+    p.add_argument("--reset-failed", action="store_true", help="reset failed jobs to pending")
+    args = p.parse_args()
+
+    model_key = "fast" if args.fast else cfg.get("default_model", "standard")
+    model_cfg = cfg["models"][model_key]
+    lm = LMStudio(cfg["lmstudio"])
+    conn = db_connect()
+
+    if args.status:
+        for status, n in conn.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status"):
+            print(f"  {status}: {n}")
+        print("  by vault (pending):")
+        for vault, n in conn.execute(
+                "SELECT vault, COUNT(*) AS n FROM jobs WHERE status='pending' GROUP BY vault ORDER BY n DESC"):
+            print(f"    {vault}: {n}")
+        return
+    if args.reset_failed:
+        conn.execute("UPDATE jobs SET status='pending', retries=0 WHERE status='failed'")
+        conn.commit()
+        print("reset failed → pending")
+        return
+
+    if args.check:
+        loaded = lm.loaded()
+        if not loaded:
+            print("LM Studio: reachable, no models loaded")
+        else:
+            print("Loaded models:")
+            for m in loaded:
+                print(f"  {m['key']}  ctx={m.get('context_length')}  reasoning_default={m.get('reasoning_default')}")
+        print(f"\nSelected model: {model_cfg['id']} ({model_key})")
+        if loaded and any(m["key"] == model_cfg["id"] for m in loaded):
+            print("  → target IS loaded. Probing thinking state…")
+            ok, reasoning = lm.probe_thinking_off(model_cfg["id"])
+            if reasoning < 0:
+                print("  → probe failed (can't determine). Start manually after toggling.")
+            elif ok:
+                print(f"  → ✓ thinking is OFF (probe used {reasoning} reasoning tokens). Safe to enrich.")
+            else:
+                print(f"  → ✗ thinking is ON (probe used {reasoning} reasoning tokens).")
+                print(f"    Toggle OFF in LM Studio GUI: Inference > Custom Fields > Reasoning. Then re-run.")
+        else:
+            print(f"  → target NOT loaded. Run: muninn-enricher --load {'--fast' if args.fast else ''}")
+        return
+
+    if args.load:
+        ok, msg = lm.ensure_loaded(model_cfg["id"], model_cfg["context_length"], allow_swap=True)
+        print(msg)
+        if ok:
+            print(f"\nNow toggle thinking OFF in LM Studio GUI for {model_cfg['id']}, then run:")
+            print(f"  muninn-enricher --check {'--fast' if args.fast else ''}")
+        return
+
+    # Enrichment path: probe thinking-off first, abort if on
+    if not lm.is_loaded(model_cfg["id"]):
+        print(f"✗ {model_cfg['id']} is not loaded.")
+        print(f"  Load it: muninn-enricher --load {'--fast' if args.fast else ''}")
+        print(f"  Then toggle thinking OFF in the LM Studio GUI.")
+        sys.exit(1)
+
+    ok, reasoning = lm.probe_thinking_off(model_cfg["id"])
+    if reasoning < 0:
+        print(f"⚠ probe failed — is LM Studio reachable? Proceeding anyway (quality unverified).")
+    elif not ok:
+        print(f"✗ {model_cfg['id']} has thinking ON (probe used {reasoning} reasoning tokens).")
+        print(f"  Toggle OFF in LM Studio GUI: Inference > Custom Fields > Reasoning.")
+        print(f"  Then re-run: muninn-enricher {'--fast' if args.fast else ''} --once")
+        sys.exit(1)
+
+    muninn = MuninnMCP(cfg)
+    if args.once:
+        run_once(cfg, muninn, lm, conn, model_key)
+    else:
+        interval = cfg.get("poll", {}).get("interval_sec", 60)
+        idle_interval = cfg.get("poll", {}).get("idle_interval_sec", 60)
+        model_id = model_cfg["id"]
+        log(f"daemon mode: model={model_id}, active poll={interval}s, idle poll={idle_interval}s")
+        log(f"  pauses when {model_id} is unloaded; backs off to {idle_interval}s when queue is idle")
+        last_unavailable_log = 0.0
+        while True:
+            sleep_sec = interval
+            try:
+                ready, reason = lm.model_ready(model_id)
+                if not ready:
+                    # Log the pause at most once per 5 minutes to avoid spam.
+                    now = time.time()
+                    if now - last_unavailable_log > 300:
+                        log(f"paused: {reason}")
+                        last_unavailable_log = now
+                    sleep_sec = idle_interval
+                else:
+                    n = run_once(cfg, muninn, lm, conn, model_key)
+                    if n == 0:
+                        # Queue drained — nothing to do. Back off so we don't
+                        # hammer LM Studio /api/v1/models while idle. New live
+                        # captures will be picked up on the next idle tick.
+                        sleep_sec = idle_interval
+            except Exception as e:
+                log(f"daemon pass error: {e}")
+                sleep_sec = interval
+            for _ in range(sleep_sec):
+                time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()

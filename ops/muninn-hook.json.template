@@ -1,0 +1,29 @@
+{
+  "endpoint": "http://127.0.0.1:8475",
+  "vault": "agent-memory",
+  "project_vaults": true,
+  "general_vault": "proj-general",
+  "defaults": {
+    "mode": "full"
+  },
+  "agents": {
+    "claude": { "key": "mk_REDACTED_SET_YOUR_SCOPED_KEY", "source": "claude" },
+    "codex":  { "key": "mk_REDACTED_SET_YOUR_SCOPED_KEY", "source": "codex"  },
+    "pi":     { "key": "mk_REDACTED_SET_YOUR_SCOPED_KEY", "source": "pi"     }
+  },
+
+  "_comment_projects": "Optional registry: map an absolute path (git root or any dir) to a named vault, overriding the auto-provisioned proj-<slug>-<hash8>. Non-project cwds fall back to general_vault. Examples below are illustrative — replace with your own.",
+  "projects": {
+    "/home/you/code/my-analysis-repo": "proj-my-analysis",
+    "/home/you/writing/thesis": "proj-writing",
+    "/home/you/writing/papers": "proj-writing"
+  },
+
+  "_comment_recall_groups": "Optional: when storing to the KEY vault, recall is expanded (union) across the LISTED vaults, weighted evenly, with agent-memory still in the general tier. Storage routing is untouched. Use to consolidate recall across related project vaults.",
+  "recall_groups": {
+    "proj-writing": [
+      "proj-writing",
+      "proj-my-analysis"
+    ]
+  }
+}

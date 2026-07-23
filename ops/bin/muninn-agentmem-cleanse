@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""
+muninn-agentmem-cleanse — safely prune raw session noise from the agent-memory
+vault so it becomes a curated tier (deliberate remembers + promoted knowledge),
+WITHOUT losing the memories recorded via muninn_remember.
+
+Key fact established 2026-07-21: deliberate `muninn_remember` engrams live in
+agent-memory ONLY. Dual-write to project vaults is new (went live 2026-07-20),
+and the transcript backfill captures conversation turns, NOT muninn_remember API
+writes — so those engrams are NOT reconstructable from project vaults or
+backfill. They MUST be preserved.
+
+CLASSIFICATION (conservative — when in doubt, KEEP):
+  KEEP  - 'promoted' or 'source:promoter' tag        (promoter output)
+  PRUNE - has an 'op:*' tag OR a 'backfill' tag       (hook live-capture + backfill
+                                                        raw session turns — these are
+                                                        redundantly preserved in
+                                                        proj-general / project vaults)
+  PRUNE - 'distributed:to:*' tag                      (deliberate remember already
+                                                        copied into its project vault
+                                                        by muninn-distributor — safe to
+                                                        remove from agent-memory)
+  KEEP  - everything else: 'distributed:general'      (deliberate muninn_remember,
+          + un-distributed deliberate + untagged       cross-project or un-routed;
+                                                        the crown jewels)
+
+Deletes are SOFT (server tombstones them; restorable via /api/engrams/{id}/restore),
+and --apply always writes a full JSONL snapshot of agent-memory first. Triple
+safety: (1) a deliberate remember only enters the PRUNE set once it has been
+copied to its project vault (distributed:to:* — see muninn-distributor), (2) full
+snapshot on disk, (3) soft-delete tombstones are restorable.
+
+MODES:
+  --snapshot [FILE]      dump every agent-memory engram to JSONL (backup). Default:
+                         ~/.local/share/muninn-hook/agentmem-snapshot-<epoch>.jsonl
+  --dry-run              classify + report KEEP/PRUNE counts and samples. No changes.
+  --apply                take a snapshot, then SOFT-DELETE the PRUNE set. Keeps the
+                         deliberate remembers + promotions in place (never re-written).
+  --replay FILE          re-import engrams from a snapshot JSONL into --vault (default
+                         agent-memory). For the clear-and-rebuild path; idempotent.
+  --vault V              target vault (default: agent-memory)
+
+Config: ~/.config/muninn-hook.json (endpoint + agents.claude.key scoped key).
+"""
+from __future__ import annotations
+import argparse, hashlib, json, sys, time, urllib.error, urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+CFG = HOME / ".config" / "muninn-hook.json"
+SNAP_DIR = HOME / ".local" / "share" / "muninn-hook"
+
+
+def load():
+    c = json.loads(CFG.read_text())
+    return c["endpoint"].rstrip("/"), c["agents"]["claude"]["key"]
+
+
+def req(endpoint, key, method, path, body=None):
+    url = endpoint + path
+    data = json.dumps(body).encode() if body is not None else None
+    r = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+        "Accept": "application/json"})
+    for attempt in range(4):
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                b = resp.read()
+                return json.loads(b) if b else {}
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < 3:
+                time.sleep(2 * (attempt + 1)); continue
+            return {"_err": e.code, "_body": e.read()[:200].decode(errors="replace")}
+        except Exception as e:
+            if attempt < 3:
+                time.sleep(1 + attempt); continue
+            return {"_err": -1, "_body": str(e)}
+
+
+def classify(tags):
+    tags = tags or []
+    if "promoted" in tags or "source:promoter" in tags:
+        return "keep"
+    has_op = any(t.startswith("op:") for t in tags)
+    if has_op or "backfill" in tags:
+        return "prune"
+    if any(t.startswith("distributed:to:") for t in tags):
+        return "prune"  # already copied into its project vault by muninn-distributor
+    return "keep"
+
+
+def iter_engrams(endpoint, key, vault, page=200):
+    # The list endpoint caps limit at 200; advance the offset by the ACTUAL
+    # number returned (never the requested page size) or rows get skipped.
+    off = 0
+    while True:
+        p = req(endpoint, key, "GET", f"/api/engrams?vault={vault}&limit={page}&offset={off}")
+        engs = (p or {}).get("engrams", []) if isinstance(p, dict) else []
+        if not engs:
+            break
+        for e in engs:
+            yield e
+        off += len(engs)
+    return
+
+
+def do_snapshot(endpoint, key, vault, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with open(path, "w") as f:
+        for e in iter_engrams(endpoint, key, vault):
+            f.write(json.dumps(e) + "\n")
+            n += 1
+            if n % 2000 == 0:
+                print(f"  snapshot: {n} written...", file=sys.stderr)
+    print(f"snapshot: {n} engrams -> {path}")
+    return n, path
+
+
+def do_classify(endpoint, key, vault):
+    keep, prune = [], []
+    samples = {"keep_deliberate": [], "keep_promoted": [], "prune": []}
+    for e in iter_engrams(endpoint, key, vault):
+        tags = e.get("tags") or []
+        c = classify(tags)
+        if c == "prune":
+            prune.append(e["id"])
+            if len(samples["prune"]) < 6:
+                samples["prune"].append((e.get("concept", "")[:55], tags[:4]))
+        else:
+            keep.append(e["id"])
+            promoted = "promoted" in tags or "source:promoter" in tags
+            bucket = "keep_promoted" if promoted else "keep_deliberate"
+            if len(samples[bucket]) < 6:
+                samples[bucket].append((e.get("concept", "")[:55], [t for t in tags if not t.startswith("op:")][:4]))
+    return keep, prune, samples
+
+
+def do_replay(endpoint, key, vault, path):
+    path = Path(path)
+    if not path.exists():
+        print(f"error: snapshot {path} not found"); sys.exit(1)
+    n = 0
+    ok = 0
+    for line in open(path):
+        line = line.strip()
+        if not line:
+            continue
+        e = json.loads(line)
+        content = e.get("content") or ""
+        op = hashlib.sha256((vault + "|" + content).encode()).hexdigest()[:8]
+        body = {
+            "concept": e.get("concept", "")[:200],
+            "content": content,
+            "type": e.get("memory_type") or e.get("type") or "fact",
+            "tags": e.get("tags") or [],
+            "idempotent_id": f"op:{op}",
+        }
+        if e.get("created_at"):
+            body["created_at"] = e["created_at"]
+        res = req(endpoint, key, "POST", f"/api/engrams?vault={vault}", body)
+        n += 1
+        if isinstance(res, dict) and res.get("id"):
+            ok += 1
+        if n % 200 == 0:
+            print(f"  replay: {n} processed ({ok} written)...", file=sys.stderr)
+        time.sleep(0.03)
+    print(f"replay: {n} lines, {ok} written into {vault}")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Safely prune raw noise from agent-memory, preserving deliberate remembers")
+    p.add_argument("--vault", default="agent-memory")
+    p.add_argument("--snapshot", nargs="?", const="__default__", help="dump vault to JSONL (backup)")
+    p.add_argument("--dry-run", action="store_true", help="classify + report, no changes")
+    p.add_argument("--apply", action="store_true", help="snapshot then SOFT-DELETE the prune set")
+    p.add_argument("--replay", metavar="FILE", help="re-import a snapshot JSONL into --vault")
+    p.add_argument("--pace-ms", type=int, default=30)
+    args = p.parse_args()
+    endpoint, key = load()
+
+    if args.replay:
+        do_replay(endpoint, key, args.vault, args.replay); return
+
+    if args.snapshot is not None and not args.apply and not args.dry_run:
+        path = args.snapshot if args.snapshot != "__default__" else SNAP_DIR / f"agentmem-snapshot-{int(time.time())}.jsonl"
+        do_snapshot(endpoint, key, args.vault, path); return
+
+    if args.dry_run or args.apply:
+        print(f"classifying {args.vault} ...")
+        keep, prune, samples = do_classify(endpoint, key, args.vault)
+        print(f"\n  KEEP:  {len(keep)}  (un-distributed/general deliberate remembers + promotions + untagged)")
+        print(f"  PRUNE: {len(prune)}  (op:-tagged live-capture + backfill raw turns + distributed:to:* deliberate remembers)")
+        print("\n  sample KEEP (deliberate remembers — PRESERVED):")
+        for c, t in samples["keep_deliberate"]:
+            print(f"    · {c}   {t}")
+        print("  sample KEEP (promotions — PRESERVED):")
+        for c, t in samples["keep_promoted"]:
+            print(f"    · {c}   {t}")
+        print("  sample PRUNE (raw + distributed — to be soft-deleted):")
+        for c, t in samples["prune"]:
+            print(f"    · {c}   {t}")
+
+        if args.dry_run:
+            print("\n(dry-run — no changes)")
+            return
+
+        # --apply: snapshot first (mandatory safety), then soft-delete prune set
+        snap_path = SNAP_DIR / f"agentmem-snapshot-{int(time.time())}.jsonl"
+        print(f"\ntaking mandatory pre-delete snapshot -> {snap_path}")
+        do_snapshot(endpoint, key, args.vault, snap_path)
+        print(f"\nsoft-deleting {len(prune)} raw engrams (restorable via /restore; full backup at {snap_path}) ...")
+        deleted = 0
+        for eid in prune:
+            res = req(endpoint, key, "DELETE", f"/api/engrams/{eid}?vault={args.vault}")
+            if not (isinstance(res, dict) and res.get("_err")):
+                deleted += 1
+            if deleted % 500 == 0 and deleted:
+                print(f"  deleted {deleted}/{len(prune)}...", file=sys.stderr)
+            time.sleep(args.pace_ms / 1000)
+        print(f"done: soft-deleted {deleted}/{len(prune)}. KEEP set ({len(keep)}) untouched.")
+        return
+
+    p.print_help()
+
+
+if __name__ == "__main__":
+    main()

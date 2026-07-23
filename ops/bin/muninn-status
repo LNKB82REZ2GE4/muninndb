@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""muninn-status — snapshot of agent-memory vault health + daemon activity."""
+import json, os, subprocess, urllib.request, time
+from datetime import datetime
+from pathlib import Path
+
+KEY = "mk_REDACTED_SET_YOUR_SCOPED_KEY"
+STATE = Path.home() / ".local" / "share" / "muninn-enricher"
+
+def api(path):
+    req = urllib.request.Request(f"http://127.0.0.1:8475{path}",
+                                  headers={"Authorization": f"Bearer {KEY}"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read())
+
+def pid_alive(pidfile):
+    try:
+        pid = int(Path(pidfile).read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except Exception:
+        return None
+
+print(f"=== agent-memory status @ {datetime.now().isoformat()[:19]} ===\n")
+
+# vault stats
+try:
+    stats = api("/api/stats?vault=agent-memory")
+    c = stats.get("coherence", {}).get("agent-memory", {})
+    print("VAULT:")
+    print(f"  total engrams:    {stats.get('engram_count', '?')}")
+    print(f"  coherence score:  {c.get('score', '?')}")
+    print(f"  orphan ratio:     {c.get('orphan_ratio', '?'):.3f}" if isinstance(c.get('orphan_ratio'), (int,float)) else f"  orphan ratio:     {c.get('orphan_ratio','?')}")
+    print(f"  dup pressure:     {c.get('duplication_pressure', '?')}")
+    print(f"  contradictions:   {c.get('contradiction_density', '?')}")
+except Exception as e:
+    print(f"VAULT: query failed ({e})")
+
+# pending vs enriched (tag-based)
+try:
+    engrams = api("/api/engrams?vault=agent-memory&limit=200").get("engrams", [])
+    pending = sum(1 for e in engrams if "enrichment:pending" in e.get("tags", []))
+    enriched = sum(1 for e in engrams if "enrichment:pending" not in e.get("tags", []) and "backfill" in e.get("tags", []))
+    live = sum(1 for e in engrams if "backfill" not in e.get("tags", []))
+    print(f"\nSAMPLING (first 200 engrams):")
+    print(f"  awaiting enricher: {pending}")
+    print(f"  enriched (backfill): {enriched}")
+    print(f"  live captures: {live}")
+except Exception as e:
+    print(f"\nSAMPLING failed: {e}")
+
+# enricher daemon
+print(f"\nENRICHER:")
+epid = pid_alive(STATE / "daemon.pid")
+print(f"  daemon: {'RUNNING (pid '+str(epid)+')' if epid else 'NOT RUNNING'}")
+try:
+    # read enricher log tail for rate
+    lines = open(STATE / "enricher.log").read().strip().split("\n")
+    recent = [l for l in lines[-50:] if "✓" in l]
+    if recent:
+        print(f"  last enriched: {recent[-1].split(']')[-1].strip()[:80]}")
+except Exception:
+    pass
+
+# backfill
+print(f"\nBACKFILL:")
+bpid = pid_alive(STATE / "backfill.pid")
+print(f"  daemon: {'RUNNING (pid '+str(bpid)+')' if bpid else 'COMPLETE (not running)'}")
+
+# VRAM
+print(f"\nGPU:")
+try:
+    out = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=memory.used,memory.free,utilization.gpu", "--format=csv,noheader"],
+        timeout=5).decode().strip().split("\n")[0]
+    used, free, util = [x.strip() for x in out.split(",")]
+    print(f"  VRAM: {used} used / {free} free  |  GPU util: {util}")
+    if "MiB" in used:
+        n = int(used.split()[0])
+        print(f"  31b resident: {'YES' if n > 20000 else 'NO (may have been evicted)'}")
+except Exception as e:
+    print(f"  nvidia-smi failed: {e}")

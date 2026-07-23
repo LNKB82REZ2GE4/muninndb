@@ -1,0 +1,990 @@
+#!/usr/bin/env python3
+"""
+muninn-hook — shared cognitive-memory hook core for Pi / Claude Code / Codex.
+
+One CLI, three ~1-line adapters. Implements the engram contract from the
+muninn-integration-plan.md (§4.5 + §5):
+
+  orient          SessionStart recall (where_left_off + light activate)
+  prompt          UserPromptSubmit recall (activate on prompt)
+  posttool        PostToolUse error recall (activate on error, only if isError)
+  store-message   write one structural engram (Pi message_end)
+  store-turn      cursor-scan a transcript → batch write new assistant msgs (Stop)
+  store-subagent  scan subagent transcript → batch write (SubagentStop)
+  store-compact   write a compaction summary engram (PostCompact)
+  flush           final write + cursor advance (session_shutdown)
+
+DESIGN: live writes NEVER block on or fail due to enrichment availability.
+Structural tier only (no LLM at write time). Entities/summary deferred to the
+background enricher. Store commands always exit 0 so the hook chain never breaks.
+
+Auth: per-agent mk_ keys auto-pin to the agent-memory vault (server-enforced),
+so vault misrouting is impossible.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Paths & config
+# ---------------------------------------------------------------------------
+
+HOME = Path.home()
+CONFIG_PATH = HOME / ".config" / "muninn-hook.json"
+STATE_DIR = HOME / ".local" / "share" / "muninn-hook"
+CURSOR_DIR = STATE_DIR / "cursors"
+LOG_PATH = STATE_DIR / "hook.log"
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except Exception as e:
+        dbg(f"config load failed: {e}; using defaults")
+        return {}
+
+
+def agent_config(cfg: dict, agent: str) -> tuple[str, str]:
+    """Return (api_key, source_tag) for the given agent."""
+    agents = cfg.get("agents", {})
+    if agent not in agents:
+        die(f"unknown agent {agent!r}; configure in {CONFIG_PATH}")
+    a = agents[agent]
+    return a["key"], a.get("source", agent)
+
+
+def defaults(cfg: dict) -> dict:
+    return cfg.get("defaults", {})
+
+
+def project_vaults_enabled(cfg: dict) -> bool:
+    return bool(cfg.get("project_vaults", False))
+
+
+# ---------------------------------------------------------------------------
+# Project resolution (project-vaults phase 3, design §2)
+# ---------------------------------------------------------------------------
+
+def _git_common_root(cwd: str) -> str | None:
+    """Return the shared repo root (git-common-dir's parent) for cwd, or None
+    outside a git repo. Worktrees share their main repo's common dir, so all
+    worktrees of one repo resolve to the same root/vault."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception as e:
+        dbg(f"_git_common_root: git invocation failed: {e}")
+        return None
+    if out.returncode != 0:
+        return None
+    common_dir = out.stdout.strip()
+    if not common_dir:
+        return None
+    common_dir_abs = os.path.realpath(os.path.join(cwd, common_dir))
+    return os.path.dirname(common_dir_abs)
+
+
+def _slugify(name: str) -> str:
+    s = re.sub(r"[^a-z0-9_-]", "-", name.lower())
+    return s or "project"
+
+
+def project_vault_name(root: str) -> str:
+    """proj-<slug>-<hash8> (design §2.1): slug is the root basename, hash8
+    pins the absolute root path so directory renames don't collide."""
+    digest = hashlib.sha256(root.encode()).hexdigest()[:8]
+    suffix = f"-{digest}"
+    slug = _slugify(Path(root).name)
+    max_slug_len = max(1, 64 - len("proj-") - len(suffix))
+    slug = slug[:max_slug_len]
+    return f"proj-{slug}{suffix}"
+
+
+def _registry_override(cfg: dict, root: str) -> tuple[bool, str | None]:
+    """Longest-prefix match against the `projects` registry (design §2.3).
+    Returns (matched, vault_or_None) — matched=False means no entry applies;
+    vault=None with matched=True means an explicit opt-out."""
+    projects = cfg.get("projects", {})
+    if not isinstance(projects, dict):
+        return False, None
+    root_norm = os.path.normpath(root)
+    best_key = None
+    for key in projects:
+        key_norm = os.path.normpath(key)
+        if root_norm == key_norm or root_norm.startswith(key_norm + os.sep):
+            if best_key is None or len(os.path.normpath(best_key)) < len(key_norm):
+                best_key = key
+    if best_key is None:
+        return False, None
+    return True, projects[best_key]
+
+
+def resolve_project(cwd: str, cfg: dict) -> str | None:
+    """Resolve cwd to a project vault name, or None for a global-only session."""
+    root = _git_common_root(cwd)
+    # The registry can claim non-git paths too (e.g. Documents/PhD Draft):
+    # match against the git root when there is one, else the cwd itself.
+    matched, override = _registry_override(cfg, root or os.path.abspath(cwd))
+    if matched:
+        return override
+    if root is None:
+        return None
+    return project_vault_name(root)
+
+
+def resolve_store_vault(cfg: dict, cwd: str) -> str | None:
+    """Vault to store/recall against for this cwd, honoring the project_vaults flag.
+    A non-project (git-less / unregistered) cwd falls back to the configured
+    `general_vault` when set — so general work gets its own isolated vault and
+    two-tier recall (general_vault + agent-memory), instead of dumping raw turns
+    straight into agent-memory. When general_vault is unset, returns None
+    (legacy: stores/recalls agent-memory single-tier)."""
+    if not project_vaults_enabled(cfg):
+        return None
+    v = resolve_project(cwd, cfg)
+    if v is None:
+        gv = cfg.get("general_vault")
+        if gv:
+            return gv
+    return v
+
+
+# ---------------------------------------------------------------------------
+# Project vault provisioning (design §5.1) — cached one-time per project
+# ---------------------------------------------------------------------------
+
+def _project_state_path(vault_name: str) -> Path:
+    return STATE_DIR / "projects" / f"{vault_name}.json"
+
+
+def _is_provisioned(vault_name: str) -> bool:
+    try:
+        return bool(json.loads(_project_state_path(vault_name).read_text()).get("provisioned"))
+    except Exception:
+        return False
+
+
+def _mark_provisioned(vault_name: str) -> None:
+    try:
+        p = _project_state_path(vault_name)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"provisioned": True, "at": now_iso()}))
+    except Exception as e:
+        dbg(f"_mark_provisioned failed: {e}")
+
+
+def ensure_project_vault(cfg: dict, key: str, vault_name: str) -> None:
+    """Idempotently provision the project vault via POST /api/vaults, once
+    per project (cached locally — the server call itself is also idempotent)."""
+    if _is_provisioned(vault_name):
+        return
+    payload = {
+        "name": vault_name,
+        "template": "knowledge-graph",
+        "multi_user": False,
+        "behavior_instructions": (
+            "This is a project vault (project-vaults design). Hook auto-stores "
+            "(turns, compactions, subagent output) land here only. Deliberate "
+            "muninn_remember calls should target both this vault and "
+            "agent-memory, unless the fact is purely project-local."
+        ),
+    }
+    res = http_post(cfg, "/api/vaults", payload, key)
+    if res is not None:
+        _mark_provisioned(vault_name)
+    else:
+        dbg(f"ensure_project_vault: provisioning failed for {vault_name}")
+
+
+# ---------------------------------------------------------------------------
+# Logging / errors
+# ---------------------------------------------------------------------------
+
+def dbg(msg: str) -> None:
+    """Append to hook.log if MUNINN_HOOK_DEBUG is set."""
+    if os.environ.get("MUNINN_HOOK_DEBUG"):
+        try:
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(LOG_PATH, "a") as f:
+                f.write(f"{datetime.now().isoformat()} {msg}\n")
+        except Exception:
+            pass
+
+
+def die(msg: str, code: int = 0) -> None:
+    """Log + exit. Default code 0 so hooks never break."""
+    dbg(f"DIE: {msg}")
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
+# HTTP (stdlib only, short timeouts, never raises on the hot path)
+# ---------------------------------------------------------------------------
+
+def http_post(cfg: dict, path: str, payload: dict, key: str, vault: str | None = None) -> dict | None:
+    url = cfg.get("endpoint", "http://127.0.0.1:8475") + path
+    if vault:
+        sep = "&" if "?" in path else "?"
+        url += f"{sep}vault={urllib.parse.quote(vault)}"
+    timeout = defaults(cfg).get("http_timeout_sec", 6)
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        dbg(f"HTTP {e.code} POST {path}: {e.read()[:200]}")
+        return None
+    except Exception as e:
+        dbg(f"POST {path} failed: {e}")
+        return None
+
+
+def http_get(cfg: dict, path: str, key: str) -> dict | None:
+    url = cfg.get("endpoint", "http://127.0.0.1:8475") + path
+    timeout = defaults(cfg).get("http_timeout_sec", 6)
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        dbg(f"GET {path} failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Timestamp handling (ISO-8601 → Unix nanoseconds)
+# ---------------------------------------------------------------------------
+
+def iso_to_ns(ts: str | None) -> int:
+    """Convert an ISO-8601 timestamp to Unix nanoseconds. 0 on failure."""
+    if not ts:
+        return 0
+    try:
+        s = ts.strip()
+        # Z suffix → +00:00
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1_000_000_000)
+    except Exception:
+        return 0
+
+
+def now_iso() -> str:
+    """Current time as ISO-8601 UTC string (what the REST write path expects)."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def yyyy_mm_from(iso_ts: str | None) -> str:
+    """Derive YYYY-MM from an ISO timestamp, falling back to now."""
+    if iso_ts:
+        ns = iso_to_ns(iso_ts)
+        if ns:
+            try:
+                return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc).strftime("%Y-%m")
+            except Exception:
+                pass
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+# ---------------------------------------------------------------------------
+# Cursor state (per-transcript byte offset for incremental scan)
+# ---------------------------------------------------------------------------
+
+def cursor_key(transcript_path: str) -> str:
+    return hashlib.sha256(transcript_path.encode()).hexdigest()[:16]
+
+
+def read_cursor(transcript_path: str) -> int:
+    p = CURSOR_DIR / f"{cursor_key(transcript_path)}.json"
+    try:
+        return int(json.loads(p.read_text()).get("offset", 0))
+    except Exception:
+        return 0
+
+
+def write_cursor(transcript_path: str, offset: int, session: str | None = None) -> None:
+    try:
+        CURSOR_DIR.mkdir(parents=True, exist_ok=True)
+        p = CURSOR_DIR / f"{cursor_key(transcript_path)}.json"
+        p.write_text(json.dumps({"offset": offset, "session": session}))
+    except Exception as e:
+        dbg(f"write_cursor failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Noise filter (§7.1 — conservative: drop only unambiguous non-content)
+# ---------------------------------------------------------------------------
+
+# Injection blocks embedded in assistant messages — strip the span, keep the rest.
+_INJECTION_RE = re.compile(
+    r"<(?:lnk-memory-context|hybrid-memory-context|agent-memory-recall)>.*?</(?:lnk-memory-context|hybrid-memory-context|agent-memory-recall)>",
+    re.DOTALL,
+)
+
+# Whole-message skips (rendering noise, command echoes, system residue).
+_NOISE_RE = re.compile(
+    r"^(\s*"
+    r"(\[tool(call|result)[\s\]])"            # [toolcall…]/[toolresult…] framing
+    r"|/lnk-memory-"                           # command echoes
+    r"|interactive_shell.*exited"              # shell exit residue
+    r"|\$\w"                                    # skill/command invocations
+    r"|Caveat:.*Claude"                         # disclaimer preamble
+    r")",
+    re.IGNORECASE,
+)
+
+
+def strip_injections(text: str) -> str:
+    return _INJECTION_RE.sub("", text).strip()
+
+
+def is_noise(text: str, min_chars: int) -> bool:
+    t = text.strip()
+    if len(t) < min_chars:
+        return True
+    if _NOISE_RE.match(t):
+        return True
+    # almost entirely an injection block
+    stripped = strip_injections(t)
+    if len(stripped) < min_chars:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Engram builder (structural tier, §3.2 + §5)
+# ---------------------------------------------------------------------------
+
+def sha8(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:8]
+
+
+def derive_concept(content: str) -> str:
+    """Heuristic: first sentence/line, ≤80 chars."""
+    t = content.strip().split("\n")[0]
+    # cut at first sentence boundary if reasonable
+    for sep in (". ", "! ", "? "):
+        i = t.find(sep)
+        if 20 < i < 80:
+            t = t[: i + 1]
+            break
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:80]
+
+
+def build_engram(
+    content: str,
+    source: str,
+    session: str,
+    turn: int | None,
+    entry_idx: int,
+    created_at: str | None,
+    cfg: dict,
+    confidence: float | None = None,
+    type_label: str = "assistant_message",
+    extra_tags: list[str] | None = None,
+) -> dict:
+    session_base = Path(session).stem if session else "unknown"
+    yyyy_mm = yyyy_mm_from(created_at)
+    tags = [
+        f"source:{source}",
+        f"session:{session_base}",
+        f"entry:{entry_idx}",
+        f"op:{sha8(content)}",
+        yyyy_mm,
+        "enrichment:pending",
+    ]
+    if turn is not None:
+        tags.append(f"turn:{turn}")
+    if extra_tags:
+        tags.extend(extra_tags)
+    conf = confidence if confidence is not None else defaults(cfg).get("confidence", 0.7)
+    eng = {
+        "concept": derive_concept(content),
+        "content": content,
+        "type": "observation",  # provisional; refined at enrichment
+        "type_label": type_label,
+        "tags": tags,
+        "confidence": conf,
+    }
+    # REST write path expects created_at as an ISO-8601 string (Go time.Time),
+    # NOT nanoseconds. Omit when absent (server stamps with now()).
+    if created_at:
+        eng["created_at"] = created_at
+    return eng
+
+
+# ---------------------------------------------------------------------------
+# Transcript parsers — yield (text, created_ns, turn_hint) for assistant msgs
+# ---------------------------------------------------------------------------
+
+def _assistant_text_claude(obj: dict) -> str | None:
+    if obj.get("type") != "assistant":
+        return None
+    msg = obj.get("message", {})
+    if not isinstance(msg, dict):
+        return None
+    content = msg.get("content", [])
+    if not isinstance(content, list):
+        return None
+    texts = [
+        c.get("text", "")
+        for c in content
+        if isinstance(c, dict) and c.get("type") == "text" and c.get("text", "").strip()
+    ]
+    return "\n".join(texts).strip() or None
+
+
+def _assistant_text_pi(obj: dict) -> str | None:
+    if obj.get("type") != "message":
+        return None
+    msg = obj.get("message", {})
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return None
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return content.strip() or None
+    if isinstance(content, list):
+        texts = [
+            c.get("text", "")
+            for c in content
+            if isinstance(c, dict) and c.get("text", "").strip()
+        ]
+        return "\n".join(texts).strip() or None
+    return None
+
+
+def _assistant_text_codex(obj: dict) -> str | None:
+    if obj.get("type") != "response_item":
+        return None
+    p = obj.get("payload", {})
+    if not isinstance(p, dict) or p.get("type") != "message" or p.get("role") != "assistant":
+        return None
+    content = p.get("content", [])
+    if not isinstance(content, list):
+        return None
+    texts = [
+        c.get("text", "")
+        for c in content
+        if isinstance(c, dict) and c.get("text", "").strip()
+    ]
+    return "\n".join(texts).strip() or None
+
+
+PARSERS = {
+    "claude": _assistant_text_claude,
+    "pi": _assistant_text_pi,
+    "codex": _assistant_text_codex,
+}
+
+# top-level timestamp field per format
+TS_FIELD = {"claude": "timestamp", "pi": "timestamp", "codex": "timestamp"}
+
+
+def detect_format(transcript_path: str) -> str:
+    p = transcript_path
+    if ".claude/projects" in p:
+        return "claude"
+    if ".codex/sessions" in p:
+        return "codex"
+    if ".pi/agent/sessions" in p or ".pi/sessions" in p:
+        return "pi"
+    return "claude"  # safe default
+
+
+def scan_transcript(
+    transcript_path: str, fmt: str, from_offset: int
+) -> tuple[list[dict], int]:
+    """Scan forward from byte offset; return (messages, new_offset).
+
+    Each message dict: {text, created_ns}.
+    """
+    msgs: list[dict] = []
+    try:
+        size = os.path.getsize(transcript_path)
+    except OSError:
+        return msgs, from_offset
+    if size <= from_offset:
+        return msgs, from_offset
+    parser = PARSERS.get(fmt, _assistant_text_claude)
+    ts_field = TS_FIELD.get(fmt, "timestamp")
+    try:
+        with open(transcript_path, "r", errors="replace") as f:
+            f.seek(from_offset)
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                text = parser(obj)
+                if not text:
+                    continue
+                text = strip_injections(text)
+                created = obj.get(ts_field)  # keep raw ISO string
+                msgs.append({"text": text, "created_at": created})
+    except Exception as e:
+        dbg(f"scan_transcript error: {e}")
+    return msgs, size
+
+
+# ---------------------------------------------------------------------------
+# Hook output (recall → context injection)
+# ---------------------------------------------------------------------------
+
+def emit_context(text: str, event_name: str, fmt: str) -> None:
+    """Emit hook-format JSON to inject additionalContext.
+
+    Claude/Codex both accept {"hookSpecificOutput": {hookEventName, additionalContext}}.
+    """
+    if not text:
+        return
+    if fmt == "plain":
+        print(text)
+        return
+    out = {"hookSpecificOutput": {"hookEventName": event_name, "additionalContext": text}}
+    print(json.dumps(out))
+
+
+def _format_activation_lines(activations: list[dict]) -> list[str]:
+    lines = []
+    for a in activations:
+        concept = a.get("concept", "")
+        content = a.get("content", "")
+        score = a.get("relevance") or a.get("score") or 0
+        lines.append(f"- [{score:.2f}] {concept}: {content[:300]}")
+    return lines
+
+
+def format_recall(activations: list[dict], source_label: str) -> str:
+    if not activations:
+        return ""
+    lines = [f"Relevant memories from {source_label} vault:"] + _format_activation_lines(activations)
+    return "\n".join(lines)
+
+
+def format_recall_sections(activations: list[dict], project_vaults: list[str]) -> str:
+    """Two labelled sections for a project-scoped multi-vault recall (design §5.1).
+
+    `project_vaults` is the full project-tier vault list (a `recall_groups`
+    expansion, or just [store_vault] when the store vault has no group) — any
+    activation from one of these vaults is "Project", everything else
+    (agent-memory) is "General"."""
+    if not activations:
+        return ""
+    proj_set = set(project_vaults)
+    proj = [a for a in activations if a.get("vault") in proj_set]
+    gen = [a for a in activations if a.get("vault") not in proj_set]
+    sections = []
+    if proj:
+        sections.append("\n".join(["Project memories:"] + _format_activation_lines(proj)))
+    if gen:
+        sections.append("\n".join(["General memories:"] + _format_activation_lines(gen)))
+    return "\n\n".join(sections)
+
+
+def recall_group_vaults(cfg: dict, project_vault: str) -> list[str]:
+    """Expand a store vault into its recall-tier vault list via `recall_groups`
+    (project-vaults phase: consolidated recall for PhD-writing dirs across all
+    PhD repos). Falls back to [project_vault] when no group is configured —
+    this is the identical single-vault behavior as before recall_groups existed."""
+    groups = cfg.get("recall_groups", {})
+    if isinstance(groups, dict):
+        vaults = groups.get(project_vault)
+        if isinstance(vaults, list) and vaults:
+            return vaults
+    return [project_vault]
+
+
+def activate_multi(cfg: dict, key: str, context: list[str], max_results: int, threshold: float, project_vault: str) -> dict | None:
+    """One /api/activate call spanning [project tier..., agent-memory] (design §5.1/§6).
+
+    The project tier is normally just [project_vault]; if project_vault has a
+    `recall_groups` entry, the tier expands to that vault list and the
+    project_weight is split evenly across it. Storage routing is untouched —
+    this only affects what gets recalled, never where writes land."""
+    d = defaults(cfg)
+    project_weight = d.get("project_weight", 0.67)
+    general_weight = d.get("general_weight", 0.33)
+    project_tier = recall_group_vaults(cfg, project_vault)
+    per_vault_weight = project_weight / len(project_tier)
+    return http_post(cfg, "/api/activate", {
+        "context": context,
+        "vaults": project_tier + ["agent-memory"],
+        "vault_weights": [per_vault_weight] * len(project_tier) + [general_weight],
+        "max_results": max_results,
+        "threshold": threshold,
+        "mode": "balanced",
+    }, key)
+
+
+# ---------------------------------------------------------------------------
+# stdin helpers
+# ---------------------------------------------------------------------------
+
+def read_hook_input() -> dict:
+    """Read JSON from stdin if present (Claude/Codex hooks pass payload)."""
+    if sys.stdin.isatty():
+        return {}
+    try:
+        raw = sys.stdin.read()
+        if not raw.strip():
+            return {}
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_orient(cfg, agent, fmt, args):
+    """SessionStart: where_left_off + light activate."""
+    key, source = agent_config(cfg, agent)
+    payload = read_hook_input()
+    # orient: recall what we were doing (generic + cwd if available)
+    cwd = payload.get("cwd") or os.getcwd()
+    ctx = [f"what was I working on in {Path(cwd).name}", "recent work context"]
+    max_results = defaults(cfg).get("recall_max_results", 6)
+    threshold = defaults(cfg).get("recall_threshold", 0.3)
+    vault = resolve_store_vault(cfg, cwd)
+    if vault:
+        ensure_project_vault(cfg, key, vault)
+        res = activate_multi(cfg, key, ctx, max_results, threshold, vault)
+        acts = (res or {}).get("activations", []) if res else []
+        text = format_recall_sections(acts, recall_group_vaults(cfg, vault))
+    else:
+        res = http_post(cfg, "/api/activate", {
+            "context": ctx,
+            "max_results": max_results,
+            "threshold": threshold,
+            "mode": "balanced",
+        }, key)
+        acts = (res or {}).get("activations", []) if res else []
+        text = format_recall(acts, "agent-memory")
+    emit_context(text, "SessionStart", fmt)
+
+
+def cmd_prompt(cfg, agent, fmt, args):
+    """UserPromptSubmit: save prompt + activate on it."""
+    key, source = agent_config(cfg, agent)
+    payload = read_hook_input()
+    prompt = payload.get("prompt") or payload.get("message") or ""
+    if not prompt:
+        return
+    prompt = prompt.strip()
+    cwd = payload.get("cwd") or os.getcwd()
+    vault = resolve_store_vault(cfg, cwd)
+    # save the user prompt (fire-and-forget)
+    eng = build_engram(
+        prompt, source, payload.get("session_id", "prompt"),
+        turn=None, entry_idx=0, created_at=now_iso(), cfg=cfg,
+        type_label="user_prompt",
+        extra_tags=[f"project:{vault}"] if vault else None,
+    )
+    eng["type"] = "observation"
+    http_post(cfg, "/api/engrams", eng, key, vault=vault)
+    # recall
+    max_results = defaults(cfg).get("recall_max_results", 6)
+    threshold = defaults(cfg).get("recall_threshold", 0.3)
+    if vault:
+        ensure_project_vault(cfg, key, vault)
+        res = activate_multi(cfg, key, [prompt[:1000]], max_results, threshold, vault)
+        acts = (res or {}).get("activations", []) if res else []
+        text = format_recall_sections(acts, recall_group_vaults(cfg, vault))
+    else:
+        res = http_post(cfg, "/api/activate", {
+            "context": [prompt[:1000]],
+            "max_results": max_results,
+            "threshold": threshold,
+            "mode": "balanced",
+        }, key)
+        acts = (res or {}).get("activations", []) if res else []
+        text = format_recall(acts, "agent-memory")
+    emit_context(text, "UserPromptSubmit", fmt)
+
+
+def cmd_posttool(cfg, agent, fmt, args):
+    """PostToolUse: if the tool errored, recall a possible fix."""
+    key, source = agent_config(cfg, agent)
+    payload = read_hook_input()
+    # Detect error across harness schemas:
+    #   Claude PostToolUse:   `error` (truthy string) + `error_type`, OR `is_timeout`, `is_interrupt`
+    #   Codex / others:        `isError` / `is_error`
+    #   PostToolBatch:         `tool_calls[].tool_response.error`
+    err_text = payload.get("error") or ""
+    is_error = bool(err_text) or payload.get("isError") or payload.get("is_error") or payload.get("is_timeout") or payload.get("is_interrupt")
+    if not is_error:
+        # scan PostToolBatch tool_calls for any errored entry
+        for tc in (payload.get("tool_calls") or []):
+            resp = (tc or {}).get("tool_response") or {}
+            if resp.get("error") or resp.get("isError") or resp.get("is_error"):
+                err_text = err_text or str(resp.get("error") or resp.get("content") or "")
+                is_error = True
+                break
+    if not is_error and not args.force:
+        return
+    # extract error text (prioritise the explicit `error` field)
+    err = (
+        err_text
+        or str(payload.get("tool_input", {}).get("command") or "")
+        or str(payload.get("tool_name") or "")
+        or str(payload)[:1000]
+    )
+    cwd = payload.get("cwd") or os.getcwd()
+    vault = resolve_store_vault(cfg, cwd)
+    threshold = defaults(cfg).get("recall_threshold", 0.3)
+    if vault:
+        res = activate_multi(cfg, key, [f"error fix for: {err[:1000]}"], 4, threshold, vault)
+        acts = (res or {}).get("activations", []) if res else []
+        text = format_recall_sections(acts, recall_group_vaults(cfg, vault))
+    else:
+        res = http_post(cfg, "/api/activate", {
+            "context": [f"error fix for: {err[:1000]}"],
+            "max_results": 4,
+            "threshold": threshold,
+            "mode": "balanced",
+        }, key)
+        acts = (res or {}).get("activations", []) if res else []
+        text = format_recall(acts, "agent-memory")
+    emit_context(text, "PostToolUse", fmt)
+
+
+def cmd_store_message(cfg, agent, fmt, args):
+    """store-message: write ONE structural engram (Pi message_end / explicit)."""
+    key, source = agent_config(cfg, agent)
+    payload = read_hook_input()
+    content = args.content or payload.get("content") or payload.get("text") or ""
+    if not content:
+        return
+    content = strip_injections(content).strip()
+    min_chars = defaults(cfg).get("min_content_chars", 15)
+    if is_noise(content, min_chars):
+        dbg(f"store-message: skipped (noise/short)")
+        return
+    session = args.session or payload.get("session_id") or payload.get("session") or "live"
+    created = args.created_at or payload.get("created_at") or payload.get("timestamp") or now_iso()
+    cwd = payload.get("cwd") or os.getcwd()
+    vault = resolve_store_vault(cfg, cwd)
+    eng = build_engram(
+        content, source, session,
+        turn=args.turn, entry_idx=args.entry or 0,
+        created_at=created, cfg=cfg,
+        type_label=args.type_label or "assistant_message",
+        extra_tags=[f"project:{vault}"] if vault else None,
+    )
+    http_post(cfg, "/api/engrams", eng, key, vault=vault)
+    dbg(f"store-message: wrote {sha8(content)}")
+
+
+def _store_transcript(cfg, agent, fmt, transcript_path, session_id, source_override=None, type_label="assistant_message", vault=None):
+    """Shared cursor-scan + batch-write logic for store-turn / store-subagent."""
+    key, source = agent_config(cfg, agent)
+    src = source_override or source
+    if not transcript_path or not os.path.exists(transcript_path):
+        dbg(f"store: transcript missing: {transcript_path}")
+        return 0
+    fmt = detect_format(transcript_path) if fmt == "auto" else fmt
+    offset = read_cursor(transcript_path)
+    msgs, new_offset = scan_transcript(transcript_path, fmt, offset)
+    if not msgs:
+        write_cursor(transcript_path, new_offset, session_id)
+        return 0
+    min_chars = defaults(cfg).get("min_content_chars", 15)
+    max_batch = defaults(cfg).get("max_batch", 50)
+    extra_tags = [f"project:{vault}"] if vault else None
+    # dedup consecutive identical
+    seen_hashes: set[str] = set()
+    engrams = []
+    entry = 0
+    for m in msgs:
+        text = strip_injections(m["text"]).strip()
+        if is_noise(text, min_chars):
+            continue
+        h = sha8(text)
+        if h in seen_hashes:
+            continue
+        seen_hashes.add(h)
+        engrams.append(build_engram(
+            text, src, session_id or transcript_path,
+            turn=None, entry_idx=entry, created_at=m["created_at"], cfg=cfg,
+            type_label=type_label, extra_tags=extra_tags,
+        ))
+        entry += 1
+        if len(engrams) >= max_batch:
+            http_post(cfg, "/api/engrams/batch", {"engrams": engrams}, key, vault=vault)
+            engrams = []
+    if engrams:
+        http_post(cfg, "/api/engrams/batch", {"engrams": engrams}, key, vault=vault)
+    write_cursor(transcript_path, new_offset, session_id)
+    dbg(f"store {fmt}: wrote {entry} engrams from {transcript_path}")
+    return entry
+
+
+def cmd_store_turn(cfg, agent, fmt, args):
+    """store-turn: cursor-scan main transcript at Stop."""
+    payload = read_hook_input()
+    transcript = (
+        args.transcript
+        or payload.get("transcript_path")
+        or payload.get("transcript")
+        or ""
+    )
+    session_id = args.session or payload.get("session_id") or payload.get("sessionId") or ""
+    cwd = payload.get("cwd") or os.getcwd()
+    vault = resolve_store_vault(cfg, cwd)
+    n = _store_transcript(cfg, agent, "auto", transcript, session_id, vault=vault)
+    dbg(f"store-turn: {n} engrams")
+
+
+def cmd_store_subagent(cfg, agent, fmt, args):
+    """store-subagent: scan subagent transcript at SubagentStop."""
+    key, source = agent_config(cfg, agent)
+    payload = read_hook_input()
+    # codex provides agent_transcript_path; claude provides transcript_path + last_assistant_message
+    transcript = (
+        args.transcript
+        or payload.get("agent_transcript_path")
+        or payload.get("transcript_path")
+        or ""
+    )
+    session_id = args.session or payload.get("session_id") or ""
+    cwd = payload.get("cwd") or os.getcwd()
+    vault = resolve_store_vault(cfg, cwd)
+    src = f"{source}-subagent"
+    n = _store_transcript(cfg, agent, "auto", transcript, session_id, source_override=src, type_label="subagent_finding", vault=vault)
+    # also capture last_assistant_message if no transcript (claude case)
+    if n == 0:
+        last = payload.get("last_assistant_message") or ""
+        if last and not is_noise(last, defaults(cfg).get("min_content_chars", 15)):
+            eng = build_engram(
+                last, src, session_id or "subagent",
+                turn=None, entry_idx=0, created_at=now_iso(), cfg=cfg,
+                type_label="subagent_finding",
+                extra_tags=[f"project:{vault}"] if vault else None,
+            )
+            http_post(cfg, "/api/engrams", eng, key, vault=vault)
+            n = 1
+    dbg(f"store-subagent: {n} engrams")
+
+
+def cmd_store_compact(cfg, agent, fmt, args):
+    """store-compact: write a compaction summary engram."""
+    key, source = agent_config(cfg, agent)
+    payload = read_hook_input()
+    # capture the current assistant tail or the compacted content
+    transcript = payload.get("transcript_path") or ""
+    summary = args.content or ""
+    cwd = payload.get("cwd") or os.getcwd()
+    vault = resolve_store_vault(cfg, cwd)
+    if not summary and transcript:
+        # take the last few assistant messages as the "summary"
+        _store_transcript(cfg, agent, "auto", transcript, payload.get("session_id"), vault=vault)
+        return
+    if not summary:
+        return
+    eng = build_engram(
+        summary, source, payload.get("session_id", "compact"),
+        turn=None, entry_idx=0, created_at=now_iso(), cfg=cfg,
+        type_label="compaction_summary",
+        extra_tags=[f"project:{vault}"] if vault else None,
+    )
+    eng["type"] = "event"
+    http_post(cfg, "/api/engrams", eng, key, vault=vault)
+
+
+def cmd_flush(cfg, agent, fmt, args):
+    """flush: final store-turn + advance cursor (session_shutdown)."""
+    cmd_store_turn(cfg, agent, fmt, args)
+
+
+# ---------------------------------------------------------------------------
+# argparse wiring
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="muninn-hook",
+        description="Shared cognitive-memory hook core for Pi / Claude Code / Codex.",
+    )
+    p.add_argument("--agent", default=os.environ.get("MUNINN_HOOK_AGENT", "claude"),
+                   choices=["pi", "claude", "codex"], help="which agent identity to use")
+    p.add_argument("--format", default="claude",
+                   choices=["claude", "codex", "plain"],
+                   help="hook output format (recall context shape); transcript fmt is auto-detected")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("orient", help="SessionStart recall").set_defaults(func=cmd_orient)
+    sub.add_parser("prompt", help="UserPromptSubmit recall").set_defaults(func=cmd_prompt)
+    pt = sub.add_parser("posttool", help="PostToolUse error recall")
+    pt.add_argument("--force", action="store_true", help="recall even if no error detected")
+    pt.set_defaults(func=cmd_posttool)
+
+    sm = sub.add_parser("store-message", help="write one structural engram")
+    sm.add_argument("--content", help="the message content")
+    sm.add_argument("--session", help="session id/path")
+    sm.add_argument("--turn", type=int, help="turn number")
+    sm.add_argument("--entry", type=int, default=0, help="entry index")
+    sm.add_argument("--created-at", help="ISO-8601 timestamp")
+    sm.add_argument("--type-label", default="assistant_message")
+    sm.set_defaults(func=cmd_store_message)
+
+    st = sub.add_parser("store-turn", help="cursor-scan transcript at Stop")
+    st.add_argument("--transcript", help="transcript path (default: from stdin)")
+    st.add_argument("--session", help="session id")
+    st.set_defaults(func=cmd_store_turn)
+
+    ss = sub.add_parser("store-subagent", help="scan subagent transcript")
+    ss.add_argument("--transcript", help="subagent transcript path")
+    ss.add_argument("--session", help="session id")
+    ss.set_defaults(func=cmd_store_subagent)
+
+    sc = sub.add_parser("store-compact", help="write compaction summary")
+    sc.add_argument("--content", help="compaction summary text")
+    sc.set_defaults(func=cmd_store_compact)
+
+    sub.add_parser("flush", help="final write + cursor advance").set_defaults(func=cmd_flush)
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    cfg = load_config()
+    try:
+        args.func(cfg, args.agent, args.format, args)
+    except Exception as e:
+        dbg(f"unhandled: {e}")
+        # never break the hook chain
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
