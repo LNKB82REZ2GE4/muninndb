@@ -39,9 +39,12 @@ and remain the reviewer's job.
    `docker-compose.yml` comment. **These are already drifted today** — see the live-drift
    list below.
 
-6. **`cmd/muninn/upgrade.go`** → if a PR claims to fix upgrade integrity (#600), verify it
-   actually verifies the downloaded binary against `checksums.txt` (which `release.yml`
-   already publishes). Don't accept an executable-bit + version-string check as "integrity."
+6. **`cmd/muninn/upgrade.go`** → upgrade integrity is checksum-verified as of #600. The
+   ordering inside `selfUpdate` is the security property, not the presence of a hash:
+   `verifyChecksum` must stay **before** `verifyBinary`, because `verifyBinary` executes
+   the downloaded file (`<path> version`). A PR that reorders those, or that makes a
+   missing/unmatched checksum non-fatal, reopens the hole. Don't accept an executable-bit
+   plus version-string check as "integrity" — that is what the gap was.
 
 7. **`proto/muninn/v1/service.proto`** → regenerate `proto/gen/go/...`. No CI step verifies
    the generated code is current — the reviewer must confirm regen ran. 🪝
@@ -70,8 +73,9 @@ and remain the reviewer's job.
   `all-MiniLM-L6-v2`, while `release.yml` ships `bge-small-en-v1.5` for Windows — CI
   validates a different model than users get. Also the Linux cache key literally says
   `minilm-v2` though the Makefile fetches bge-small.
-- **`muninn upgrade` has no checksum verification** (#600) despite `release.yml` generating
-  `checksums.txt` — a real supply-chain gap.
+- ~~**`muninn upgrade` has no checksum verification** (#600)~~ — fixed. `selfUpdate` now
+  fetches `checksums.txt`, hashes the whole downloaded archive, and verifies before
+  anything executes it. Fails closed if the file is unreachable or the asset isn't listed.
 - **Presets are hand-duplicated** Go ↔ web UI with no parity test.
 - **SDK type drift is warning-only** — no CI gate keeps Python/Node/PHP in sync with
   `types.go`.
