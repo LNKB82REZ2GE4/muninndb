@@ -135,16 +135,21 @@ jobs:
         uses: actions/cache@v4
         with:
           path: internal/plugin/embed/assets
-          key: embed-assets-ort-1.24.2-minilm-v2-windows
+          key: embed-assets-ort-1.24.2-bge-small-en-v1.5-windows
 
+      # Must stay identical to the model release.yml ships for windows/amd64
+      # (see its build-windows job). These drifted apart once: CI validated
+      # all-MiniLM-L6-v2 while releases shipped bge-small-en-v1.5, so the
+      # Windows job was green against a model no user ever ran. Both models are
+      # 384-dimensional, so nothing failed — the embeddings were just different.
       - name: Fetch model assets
         if: steps.asset-cache-win.outputs.cache-hit != 'true'
         run: |
           New-Item -ItemType Directory -Path internal/plugin/embed/assets -Force | Out-Null
           Write-Host "Downloading model..."
-          Invoke-WebRequest -Uri "https://huggingface.co/Xenova/all-MiniLM-L6-v2/resolve/main/onnx/model_int8.onnx" -OutFile "internal/plugin/embed/assets/model_int8.onnx"
+          Invoke-WebRequest -Uri "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main/onnx/model_int8.onnx" -OutFile "internal/plugin/embed/assets/model_int8.onnx"
           Write-Host "Downloading tokenizer..."
-          Invoke-WebRequest -Uri "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json" -OutFile "internal/plugin/embed/assets/tokenizer.json"
+          Invoke-WebRequest -Uri "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json" -OutFile "internal/plugin/embed/assets/tokenizer.json"
         shell: pwsh
 
       - name: Fetch ORT DLL
@@ -429,8 +434,12 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Pinned, not @latest: an unpinned tool makes this job non-reproducible and
+      # lets an upstream release change CI behaviour without a commit here. The
+      # vulnerability database is still fetched fresh at run time, so pinning the
+      # binary does not stale the findings.
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
 
       - name: Run govulncheck
         run: govulncheck ./...
