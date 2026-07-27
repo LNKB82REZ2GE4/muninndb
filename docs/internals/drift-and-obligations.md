@@ -4,6 +4,12 @@ MuninnDB has many surfaces that must stay in sync but mostly *aren't* checked au
 This is where "you changed X but didn't update Y" bugs live. A reviewer must walk this list
 for any PR that touches a synced surface.
 
+Obligations marked 🪝 are additionally warned about by `.claude/hooks/drift-guard.mjs`, a
+PostToolUse hook that fires when Claude Code edits the triggering path. It is a reminder,
+not a gate: it warns once per session, stays quiet if you have already touched the
+corresponding surface, and never blocks. The unmarked obligations need judgment or a build,
+and remain the reviewer's job.
+
 ## "If a PR touches X, it must also do Y"
 
 1. **An MCP tool handler** (`internal/mcp/*.go`) → update `allMCPTools` in
@@ -15,18 +21,18 @@ for any PR that touches a synced surface.
 2. **A REST route or handler** (`internal/transport/rest/`) → update
    `internal/transport/rest/openapi.yaml` and pass `npx @redocly/cli lint`. The CI
    route-count parity check is **informational only** (±5 tolerance) and cannot see
-   field-level drift — so this is a manual reviewer obligation, not a gate.
+   field-level drift — so this is a manual reviewer obligation, not a gate. 🪝
 
 3. **REST request/response types** (`internal/transport/rest/types.go`) → check
    `sdk/python`, `sdk/node`, `sdk/php` (and Kotlin/Swift/Go) for the corresponding change.
-   **There is no automated check** — only the `.claude/hookify.sdk-types-drift.local.md`
-   warning. Manual.
+   **There is no automated check** — nothing verifies SDK parity in CI. Claude Code users
+   get a warning from `.claude/hooks/drift-guard.mjs`; otherwise manual. 🪝
 
 4. **A plasticity preset value** (`internal/auth/plasticity.go`) → update the web-UI preset
    cards (`web/templates/index.html`) and the JS descriptions/radar data
    (`web/static/js/app.js`), and any docs table. Presets are **hand-duplicated** across Go
    and the web UI with no parity test — a known drift surface. If you add a preset, also
-   add a `reflect.DeepEqual`-style pinning test if it's derived from another (see #599).
+   add a `reflect.DeepEqual`-style pinning test if it's derived from another (see #599). 🪝
 
 5. **The embed model or ORT version** (`Makefile`) → update **all** of: `ci.yml` cache keys
    (Linux *and* Windows jobs), `release.yml` matrix cache keys (5 platforms), and the
@@ -38,7 +44,7 @@ for any PR that touches a synced surface.
    already publishes). Don't accept an executable-bit + version-string check as "integrity."
 
 7. **`proto/muninn/v1/service.proto`** → regenerate `proto/gen/go/...`. No CI step verifies
-   the generated code is current — the reviewer must confirm regen ran.
+   the generated code is current — the reviewer must confirm regen ran. 🪝
 
 8. **A new Pebble prefix** → see `keyspace-registry.md`: disjoint, and added to
    `internal/prefix/prefix.All()` (the single source of truth). The disjointness tests in
