@@ -69,10 +69,13 @@ and remain the reviewer's job.
 
 ## Live drift found during the guardian audit (worth fixing)
 
-- **Windows CI tests the wrong embedding model.** `ci.yml`'s Windows job hardcodes URLs for
-  `all-MiniLM-L6-v2`, while `release.yml` ships `bge-small-en-v1.5` for Windows — CI
-  validates a different model than users get. Also the Linux cache key literally says
-  `minilm-v2` though the Makefile fetches bge-small.
+- ~~**Windows CI tests the wrong embedding model.**~~ — fixed. `ci.yml`'s Windows job now
+  fetches `bge-small-en-v1.5`, matching `release.yml`, and its cache key was corrected from
+  `minilm-v2`. Note this was a *recurrence*: #455 already fixed the same divergence in
+  `release.yml` and left `ci.yml` behind. Both models are 384-dim, so nothing ever failed —
+  which is exactly why it survived. When changing the model, grep for the old name across
+  `ci.yml`, `release.yml`, `Makefile`, `Dockerfile`, and `docker-compose.yml`; the label
+  appears in prose comments that no test covers.
 - ~~**`muninn upgrade` has no checksum verification** (#600)~~ — fixed. `selfUpdate` now
   fetches `checksums.txt`, hashes the whole downloaded archive, and verifies before
   anything executes it. Fails closed if the file is unreachable or the asset isn't listed.
