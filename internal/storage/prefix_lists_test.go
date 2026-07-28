@@ -80,7 +80,7 @@ func TestClearVaultDataPrefixes_Scope(t *testing.T) {
 		prefix.AssocWeightIndex, prefix.VaultCount, prefix.Provenance, prefix.BucketMigration,
 		prefix.EntityEngramLink, prefix.Relationship, prefix.LastAccess, prefix.CoOccurrence,
 		prefix.ArchiveAssoc, prefix.RelEntityIndex, prefix.DreamState, prefix.ContentHash,
-		prefix.RecallEvent, prefix.Lease, prefix.RawTagRange,
+		prefix.RecallEvent, prefix.Lease, prefix.EvolveRepairMark, prefix.RawTagRange,
 	}
 	assertPrefixListEqual(t, "clearVaultDataPrefixes", clearVaultDataPrefixes, want)
 }

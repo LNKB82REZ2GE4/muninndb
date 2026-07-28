@@ -53,12 +53,14 @@ const (
 	ContentHash        byte = 0x28
 	RecallEvent        byte = 0x29
 	Lease              byte = 0x2A
+	// EvolveRepairMark (0x2B) — vault-scoped watermark for the one-time startup
+	// repair of evolve-stripped successors (#681/#622). Idempotent: presence of
+	// the mark means the repair already ran for that vault.
+	EvolveRepairMark byte = 0x2B
 	// RawTagRange (0x2C) — ordered raw-tag secondary index (S1). Unlike
 	// TagIndex (0x0C, keyed by Hash(tag) with no range scans), RawTagRange keys
 	// on Hash(tagKey) with the raw tag VALUE bytes sorted after it, enabling
 	// bounded range scans for key:value tag conventions (e.g. "due:2026-07-27").
-	// (0x2B is intentionally left free for the evolve-repair watermark in #681,
-	// which was allocated 0x2B independently; S1 took 0x2C to avoid the collision.)
 	// See docs/internals/keyspace-registry.md for the exact key layout.
 	RawTagRange byte = 0x2C
 	// Capability (0x40/0x41 — clean since #612)
@@ -138,6 +140,7 @@ var registry = []Entry{
 	{ContentHash, "storage", "ContentHash", "vault-scoped-data"},
 	{RecallEvent, "storage", "RecallEvent", "vault-scoped-data"},
 	{Lease, "storage", "Lease", "lease"},
+	{EvolveRepairMark, "storage", "EvolveRepairMark", "vault-scoped-data"},
 	{RawTagRange, "storage", "RawTagRange", "vault-scoped-data"},
 	{Capability, "capability", "Capability", "capability"},
 	{CapabilityVaultIdx, "capability", "CapabilityVaultIdx", "capability"},
