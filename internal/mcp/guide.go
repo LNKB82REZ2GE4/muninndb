@@ -88,7 +88,7 @@ func generateGuide(vaultName string, resolved auth.ResolvedPlasticity, stats eng
 	b.WriteString("- **muninn_link** — Create associations between memories\n")
 	b.WriteString("- **muninn_contradictions** — Check for known contradictions\n")
 	b.WriteString("- **muninn_status** — Get vault health and stats\n")
-	b.WriteString("- **muninn_evolve** — Update a memory with new information\n")
+	b.WriteString("- **muninn_evolve** — Update a memory with new information (optional `entities` replaces the carried entity set when the update changed what the memory is about; optional `importance` and `effective_at`)\n")
 	b.WriteString("- **muninn_consolidate** — Merge related memories into one\n")
 	if resolved.MultiUser {
 		b.WriteString("- **muninn_session** — Recent memory activity across ALL users of this shared vault (admin/audit)\n")

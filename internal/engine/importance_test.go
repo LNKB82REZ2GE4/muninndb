@@ -102,7 +102,7 @@ func TestEvolveImportanceInheritance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	newID, err := eng.EvolveAt(ctx, vault, resp.ID, "importance evolve v2", "update", nil, "", time.Time{}, nil)
+	newID, err := eng.EvolveAt(ctx, vault, resp.ID, "importance evolve v2", "update", nil, "", nil, nil, time.Time{})
 	if err != nil {
 		t.Fatalf("EvolveAt: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestEvolveImportanceInheritance(t *testing.T) {
 	}
 
 	// Explicit override wins.
-	overrideID, err := eng.EvolveAt(ctx, vault, newID.String(), "importance evolve v3", "update", nil, "", time.Time{}, f32ptr(0.3))
+	overrideID, err := eng.EvolveAt(ctx, vault, newID.String(), "importance evolve v3", "update", nil, "", nil, f32ptr(0.3), time.Time{})
 	if err != nil {
 		t.Fatalf("EvolveAt override: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestEvolveImportanceInheritance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Write plain: %v", err)
 	}
-	plainV2, err := eng.EvolveAt(ctx, vault, plain.ID, "importance evolve unset v2", "update", nil, "", time.Time{}, nil)
+	plainV2, err := eng.EvolveAt(ctx, vault, plain.ID, "importance evolve unset v2", "update", nil, "", nil, nil, time.Time{})
 	if err != nil {
 		t.Fatalf("EvolveAt plain: %v", err)
 	}

@@ -720,6 +720,29 @@ func (s *MCPServer) handleEvolve(ctx context.Context, w http.ResponseWriter, id 
 	if c, ok := args["concept"].(string); ok {
 		evolveConcept = c
 	}
+	// Optional inline entities — same shape and normalization as remember's.
+	// When present they REPLACE the entity links otherwise carried forward
+	// from the predecessor.
+	var evolveEntities []mbp.InlineEntity
+	if entitiesAny, ok := args["entities"].([]any); ok {
+		for i, eAny := range entitiesAny {
+			if i >= 20 {
+				break
+			}
+			eMap, ok := eAny.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := eMap["name"].(string)
+			typ, _ := eMap["type"].(string)
+			name = strings.TrimSpace(norm.NFKC.String(name))
+			typ = normalizeEntityType(typ)
+			if name == "" || typ == "" {
+				continue
+			}
+			evolveEntities = append(evolveEntities, mbp.InlineEntity{Name: name, Type: typ})
+		}
+	}
 	// effective_at: valid-time boundary between predecessor and successor
 	// (default now). The old version's ValidUntil and the new version's
 	// ValidFrom both become this moment.
@@ -739,7 +762,7 @@ func (s *MCPServer) handleEvolve(ctx context.Context, w http.ResponseWriter, id 
 		sendError(w, id, -32602, "invalid params: 'importance' must be a number in [0,1]")
 		return
 	}
-	result, err := s.engine.Evolve(ctx, vault, engramID, newContent, reason, evolveEmb, evolveConcept, effectiveAt, evolveImportance)
+	result, err := s.engine.Evolve(ctx, vault, engramID, newContent, reason, evolveEmb, evolveConcept, evolveEntities, evolveImportance, effectiveAt)
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return

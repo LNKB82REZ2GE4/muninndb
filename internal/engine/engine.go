@@ -3265,22 +3265,25 @@ type EngineSessionEntry struct {
 
 // Evolve creates a new version of an existing engram and soft-deletes the old one.
 // concept overrides the inherited concept label; empty string inherits verbatim (#483).
+// entities, when non-empty, REPLACE the entity links otherwise carried forward
+// from the predecessor — the update changed what the memory is about.
 // All three writes are committed in a single atomic Pebble batch.
 func (e *Engine) Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string) (storage.ULID, error) {
-	return e.EvolveAt(ctx, vault, oldID, newContent, reason, embedding, concept, time.Time{}, nil)
+	return e.EvolveAt(ctx, vault, oldID, newContent, reason, embedding, concept, nil, nil, time.Time{})
 }
 
-// EvolveAt is Evolve with an explicit valid-time boundary: effectiveAt is the
-// application-time moment the new version became true — it becomes the
-// successor's ValidFrom and the predecessor's ValidUntil stamp (half-open
-// [from, until) windows meet exactly). The zero time defaults to now.
-//
-// importance overrides the successor's caller-asserted importance (clamped
-// [0,1], explicit 0 quantized to 0.01 — same rules as Write). nil inherits
-// the predecessor's explicitly asserted importance verbatim: an unset (0)
-// predecessor stays unset, so a type-derived default keeps deriving from the
-// (also inherited) MemoryType rather than being frozen into the record.
-func (e *Engine) EvolveAt(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string, effectiveAt time.Time, importance *float32) (storage.ULID, error) {
+// EvolveAt is Evolve with three optional extras. entities, when non-nil,
+// replaces the carried entity set (the update changed what the memory is
+// about); nil carries the predecessor's entities forward as before. importance
+// overrides the successor's caller-asserted importance (clamped [0,1], explicit
+// 0 quantized to 0.01, same rules as Write); nil inherits the predecessor's
+// explicitly asserted importance verbatim (an unset predecessor stays unset, so
+// a type-derived default keeps deriving from the inherited MemoryType rather
+// than being frozen into the record). effectiveAt is the application-time moment
+// the new version became true — it becomes the successor's ValidFrom and the
+// predecessor's ValidUntil stamp (half-open [from, until) windows meet exactly);
+// the zero time defaults to now.
+func (e *Engine) EvolveAt(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string, entities []mbp.InlineEntity, importance *float32, effectiveAt time.Time) (storage.ULID, error) {
 	// Append-mode credentials cannot evolve (modify an existing memory). Guarding
 	// EvolveAt covers Evolve too, since Evolve delegates here (#687 + valid-time).
 	if auth.AppendFromContext(ctx) {
@@ -3372,20 +3375,23 @@ func (e *Engine) EvolveAt(ctx context.Context, vault, oldID, newContent, reason 
 	// from FindByEntity and entity scoring from the moment it was evolved.
 	// The link and relationship keys are queued into the same atomic batch as
 	// the engram writes; the mention-count and co-occurrence ledgers are funded
-	// post-commit (see below).
+	// post-commit (see below). Caller-supplied inline entities suppress the
+	// carry entirely — they replace the set rather than merging with it.
 	var carriedEntities []string
 	var carriedRels []storage.RelationshipRecord
-	if err := e.store.ScanEngramEntities(ctx, wsPrefix, oldULID, func(name string) error {
-		carriedEntities = append(carriedEntities, name)
-		return nil
-	}); err != nil {
-		return storage.ULID{}, fmt.Errorf("evolve: scan predecessor entities: %w", err)
-	}
-	if err := e.store.ScanEngramRelationships(ctx, wsPrefix, oldULID, func(rec storage.RelationshipRecord) error {
-		carriedRels = append(carriedRels, rec)
-		return nil
-	}); err != nil {
-		return storage.ULID{}, fmt.Errorf("evolve: scan predecessor relationships: %w", err)
+	if len(entities) == 0 {
+		if err := e.store.ScanEngramEntities(ctx, wsPrefix, oldULID, func(name string) error {
+			carriedEntities = append(carriedEntities, name)
+			return nil
+		}); err != nil {
+			return storage.ULID{}, fmt.Errorf("evolve: scan predecessor entities: %w", err)
+		}
+		if err := e.store.ScanEngramRelationships(ctx, wsPrefix, oldULID, func(rec storage.RelationshipRecord) error {
+			carriedRels = append(carriedRels, rec)
+			return nil
+		}); err != nil {
+			return storage.ULID{}, fmt.Errorf("evolve: scan predecessor relationships: %w", err)
+		}
 	}
 
 	// Build the supersedes association (new → old).
@@ -3463,9 +3469,54 @@ func (e *Engine) EvolveAt(ctx context.Context, vault, oldID, newContent, reason 
 		}
 	}
 
-	// Mark entity extraction complete when the successor carries a curated set,
-	// so the retroactive enrichment provider does not re-extract over it.
-	if len(carriedEntities) > 0 {
+	// Caller-supplied inline entities replace the carry: the update changed what
+	// the memory is about. These are genuinely new mentions, so they take the
+	// same path remember's inline entities do — record upsert (which funds the
+	// mention count), link, and co-occurrence bookkeeping included.
+	if len(entities) > 0 {
+		var linkedEntityNames []string
+		for _, ent := range entities {
+			typ := strings.ToLower(strings.TrimSpace(ent.Type))
+			if typ == "" {
+				typ = "other"
+			}
+			record := storage.EntityRecord{
+				Name:       ent.Name,
+				Type:       typ,
+				Confidence: 1.0,
+			}
+			if err := e.store.UpsertEntityRecord(ctx, record, "inline"); err != nil {
+				slog.Warn("engine: evolve: failed to store inline entity", "name", ent.Name, "err", err)
+				continue
+			}
+			if err := e.store.WriteEntityEngramLink(ctx, wsPrefix, newULID, ent.Name); err != nil {
+				slog.Warn("engine: evolve: failed to link inline entity", "name", ent.Name, "err", err)
+				continue
+			}
+			linkedEntityNames = append(linkedEntityNames, ent.Name)
+		}
+		for i := 0; i < len(linkedEntityNames); i++ {
+			for j := i + 1; j < len(linkedEntityNames); j++ {
+				if err := e.store.IncrementEntityCoOccurrence(ctx, wsPrefix, linkedEntityNames[i], linkedEntityNames[j]); err != nil {
+					slog.Warn("engine: evolve: failed to increment co-occurrence", "vault", vault, "engram", newULID.String(), "entity_a", linkedEntityNames[i], "entity_b", linkedEntityNames[j], "err", err)
+				}
+				if err := e.store.UpsertRelationshipRecord(ctx, wsPrefix, newULID, storage.RelationshipRecord{
+					FromEntity: linkedEntityNames[i],
+					ToEntity:   linkedEntityNames[j],
+					RelType:    "co_occurs_with",
+					Weight:     0.3,
+					Source:     "co-occurrence",
+				}); err != nil {
+					slog.Warn("engine: evolve: failed to upsert co_occurs_with relationship", "vault", vault, "engram", newULID.String(), "entity_a", linkedEntityNames[i], "entity_b", linkedEntityNames[j], "err", err)
+				}
+			}
+		}
+	}
+
+	// Mark entity extraction complete whenever the successor carries a curated
+	// set (carried or inline), so the retroactive enrichment provider does not
+	// re-extract over it.
+	if len(carriedEntities) > 0 || len(entities) > 0 {
 		existingFlags, _ := e.store.GetDigestFlags(ctx, plugin.ULID(newULID))
 		if err := e.store.SetDigestFlag(ctx, newULID, existingFlags|plugin.DigestEntities); err != nil {
 			slog.Warn("engine: evolve: failed to set DigestEntities flag", "id", newULID.String(), "err", err)

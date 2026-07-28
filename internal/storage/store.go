@@ -35,7 +35,7 @@ type StoreBatch interface {
 	UpdateEngramState(ctx context.Context, ws [8]byte, id ULID, newState LifecycleState) error
 	// SupersedeEngram queues a soft-delete PLUS a ValidUntil stamp for an
 	// existing engram in one re-encode (the evolve write path, COG-19:
-	// invalidation is a stamp, never a delete — the soft-delete hides the
+	// invalidation is a stamp, never a delete. The soft-delete hides the
 	// predecessor from the present; the stamp records when it stopped being
 	// true). An already-closed ValidUntil is preserved (evolving an
 	// already-expired fact must not destroy the earlier window end).

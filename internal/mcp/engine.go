@@ -26,12 +26,13 @@ type EngineInterface interface {
 
 	// Higher-level cognitive operations (tools 1-11)
 	GetContradictions(ctx context.Context, vault string) ([]ContradictionPair, error)
-	// Evolve replaces a memory with a new version. effectiveAt is the
-	// valid-time moment the new version became true (predecessor's ValidUntil
-	// stamp = successor's ValidFrom); the zero time defaults to now.
-	// importance overrides the successor's caller-asserted importance; nil
-	// inherits the predecessor's explicit importance (unset stays unset).
-	Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string, effectiveAt time.Time, importance *float32) (*WriteResult, error)
+	// Evolve replaces a memory with a new version. entities, when non-nil,
+	// replaces the carried entity set. importance overrides the successor's
+	// caller-asserted importance (nil inherits the predecessor's explicit
+	// importance, unset stays unset). effectiveAt is the valid-time moment the
+	// new version became true (predecessor's ValidUntil stamp = successor's
+	// ValidFrom); the zero time defaults to now.
+	Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string, entities []mbp.InlineEntity, importance *float32, effectiveAt time.Time) (*WriteResult, error)
 	Consolidate(ctx context.Context, vault string, ids []string, mergedContent string) (*ConsolidateResult, error)
 	Session(ctx context.Context, vault string, since time.Time) (*SessionSummary, error)
 	Decide(ctx context.Context, vault, decision, rationale string, alternatives, evidenceIDs []string) (*WriteResult, error)
