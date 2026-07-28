@@ -89,6 +89,14 @@ type WriteRequest struct {
 	MemoryType   uint8         `msgpack:"memory_type,omitempty" json:"memory_type,omitempty"`
 	TypeLabel    string        `msgpack:"type_label,omitempty" json:"type_label,omitempty"`
 
+	// Trust is an optional trust-level label (verified|inferred|external|untrusted).
+	// Empty defaults to "inferred" — the level for all AI-generated content.
+	// Setting "verified" requires a write or full credential (S8): the engine
+	// rejects it under an observe credential. source_type is provenance-derived
+	// and never a write argument, so trust is the only discriminator the write
+	// path exposes for the anti-pollution capture tiering.
+	Trust string `msgpack:"trust,omitempty" json:"trust,omitempty"`
+
 	// Inline enrichment: caller-provided data that bypasses background enrichment.
 	Summary             string                     `msgpack:"summary,omitempty" json:"summary,omitempty"`
 	Entities            []InlineEntity             `msgpack:"entities,omitempty" json:"entities,omitempty"`
@@ -107,6 +115,11 @@ type WriteResponse struct {
 type ReadRequest struct {
 	ID    string `msgpack:"id" json:"id"`
 	Vault string `msgpack:"vault,omitempty" json:"vault,omitempty"`
+	// ReadOnly, when true, suppresses reinforcement side effects (TouchAccess
+	// and the implicit feedback signal) for this read. Set by the MCP/REST/gRPC
+	// surface from the effective read-only decision (S3): observe-mode
+	// credential OR an explicit read_only request flag.
+	ReadOnly bool `msgpack:"read_only,omitempty" json:"read_only,omitempty"`
 }
 
 // ReadResponse returns the full engram data.
@@ -165,6 +178,11 @@ type ActivateRequest struct {
 	CallerOwner string `json:"caller_owner,omitempty" msgpack:"caller_owner,omitempty"`
 	// IncludeLeased disables lease-based visibility filtering (admin/debugging).
 	IncludeLeased bool `json:"include_leased,omitempty" msgpack:"include_leased,omitempty"`
+	// ReadOnly, when true, marks this activation as a pure read (S3): skips
+	// activation-log side effects. Recall/Activate never reinforces
+	// AccessCount regardless of this flag (COG-12) — this only affects the
+	// existing activation-log write path (see engine.go activateCore).
+	ReadOnly bool `json:"read_only,omitempty" msgpack:"read_only,omitempty"`
 }
 
 // Weights defines scoring weight distribution.
@@ -240,6 +258,9 @@ type ActivationItem struct {
 	MemoryType uint8 `msgpack:"memory_type,omitempty" json:"memory_type,omitempty"`
 	// TypeLabel is the writer's free-form type label; empty when none was stored.
 	TypeLabel string `msgpack:"type_label,omitempty" json:"type_label,omitempty"`
+	// Tags carries the engram's stored tags (S4) so muninn_recall doesn't
+	// require a follow-up muninn_read just to see them.
+	Tags []string `msgpack:"tags,omitempty" json:"tags,omitempty"`
 }
 
 // ScoreComponents breaks down the activation score.

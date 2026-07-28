@@ -110,6 +110,9 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 		req.CreatedAt = &t
 	}
 	applyTypeArgs(args, req)
+	if t, ok := args["trust"].(string); ok {
+		req.Trust = t
+	}
 	malformed := applyEnrichmentArgs(args, req)
 	if emb, errMsg := parseEmbeddingArg(args); errMsg != "" {
 		sendError(w, id, -32602, errMsg)
@@ -205,6 +208,9 @@ func (s *MCPServer) handleRememberBatch(ctx context.Context, w http.ResponseWrit
 			req.CreatedAt = &t
 		}
 		applyTypeArgs(m, req)
+		if t, ok := m["trust"].(string); ok {
+			req.Trust = t
+		}
 		malformed := applyEnrichmentArgs(m, req)
 		if emb, errMsg := parseEmbeddingArg(m); errMsg != "" {
 			sendError(w, id, -32602, fmt.Sprintf("invalid params: memories[%d].%s", i, strings.TrimPrefix(errMsg, "invalid params: ")))
@@ -311,12 +317,19 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 		modePreset = preset
 	}
 
+	readOnly, roErrMsg := resolveReadOnly(ctx, args)
+	if roErrMsg != "" {
+		sendError(w, id, -32001, roErrMsg)
+		return
+	}
+
 	req := &mbp.ActivateRequest{
 		Vault:      vault,
 		Context:    contexts,
 		Threshold:  threshold,
 		MaxResults: limit,
 		Profile:    profile,
+		ReadOnly:   readOnly,
 	}
 
 	// Ownership-lease work-queue visibility (#548).
@@ -471,7 +484,13 @@ func (s *MCPServer) handleRead(ctx context.Context, w http.ResponseWriter, id js
 		sendError(w, id, -32602, "invalid params: 'id' is required")
 		return
 	}
-	resp, err := s.engine.Read(ctx, &mbp.ReadRequest{ID: engramID, Vault: vault})
+	readOnly, roErrMsg := resolveReadOnly(ctx, args)
+	if roErrMsg != "" {
+		sendError(w, id, -32001, roErrMsg)
+		return
+	}
+
+	resp, err := s.engine.Read(ctx, &mbp.ReadRequest{ID: engramID, Vault: vault, ReadOnly: readOnly})
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return
@@ -864,7 +883,25 @@ func (s *MCPServer) handleWhereLeftOff(ctx context.Context, w http.ResponseWrite
 		limit = 50
 	}
 
-	entries, err := s.engine.WhereLeftOff(ctx, vault, limit)
+	// S3: WhereLeftOff has no write side effects regardless of read_only (it
+	// never reinforces — see engine_where_left_off.go), so there is nothing
+	// to set on the downstream call. Still validate/reject for API
+	// consistency with muninn_recall/muninn_read (RFC S3 requires all three).
+	if _, roErrMsg := resolveReadOnly(ctx, args); roErrMsg != "" {
+		sendError(w, id, -32001, roErrMsg)
+		return
+	}
+
+	var excludeTypeLabels []string
+	if raw, ok := args["exclude_type_labels"].([]any); ok {
+		for _, v := range raw {
+			if s, ok := v.(string); ok && s != "" {
+				excludeTypeLabels = append(excludeTypeLabels, s)
+			}
+		}
+	}
+
+	entries, err := s.engine.WhereLeftOff(ctx, vault, limit, excludeTypeLabels)
 	if err != nil {
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return

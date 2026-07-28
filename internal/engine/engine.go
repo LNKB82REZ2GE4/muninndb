@@ -37,6 +37,15 @@ import (
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 )
 
+// dedupReinforceCap is the minimum interval between content-hash dedup
+// reinforcements (#682) for a single engram. It applies ONLY to the
+// content-hash/dedup "re-experienced" channel (Write and WriteBatch), never to
+// explicit read-by-id (engine.Read) — five explicit reads of the same engram
+// must still land AccessCount at 5. Without this cap, re-submitting identical
+// content in a tight loop (e.g. a flaky retry) would runaway-inflate
+// AccessCount in a way no human/agent "access" actually occurred.
+const dedupReinforceCap = 24 * time.Hour
+
 // CognitiveForwarder is implemented by ClusterCoordinator on Lobe nodes.
 // Using an interface avoids an import cycle between engine and replication.
 type CognitiveForwarder interface {
@@ -230,6 +239,20 @@ type Engine struct {
 	// MCPServer.idempotencyLocks but lives on the engine so gRPC and REST callers
 	// get the same protection.
 	idempotencyLocks sync.Map
+
+	// dedupReinforceTimes tracks, per engram ID, the last time the content-hash
+	// dedup channel (#682) reinforced it via TouchAccess — keyed separately
+	// from Engram.LastAccess because LastAccess is set to "now" by the ORIGINAL
+	// write too, so gating on LastAccess directly would make the very first
+	// duplicate-content submission (the common case: a retry moments after the
+	// original write) look like it's already "within the cap window" and
+	// wrongly skip reinforcement. This map remembers only dedup-channel
+	// touches, so the 1/day cap (dedupReinforceCap) applies to repeated
+	// dedup hits, not to the first one. In-memory/process-local — a soft
+	// anti-runaway cap, not a security invariant — same pattern as
+	// idempotencyLocks above; bounded by the number of distinct engrams that
+	// have ever received a duplicate-content write.
+	dedupReinforceTimes sync.Map
 }
 
 const contentHashStripes = 256
@@ -239,6 +262,30 @@ const contentHashStripes = 256
 func (e *Engine) getIdempotencyLock(opID string) *sync.Mutex {
 	v, _ := e.idempotencyLocks.LoadOrStore(opID, &sync.Mutex{})
 	return v.(*sync.Mutex)
+}
+
+// shouldDedupReinforce reports whether id is due for a content-hash dedup
+// reinforcement (#682). This is a SOFT rate cap, not a strict mutex: the
+// first-ever hit for an id is claimed atomically (LoadOrStore), but the
+// cap-window-elapsed path below is check-then-Store, so two callers that race
+// past the window for the same id can both reinforce once. That is acceptable —
+// the cap only bounds runaway reinforcement from repeated duplicate writes to
+// roughly one per window; an occasional extra bump under a rare exact race does
+// not distort decay. If it ever needs to be strict, switch the elapsed path to
+// CompareAndSwap on a comparable stored value.
+func (e *Engine) shouldDedupReinforce(id storage.ULID) bool {
+	now := time.Now()
+	v, loaded := e.dedupReinforceTimes.LoadOrStore(id, now)
+	if !loaded {
+		return true // first time this id has hit the dedup channel
+	}
+	last := v.(time.Time)
+	if now.Sub(last) < dedupReinforceCap {
+		return false
+	}
+	// Cap window elapsed — claim it for this call (soft: see doc comment).
+	e.dedupReinforceTimes.Store(id, now)
+	return true
 }
 
 // contentHashLock returns the stripe mutex for the given (vault prefix, content hash) pair.
@@ -875,6 +922,30 @@ func (e *Engine) Hello(ctx context.Context, req *mbp.HelloRequest) (*mbp.HelloRe
 	}, nil
 }
 
+// resolveTrust validates a caller-supplied trust label and enforces the S8/D4
+// credential gate: the elevated "verified" level (human-confirmed / admin-
+// certified) may only be set by a write or full credential, never by an
+// observe credential. An empty label defaults to TrustInferred — the level for
+// all AI-generated content — preserving the pre-S8 behaviour for callers that
+// do not pass trust. source_type is provenance-derived and never a write
+// argument, so trust is the sole discriminator the write path exposes.
+func resolveTrust(ctx context.Context, label string) (storage.TrustLevel, error) {
+	if label == "" {
+		return storage.TrustInferred, nil
+	}
+	level, err := storage.ParseTrustLevel(label)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrInvalidRequest, err)
+	}
+	if level == storage.TrustVerified {
+		mode, _ := ctx.Value(auth.ContextMode).(string)
+		if mode != auth.ModeFull && mode != auth.ModeWrite {
+			return 0, fmt.Errorf("%w: trust=verified requires a write or full credential", ErrInvalidRequest)
+		}
+	}
+	return level, nil
+}
+
 // Write implements mbp.EngineAPI.Write.
 func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteResponse, error) {
 	writeStart := time.Now()
@@ -914,19 +985,22 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 	if existingID, err := e.store.GetContentHash(ctx, wsPrefix, contentHash); err == nil && existingID != (storage.ULID{}) {
 		// A mapping exists — verify the engram is still live (not soft-deleted).
 		if existingEng, err := e.store.GetEngram(ctx, wsPrefix, existingID); err == nil && existingEng.State != storage.StateSoftDeleted {
-			// Reinforce: increment access count and update LastAccess
-			// to signal that this content is being re-experienced.
-			// Release the stripe lock before UpdateMetadata — the dedup decision
-			// is already made and UpdateMetadata doesn't need protection.
+			// Reinforce: increment access count and update LastAccess to signal
+			// that this content is being re-experienced. Release the stripe
+			// lock before TouchAccess — the dedup decision is already made and
+			// the per-engram reinforcement below has its own lock (#682).
+			//
+			// 1/day cap (dedup channel ONLY — explicit read-by-id is uncapped,
+			// see engine.Read): re-submitting identical content in a tight loop
+			// must not runaway-inflate AccessCount the way N distinct reads-by-id
+			// legitimately do. shouldDedupReinforce (not LastAccess age) is the
+			// gate — see its doc comment for why LastAccess alone can't tell "the
+			// first duplicate right after the original write" apart from "already
+			// reinforced recently".
 			unlockContentHash()
-			_ = e.store.UpdateMetadata(ctx, wsPrefix, existingID, &storage.EngramMeta{
-				AccessCount: existingEng.AccessCount + 1,
-				LastAccess:  time.Now(),
-				State:       existingEng.State,
-				Confidence:  existingEng.Confidence,
-				Relevance:   existingEng.Relevance,
-				Stability:   existingEng.Stability,
-			})
+			if e.shouldDedupReinforce(existingID) {
+				_ = e.store.TouchAccess(ctx, wsPrefix, existingID)
+			}
 			return &mbp.WriteResponse{
 				ID:        existingID.String(),
 				CreatedAt: existingEng.CreatedAt.UnixNano(),
@@ -961,6 +1035,12 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		callerRelationships = req.Relationships
 	}
 
+	// Resolve trust (S8): default inferred; "verified" gated to write/full creds.
+	trust, trustErr := resolveTrust(ctx, req.Trust)
+	if trustErr != nil {
+		return nil, trustErr
+	}
+
 	// Build storage.Engram from request
 	eng := &storage.Engram{
 		Concept:    req.Concept,
@@ -971,7 +1051,7 @@ func (e *Engine) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteRe
 		Embedding:  req.Embedding,
 		MemoryType: storage.MemoryType(req.MemoryType),
 		TypeLabel:  req.TypeLabel,
-		Trust:      storage.TrustInferred, // all new MCP writes default to inferred
+		Trust:      trust,
 	}
 
 	// Apply caller-provided summary directly to the engram.
@@ -1407,15 +1487,13 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 		contentHash := storage.ContentHash(req.Content)
 		if existingID, err := e.store.GetContentHash(ctx, wsPrefix, contentHash); err == nil && existingID != (storage.ULID{}) {
 			if existingEng, err := e.store.GetEngram(ctx, wsPrefix, existingID); err == nil && existingEng.State != storage.StateSoftDeleted {
-				// Reinforce: increment access count and update LastAccess.
-				_ = e.store.UpdateMetadata(ctx, wsPrefix, existingID, &storage.EngramMeta{
-					AccessCount: existingEng.AccessCount + 1,
-					LastAccess:  time.Now(),
-					State:       existingEng.State,
-					Confidence:  existingEng.Confidence,
-					Relevance:   existingEng.Relevance,
-					Stability:   existingEng.Stability,
-				})
+				// Reinforce via TouchAccess (#682) — same locked primitive and
+				// same 1/day dedup-channel cap as the single-Write path above;
+				// this unlocked GetEngram→UpdateMetadata pair was the identical
+				// STO-2 race, just in the batch path.
+				if e.shouldDedupReinforce(existingID) {
+					_ = e.store.TouchAccess(ctx, wsPrefix, existingID)
+				}
 				responses[i] = &mbp.WriteResponse{
 					ID:        existingID.String(),
 					CreatedAt: existingEng.CreatedAt.UnixNano(),
@@ -1449,6 +1527,14 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 			callerRelationships = req.Relationships
 		}
 
+		// Resolve trust (S8): default inferred; "verified" gated to write/full
+		// creds. A bad/ungated trust fails only this item, not the whole batch.
+		trust, trustErr := resolveTrust(ctx, req.Trust)
+		if trustErr != nil {
+			errs[i] = trustErr
+			continue
+		}
+
 		eng := &storage.Engram{
 			Concept:    req.Concept,
 			Content:    req.Content,
@@ -1458,7 +1544,7 @@ func (e *Engine) WriteBatch(ctx context.Context, reqs []*mbp.WriteRequest) ([]*m
 			Embedding:  req.Embedding,
 			MemoryType: storage.MemoryType(req.MemoryType),
 			TypeLabel:  req.TypeLabel,
-			Trust:      storage.TrustInferred, // all new MCP writes default to inferred
+			Trust:      trust,
 		}
 
 		if callerSummary != "" {
@@ -1846,17 +1932,40 @@ func (e *Engine) Read(ctx context.Context, req *mbp.ReadRequest) (*mbp.ReadRespo
 		return nil, fmt.Errorf("get engram: %w", err)
 	}
 
-	// Fire implicit positive feedback signal asynchronously — read = accessed.
-	// spawnFireAndForget ensures Stop() drains this goroutine before DB close.
-	e.spawnFireAndForget(func() {
-		signal := scoring.FeedbackSignal{
-			EngramID:    [16]byte(id),
-			Accessed:    true,
-			ScoreVector: scoring.DefaultWeights(),
-			Timestamp:   time.Now(),
+	// S3: effective read-only = observe-mode credential OR an explicit
+	// req.ReadOnly (already the effective decision computed by the
+	// MCP/REST/gRPC handler). A read-only read must skip BOTH write side
+	// effects below — the implicit feedback signal AND #682's reinforcement —
+	// closing the brief→"verify before acting"→read→reinforce loop for
+	// observe credentials.
+	readOnly := auth.ObserveFromContext(ctx) || req.ReadOnly
+
+	if !readOnly {
+		// Fire implicit positive feedback signal asynchronously — read = accessed.
+		// spawnFireAndForget ensures Stop() drains this goroutine before DB close.
+		e.spawnFireAndForget(func() {
+			signal := scoring.FeedbackSignal{
+				EngramID:    [16]byte(id),
+				Accessed:    true,
+				ScoreVector: scoring.DefaultWeights(),
+				Timestamp:   time.Now(),
+			}
+			e.scoring.RecordFeedback(e.stopCtx, wsPrefix, signal)
+		})
+
+		// #682: reinforce AccessCount/LastAccess for this explicit read-by-id,
+		// gated on the vault's ReinforceOnRead plasticity flag (default true).
+		// Fire-and-forget on e.stopCtx (not the request ctx) — mirrors the
+		// feedback signal above: reinforcement is gated by engine lifecycle,
+		// not request lifecycle, so a client disconnect must not abort it.
+		// Uncapped (unlike the dedup channel): N explicit reads-by-id must
+		// land AccessCount at N.
+		if e.ResolveVaultPlasticity(req.Vault).ReinforceOnRead {
+			e.spawnFireAndForget(func() {
+				_ = e.store.TouchAccess(e.stopCtx, wsPrefix, id)
+			})
 		}
-		e.scoring.RecordFeedback(e.stopCtx, wsPrefix, signal)
-	})
+	}
 
 	// Collect entities linked to this engram (0x20 forward index).
 	var entities []mbp.InlineEntity
@@ -2002,7 +2111,10 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	}
 
 	// Fix 4: Observe mode is a pure read — skip activation log side effects.
-	actReq.ReadOnly = auth.ObserveFromContext(ctx)
+	// S3: an explicit req.ReadOnly (already the effective value computed by the
+	// MCP/REST/gRPC handler — credential-observe OR request read_only) also
+	// forces this; it can only ADD read-only-ness, never remove it.
+	actReq.ReadOnly = auth.ObserveFromContext(ctx) || req.ReadOnly
 
 	// Convert weights if provided; otherwise apply preset weights from Plasticity config.
 	// All scoring goes through ACT-R; legacy temporal path is kept in code but not reachable for now.
@@ -2133,7 +2245,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// After BFS produces a scored set, any engram sharing a named entity with a
 	// top-N result receives a small boost. This surfaces entity-linked engrams
 	// that have no direct association edge to the query-matching engrams.
-	result.Activations = e.applyEntityBoost(ctx, wsPrefix, result.Activations)
+	result.Activations = e.applyEntityBoost(ctx, wsPrefix, result.Activations, actReq.Threshold)
 	// Re-apply MaxResults: entity boost may have appended engrams beyond the limit.
 	// applyEntityBoost re-sorts by score descending, so truncation preserves top-K.
 	if actReq.MaxResults > 0 && len(result.Activations) > actReq.MaxResults {
@@ -2160,6 +2272,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 			Trust:       uint8(scored.Engram.Trust),
 			MemoryType:  uint8(scored.Engram.MemoryType),
 			TypeLabel:   scored.Engram.TypeLabel,
+			Tags:        scored.Engram.Tags,
 		}
 
 		items[i].ScoreComponents = mbp.ScoreComponents{
@@ -3317,26 +3430,21 @@ func (e *Engine) Decide(ctx context.Context, vault, decision, rationale string, 
 
 // RecordAccess increments the access count and updates the last-accessed timestamp
 // for the engram identified by id in the given vault.
+//
+// Thin wrapper over storage.TouchAccess (#682) — previously this did its own
+// unlocked GetEngram→UpdateMetadata read-modify-write, which raced
+// CompareAndSet/DeleteEngram on the same id (STO-2). TouchAccess holds the
+// per-engram stripe lock across the whole RMW.
 func (e *Engine) RecordAccess(ctx context.Context, vault, id string) error {
 	ws := e.store.ResolveVaultPrefix(vault)
 	ulid, err := storage.ParseULID(id)
 	if err != nil {
 		return fmt.Errorf("record_access: parse id: %w", err)
 	}
-	eng, err := e.store.GetEngram(ctx, ws, ulid)
-	if err != nil {
-		return fmt.Errorf("record_access: get engram: %w", err)
+	if err := e.store.TouchAccess(ctx, ws, ulid); err != nil {
+		return fmt.Errorf("record_access: %w", err)
 	}
-	meta := &storage.EngramMeta{
-		State:       eng.State,
-		Confidence:  eng.Confidence,
-		Relevance:   eng.Relevance,
-		Stability:   eng.Stability,
-		AccessCount: eng.AccessCount + 1,
-		UpdatedAt:   eng.UpdatedAt,
-		LastAccess:  time.Now(),
-	}
-	return e.store.UpdateMetadata(ctx, ws, ulid, meta)
+	return nil
 }
 
 // ResolveVaultPlasticity returns the resolved plasticity config for a vault,
@@ -3711,5 +3819,20 @@ func (e *Engine) RecordFeedback(ctx context.Context, vault, engramID string, use
 	e.spawnFireAndForget(func() {
 		e.scoring.RecordFeedback(e.stopCtx, wsPrefix, signal)
 	})
+
+	// #682: useful=true is an explicit positive signal — reinforce
+	// AccessCount/LastAccess the same as an explicit read. This is NEW wiring
+	// (previously feedback only updated vault-level scoring weights, never
+	// per-engram AccessCount). useful=false records negative feedback only;
+	// it must not decrement or otherwise touch AccessCount. Unconditional
+	// (not gated by ReinforceOnRead — that flag governs the passive
+	// read-implies-access channel; an explicit "this was useful" signal is a
+	// different, always-on channel) and uncapped, mirroring explicit
+	// read-by-id.
+	if useful {
+		e.spawnFireAndForget(func() {
+			_ = e.store.TouchAccess(e.stopCtx, wsPrefix, ulid)
+		})
+	}
 	return nil
 }

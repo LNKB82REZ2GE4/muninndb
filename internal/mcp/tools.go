@@ -29,6 +29,7 @@ func allToolDefinitions() []ToolDefinition {
 					"created_at": map[string]any{"type": "string", "description": "ISO 8601 timestamp for when this memory was created. Defaults to now. Use to seed memories at past or future times."},
 					"type":       map[string]any{"type": "string", "description": "Memory type — either a built-in name (fact, decision, observation, preference, issue, task, procedure, event, goal, constraint, identity, reference) or a free-form label (e.g. 'architectural_decision', 'coding_pattern'). Built-in names set the enum; free-form labels are stored as type_label with enum defaulting to 'fact'."},
 					"type_label": map[string]any{"type": "string", "description": "Explicit free-form type label (e.g. 'architectural_decision'). Overrides the label inferred from 'type'."},
+					"trust":      map[string]any{"type": "string", "enum": []string{"verified", "inferred", "external", "untrusted"}, "description": "Provenance trust level. Default 'inferred' (all AI-generated content). 'verified' = human-confirmed/admin-certified and requires a write or full credential (rejected for observe credentials). 'external' = imported from another system; 'untrusted' = flagged unreliable."},
 					"summary":    map[string]any{"type": "string", "description": "One-line summary of what this memory captures. Providing this skips background summarization."},
 					"entities": map[string]any{
 						"type":        "array",
@@ -102,6 +103,7 @@ func allToolDefinitions() []ToolDefinition {
 								"created_at": map[string]any{"type": "string", "description": "ISO 8601 timestamp. Defaults to now."},
 								"type":       map[string]any{"type": "string", "description": "Memory type — built-in name or free-form label."},
 								"type_label": map[string]any{"type": "string", "description": "Explicit free-form type label."},
+								"trust":      map[string]any{"type": "string", "enum": []string{"verified", "inferred", "external", "untrusted"}, "description": "Provenance trust level. Default 'inferred'. 'verified' requires a write or full credential."},
 								"summary":    map[string]any{"type": "string", "description": "One-line summary. Skips background summarization."},
 								"entities": map[string]any{
 									"type": "array",
@@ -222,6 +224,10 @@ func allToolDefinitions() []ToolDefinition {
 						"type":        "boolean",
 						"description": "When true, disables work-queue lease filtering so memories checked out by other owners are also returned (admin/debugging). Default false.",
 					},
+					"read_only": map[string]any{
+						"type":        "boolean",
+						"description": "When true, marks this recall as a pure read that must not trigger any write side effects. Always effectively true for observe-mode credentials -- passing read_only=false with an observe credential is rejected. Default false.",
+					},
 				},
 				"required": []string{"context"},
 			},
@@ -234,6 +240,10 @@ func allToolDefinitions() []ToolDefinition {
 				"properties": map[string]any{
 					"vault": vaultProp,
 					"id":    map[string]any{"type": "string", "description": "Memory ID (ULID)."},
+					"read_only": map[string]any{
+						"type":        "boolean",
+						"description": "When true, this read must not trigger reinforcement (AccessCount/LastAccess bump) or implicit feedback side effects. Always effectively true for observe-mode credentials -- passing read_only=false with an observe credential is rejected. Default false.",
+					},
 				},
 				"required": []string{"id"},
 			},
@@ -573,6 +583,15 @@ func allToolDefinitions() []ToolDefinition {
 					"limit": map[string]any{
 						"type":        "integer",
 						"description": "Max memories to return (default 10, max 50).",
+					},
+					"read_only": map[string]any{
+						"type":        "boolean",
+						"description": "When true, marks this call as a pure read. where_left_off never has write side effects regardless of this flag; it exists for API consistency with muninn_recall/muninn_read. Always effectively true for observe-mode credentials -- passing read_only=false with an observe credential is rejected. Default false.",
+					},
+					"exclude_type_labels": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "string"},
+						"description": "Opt-in: type_label values to skip (e.g. \"session-log\"), so recency scan noise doesn't crowd out real memories. Excluded entries don't count against limit — the scan keeps going to fill it. Default: empty (no exclusion, all types included).",
 					},
 				},
 				"required": []string{},
