@@ -2354,32 +2354,43 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	preBoost := len(result.Activations)
 	result.Activations = e.applyEntityBoost(ctx, wsPrefix, vaultSize, result.Activations, actReq)
 	// Injected engrams count as found: on the boost path, total <
-	// len(activations) was the #569 bypass fingerprint. This covers entity
-	// boost only — applySupersession below may still inject promoted heads
-	// without a TotalFound bump. Known imprecision (scoped follow-up, PR #570
-	// review): an engram that scored above threshold in the pipeline but was
-	// truncated past MaxResults and then re-injected here is counted twice.
+	// len(activations) was the #569 bypass fingerprint. Known imprecision, for
+	// BOTH injectors here and below (scoped follow-up, PR #570 review): an
+	// engram that scored above threshold in the pipeline but was truncated
+	// past MaxResults inside Run() and then re-injected by boost or
+	// supersession is counted twice.
 	result.TotalFound += len(result.Activations) - preBoost
 
 	// Supersedes-aware ranking: promote the current fact over any superseded one
 	// it replaces (injecting it if the query didn't retrieve it), so recall never
 	// leads with a fact it knows is stale. Runs after entity boost and BEFORE
-	// truncation so an injected head is not cut. Pure read-path ranking (no writes).
-	result.Activations = e.applySupersession(ctx, wsPrefix, result.Activations, actReq.MaxResults)
+	// truncation so an injected head is not cut. Chains resolve under the
+	// caller's view through the shared visibility gate (hidden nodes are
+	// traversable but unnameable; no admitted successor → the substitution
+	// abstains whole), and admitted injections count as found, same rule as
+	// boost. injectorNow is shared with the final COG-19 cut below so a
+	// validity boundary cannot fall between the gate's admission and that cut.
+	injectorNow := time.Now()
+	var supInjected int
+	result.Activations, supInjected = e.applySupersession(ctx, wsPrefix, result.Activations, actReq, injectorNow)
+	result.TotalFound += supInjected
 
 	// Final valid-time gate (COG-19: default recall never returns an engram whose
-	// ValidUntil <= now). Phase-6 already gated scored candidates, and entity-boost
-	// injections now enforce the full phase-6 contract (filters, trust, lease,
-	// validity — #569) at injection, but supersession still injects promoted heads
-	// past PassesMetaFilter, so the shared predicate must hold at the last cut
-	// before truncation. Runs AFTER supersession
+	// ValidUntil <= now). Phase-6 gated scored candidates and both injectors
+	// gate their entrants. For supersession this cut is defense in depth at
+	// the same instant (injectorNow); it remains LOAD-BEARING for two paths:
+	// boost runs on its own earlier clock, so a boost injection (or phase-6
+	// survivor) whose validity boundary falls inside that window is admitted,
+	// counted at line ~2340, then swept here — a documented overcount sliver —
+	// and it backstops any future result-set mutation that forgets the gate.
+	// Runs AFTER supersession
 	// on purpose: a manual supersede's now-expired predecessor is dropped only once
 	// its current head has been promoted/injected, so a query matching only the
 	// stale phrasing still returns the current fact.
 	// NOTE: filter into a NEW slice — the activation engine's async log-drain
 	// goroutine may still be reading the backing array returned by Run(), so
 	// in-place compaction (Activations[:0]) is a data race.
-	gateNow := time.Now()
+	gateNow := injectorNow
 	kept := make([]activation.ScoredEngram, 0, len(result.Activations))
 	for _, s := range result.Activations {
 		if activation.PassesValidity(s.Engram, req.AsOf, req.IncludeInvalid, gateNow) {
