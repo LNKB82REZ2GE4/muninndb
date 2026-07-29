@@ -120,6 +120,17 @@ func runProspectiveHarness(t *testing.T, enabled bool) harnessResult {
 		intentionIDs[i] = id
 	}
 
+	// Deterministically drain the write-time association workers (autoAssoc,
+	// neighborWorker, goalLinkWorker) before the scripted calls. Intend()
+	// writes each intention through the normal Write() path, which enqueues
+	// fire-and-forget jobs to those workers; the BFS candidate pool the
+	// scripted Activate() calls traverse depends on associations (e.g.
+	// RelSupports from goalLinkWorker) those jobs create. Without this the
+	// harness nondeterministically raced its own async write-time workers
+	// under scheduler pressure (flaky under -race/CPU load on every branch,
+	// not specific to any feature change) — see #722.
+	eng.waitWriteTimeIdle()
+
 	var res harnessResult
 	for ci, call := range sc.Calls {
 		resp, err := eng.Activate(ctx, &mbp.ActivateRequest{
@@ -137,6 +148,26 @@ func runProspectiveHarness(t *testing.T, enabled bool) harnessResult {
 		if err != nil {
 			t.Fatalf("call %d Activate: %v", ci, err)
 		}
+		// Drain this call's activation-log submission (drainLog/logCh, see
+		// waitWriteTimeIdle) and then clear it before the NEXT scripted call
+		// runs. phase4HebbianBoost reads the activation log for "was this
+		// candidate's associated target recently activated" — real sessions
+		// are minutes/hours apart, so the log's 3600s recency half-life
+		// normally decays this to ~0 between them. This harness fires 60
+		// calls back-to-back in milliseconds, so without resetting, every
+		// prior call's results stay maximally "recent" for the rest of the
+		// run: an armed intention shares its "prospective" tag with the
+		// other 11 (autoassoc.go links same-tagged engrams), so once ANY
+		// sibling intention has appeared in an earlier call's results, later
+		// intentions accumulate Hebbian boost from that unrelated call and
+		// can outscore their OWN corroborator — which, via the #693
+		// self-focality guard, silently drops their own notice. Draining
+		// (so no in-flight entry survives the reset) then resetting models
+		// the harness's own stated "separate agent session" per call
+		// (see the file doc comment) instead of leaking priming across
+		// them — the residual #722 flake this closes.
+		eng.waitWriteTimeIdle()
+		eng.resetActivationLogForVault(vault)
 
 		dumpResults := func() string {
 			s := ""
@@ -179,7 +210,7 @@ func runProspectiveHarness(t *testing.T, enabled bool) harnessResult {
 			if hit {
 				res.shouldFireHit++
 			} else if enabled {
-				t.Logf("call %d (%q): expected intention %d did not fire (results=%d)", ci, call.Context, call.Want, len(resp.Activations))
+				t.Logf("call %d (%q): expected intention %d did not fire (results=%d) real:%s", ci, call.Context, call.Want, len(resp.Activations), dumpResults())
 			}
 		case "trap":
 			for _, n := range notices {

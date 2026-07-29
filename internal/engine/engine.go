@@ -726,6 +726,18 @@ func (e *Engine) spawnFireAndForget(fn func()) bool {
 	return true
 }
 
+// waitFireAndForgetIdle blocks until every fire-and-forget goroutine spawned
+// so far (RecordFeedback's scoring/TouchAccess writes, Read's reinforcement
+// signal) has finished. Test-only synchronization helper, mirroring
+// autoassoc.Worker.WaitIdle: production callers never await this —
+// fire-and-forget work is deliberately unawaited on the request path.
+// Safe to call only when the caller knows no *other* concurrent request on
+// this Engine is still spawning fire-and-forget work, since the WaitGroup is
+// shared across all callers of spawnFireAndForget.
+func (e *Engine) waitFireAndForgetIdle() {
+	e.fireAndForgetWG.Wait()
+}
+
 // spawnJob tracks fn in the engine's job WaitGroup and launches it as a
 // goroutine. Returns false without spawning if the engine is shutting down.
 // Callers MUST fail the associated job immediately when false is returned.
@@ -743,6 +755,71 @@ func (e *Engine) spawnJob(fn func()) bool {
 		fn()
 	}()
 	return true
+}
+
+// waitWriteTimeIdle blocks until every write-time async worker has finished
+// the work enqueued so far: the three association workers (autoAssoc,
+// neighborWorker, goalLinkWorker) AND the FTS indexer (ftsWorker), all of
+// which run off the Write() hot path (see the Intend/Write enqueue sites) so
+// normal callers never await them — recall tolerates their eventual
+// consistency by design. It also drains the activation engine's async log
+// drainer (see below) — not a write-time worker, but folded in here so the
+// harness has a single drain call to make between scripted steps.
+//
+// Test-only synchronization helper: the prospective acceptance harness arms
+// intentions via Intend() (which calls Write()) and then immediately runs
+// scripted Activate() calls that depend both on associations these workers
+// create (RelSupports for the BFS pool) AND on the intention being FTS-indexed
+// (the only recall path with the harness's noop zero-vector embeddings). Async
+// FTS indexing is decoupled from the write hot path (ftsWorker), so without
+// flushing it a scripted call can run before its intention is searchable and
+// the intention silently "does not fire" — the residual harness flake under
+// -race/CPU contention. Draining all of it makes the harness observe steady
+// state before asserting recall. Production scheduling/dispatch is unchanged;
+// this only adds the ability to await it.
+//
+// activation.WaitLogIdle (drainLog/logCh): Run() submits each activation's
+// result set to a buffered channel that a single goroutine drains into
+// assocLog, which phase4HebbianBoost reads on the NEXT call to boost
+// candidates associated with something recently activated. The drainer's
+// eventual consistency ("~1ms lag, half-life 3600s — irrelevant", per its
+// doc comment) is production-safe but breaks a scripted back-to-back
+// harness: call N's log entry can still be in flight when call N+1 runs
+// phase4HebbianBoost, so the same candidate nondeterministically scores with
+// or without that boost — flipping which of two near-tied candidates ranks
+// first (and, downstream, whether NoticesForRecall sees the corroborator or
+// the intention's own engram at rank 0). Refs #722.
+func (e *Engine) waitWriteTimeIdle() {
+	if e.autoAssoc != nil {
+		e.autoAssoc.WaitIdle()
+	}
+	if e.neighborWorker != nil {
+		e.neighborWorker.WaitIdle()
+	}
+	if e.goalLinkWorker != nil {
+		e.goalLinkWorker.WaitIdle()
+	}
+	if e.ftsWorker != nil {
+		// Best-effort in a test helper; the timeout is generous enough that it
+		// never trips for the handful of intentions the harness arms.
+		_ = e.ftsWorker.Flush(10 * time.Second)
+	}
+	if e.activation != nil {
+		e.activation.WaitLogIdle()
+	}
+}
+
+// resetActivationLogForVault clears the activation engine's recorded recent-
+// activations for vault (see activation.ActivationLog.ResetVault). Test-only:
+// callers MUST have already called waitWriteTimeIdle (or otherwise know no
+// Activate() on this vault has an entry still in flight to the log drainer),
+// or the reset can be immediately undone by a late-arriving drain.
+func (e *Engine) resetActivationLogForVault(vault string) {
+	if e.activation == nil {
+		return
+	}
+	ws := e.store.ResolveVaultPrefix(vault)
+	e.activation.ResetLog(wsVaultID(ws))
 }
 
 // beginVaultOp tracks synchronous vault-operation setup work that can still

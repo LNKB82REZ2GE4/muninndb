@@ -268,6 +268,18 @@ type ActivateResponseFrame struct {
 type ActivationStore interface {
 	GetMetadata(ctx context.Context, wsPrefix [8]byte, ids []storage.ULID) ([]*storage.EngramMeta, error)
 	GetEngrams(ctx context.Context, wsPrefix [8]byte, ids []storage.ULID) ([]*storage.Engram, error)
+	// GetEmbedding reads the standalone embedding (0x18 key, ERF v2) for a single
+	// engram. GetEngrams does NOT join this key (embeddings are large and the
+	// join is a hot-path cost not every caller needs), so any post-load cosine
+	// fixup that finds eng.Embedding empty must fall back to this — see
+	// storage.PebbleStore.GetEmbedding and the identical fallback in
+	// internal/consolidation/dedup.go and orient.go.
+	GetEmbedding(ctx context.Context, wsPrefix [8]byte, id storage.ULID) ([]float32, error)
+	// GetEmbeddings batch-reads the standalone embeddings (0x18 keys, ERF v2) for
+	// multiple engrams in one round-trip -- see storage.PebbleStore.GetEmbeddings.
+	// The returned slice is positionally aligned with ids; an id with no stored
+	// embedding gets a nil/empty entry, never an error.
+	GetEmbeddings(ctx context.Context, wsPrefix [8]byte, ids []storage.ULID) ([][]float32, error)
 	// GetLeases batch-reads ownership leases, one per id in order (zero Lease for
 	// unleased engrams). Used for work-queue recall visibility filtering.
 	GetLeases(ctx context.Context, wsPrefix [8]byte, ids []storage.ULID) ([]storage.Lease, error)
@@ -346,6 +358,10 @@ type ActivationEngine struct {
 	logCh     chan logItem
 	logDone   chan struct{}
 	closeOnce sync.Once
+	// logWG tracks in-flight logCh items (Add before enqueue, Done after
+	// drainLog applies the entry to assocLog) so tests can await full log
+	// visibility. See WaitLogIdle.
+	logWG sync.WaitGroup
 }
 
 // New creates a new ActivationEngine.
@@ -406,7 +422,37 @@ func (e *ActivationEngine) drainLog() {
 			EngramIDs: ids,
 			Scores:    scores,
 		})
+		e.logWG.Done()
 	}
+}
+
+// WaitLogIdle blocks until every activation-log entry submitted so far (via
+// the logCh <- logItem send in Run()) has been applied to assocLog by
+// drainLog. Test-only synchronization helper, mirroring autoassoc.Worker's
+// WaitIdle pattern: production callers never await this — phase4HebbianBoost
+// tolerates the drainer's eventual consistency by design (comment on
+// drainLog: "the log may lag by ~1ms but Hebbian decay half-life is 3600s —
+// irrelevant"). That assumption fails in a scripted back-to-back test harness
+// (calls a few ms apart): under -race/CPU contention the drainer goroutine
+// can still be applying call N's entry when call N+1 runs phase4HebbianBoost,
+// so the same candidate nondeterministically scores with or without the
+// Hebbian boost from a just-finished activation — flipping which of two
+// near-tied candidates ranks first. Exported only because the caller
+// (engine.Engine.waitWriteTimeIdle, itself unexported/test-only) lives in a
+// different package — same visibility trade-off as autoassoc.Worker.WaitIdle.
+func (e *ActivationEngine) WaitLogIdle() {
+	e.logWG.Wait()
+}
+
+// ResetLog discards assocLog's recorded activation events for vaultID.
+// Test-only: see ActivationLog.ResetVault for the full rationale (a scripted
+// back-to-back harness modeling separate agent sessions compresses real
+// elapsed time, defeating the recency half-life that normally bounds
+// cross-call priming). Callers MUST call WaitLogIdle first if a just-run
+// Activate() may still have an entry in flight, or the drainer can
+// re-populate the vault's log immediately after this call clears it.
+func (e *ActivationEngine) ResetLog(vaultID uint32) {
+	e.assocLog.ResetVault(vaultID)
 }
 
 // SetTransitionStore sets the PAS transition store for candidate injection.
@@ -536,6 +582,7 @@ func (e *ActivationEngine) Run(ctx context.Context, req *ActivateRequest) (*Acti
 	// The drainer extracts ids/scores off the critical path.
 	// Non-blocking: drops if channel full (Hebbian half-life=3600s, 1ms lag is negligible).
 	if !req.ReadOnly && len(result.Activations) > 0 {
+		e.logWG.Add(1) // Add FIRST — visible to WaitLogIdle() (test-only); undone below on drop
 		select {
 		case e.logCh <- logItem{vaultID: req.VaultID, activations: result.Activations}:
 			// Yield to allow the drainer goroutine to process immediately.
@@ -543,6 +590,7 @@ func (e *ActivationEngine) Run(ctx context.Context, req *ActivateRequest) (*Acti
 			// drainer queue depth in production under bursty load.
 			runtime.Gosched()
 		default: // channel full — drop; eventual consistency accepted
+			e.logWG.Done()
 		}
 	}
 
@@ -1521,21 +1569,58 @@ func (e *ActivationEngine) phase6Score(
 	}
 
 	// Compute vectorScore for candidates that entered the pipeline without an HNSW
-	// score now that engrams are loaded. Two cases need this:
+	// score now that engrams are loaded. Three cases need this:
 	//   - BFS-traversed candidates (never in the HNSW pool).
 	//   - Tag-seeded candidates that appear in no other pool (vectorScore == 0):
 	//     without this, ACT-R/CGDN/legacy contentMatch is zero and the tag hit is
 	//     threshold-dropped one layer below the seeding fix (caveat 1 of #607).
+	//   - FTS-only candidates (vectorScore == 0, ftsScore > 0): a lexical match that
+	//     never ranked into the HNSW top-K otherwise keeps vectorScore=0 forever,
+	//     silently dropping its entire semantic evidence term from the ACT-R blend
+	//     even though the engram's embedding is right there once loaded (#714-A2).
 	// A non-zero vectorScore from the HNSW pool is never overwritten.
 	// ftsScore is left at zero: BM25 requires corpus-level IDF statistics unavailable here.
 	if len(p1.embedding) > 0 {
+		// Two passes: first collect the embeddings already available (eng.Embedding
+		// non-empty) and the ids that need a fallback read; then fetch all fallback
+		// ids in ONE GetEmbeddings round-trip instead of one GetEmbedding point-read
+		// per candidate (#714 batch follow-up). Bounded to exactly this needsCosine
+		// candidate set, never the full result set.
+		embeds := make([]([]float32), len(all))
+		var fallbackIdx []int
+		var fallbackIDs []storage.ULID
 		for i := range all {
-			needsCosine := all[i].isTraversed || (all[i].inTagPool && all[i].vectorScore == 0)
+			needsCosine := all[i].isTraversed || (all[i].vectorScore == 0 && (all[i].inTagPool || all[i].ftsScore > 0))
 			if !needsCosine {
 				continue
 			}
-			if eng := engramByID[all[i].id]; eng != nil && len(eng.Embedding) > 0 {
-				all[i].vectorScore = float64(cosineSimilarity32(p1.embedding, eng.Embedding))
+			eng := engramByID[all[i].id]
+			if eng == nil {
+				continue
+			}
+			if len(eng.Embedding) > 0 {
+				embeds[i] = eng.Embedding
+				continue
+			}
+			// ERF v2 stores embeddings in a separate 0x18 key, so GetEngrams()
+			// above returns nil embeddings. Fall back to a batched GetEmbeddings()
+			// read in that case -- same pattern as internal/consolidation/dedup.go
+			// and orient.go, collapsed into one round-trip.
+			fallbackIdx = append(fallbackIdx, i)
+			fallbackIDs = append(fallbackIDs, eng.ID)
+		}
+		if len(fallbackIDs) > 0 {
+			if loaded, err := e.store.GetEmbeddings(ctx, ws, fallbackIDs); err == nil {
+				for j, idx := range fallbackIdx {
+					if j < len(loaded) && len(loaded[j]) > 0 {
+						embeds[idx] = loaded[j]
+					}
+				}
+			}
+		}
+		for i := range all {
+			if embed := embeds[i]; len(embed) > 0 {
+				all[i].vectorScore = float64(cosineSimilarity32(p1.embedding, embed))
 			}
 		}
 	}
