@@ -2180,10 +2180,6 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	if actReq.MaxResults == 0 {
 		actReq.MaxResults = 20
 	}
-	if actReq.Threshold == 0 {
-		actReq.Threshold = 0.1
-	}
-
 	// Fix 2: Default to resolved HopDepth (from Plasticity preset) BFS traversal.
 	// The association graph is the primary differentiator of MuninnDB — it should
 	// be active by default. Order matters: apply default FIRST, then check explicit opt-out.
@@ -2260,6 +2256,20 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// Gate CGDN behind vault's ExperimentalCGDN flag.
 	if actReq.Weights.UseCGDN && !resolved.ExperimentalCGDN {
 		actReq.Weights.UseCGDN = false
+	}
+
+	// COG-6: the effective default threshold is mode-aware and keyed on the
+	// EFFECTIVE scoring mode (actReq.Weights.UseRRFFusion), decided here in one
+	// place — AFTER the weights block sets UseRRFFusion — so the threshold default
+	// always matches the scoring math that will actually run. (Keying on vault
+	// config, resolved.ScoringFusion, diverges when a caller passes explicit
+	// weights on an rrf vault: the request scores ACT-R but config says rrf.)
+	// For rrf scoring, leave Threshold 0 ("unset") so activation.Run() applies its
+	// rrf default (0.001, #590's mechanism); coercing to 0.1 here — an
+	// ACT-R-calibrated value — made #590's fix unreachable on every production
+	// transport. ACT-R/weighted_sum default behavior is unchanged.
+	if actReq.Threshold == 0 && !actReq.Weights.UseRRFFusion {
+		actReq.Threshold = 0.1
 	}
 
 	// Apply vault default recall mode when no explicit mode was set by the caller.
