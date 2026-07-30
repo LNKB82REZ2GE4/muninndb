@@ -135,7 +135,23 @@ type MemoryAnnotations struct {
 	// head — the fact to consult now. Both present when this memory is stale.
 	SupersededBy   string `json:"superseded_by,omitempty"`
 	CurrentVersion string `json:"current_version,omitempty"`
-	LastVerified   string `json:"last_verified,omitempty"` // RFC3339
+	// PossiblySupersededBy / VersionCluster / NewestOfCluster / ClusterSize are the
+	// ADVISORY heuristic-currency signal (COG-25) — inferred from a same-version
+	// cluster, NOT asserted. PossiblySupersededBy names a newer, highly-similar
+	// fact about the same subject: a mechanical hint, verify before treating this
+	// memory as false — it is still returned at full score. Distinct from the
+	// authoritative SupersededBy above.
+	//
+	// Scope: these are computed over the CO-RETRIEVED results only. "newest_of_cluster"
+	// means newest among the returned cluster members — a newer version that scored
+	// below the retrieval cut is not considered — and possibly_superseded_by may name
+	// an engram not present in this response (muninn_read it to inspect). Same
+	// returned-set boundary the authoritative superseded_by already has.
+	PossiblySupersededBy string `json:"possibly_superseded_by,omitempty"`
+	VersionCluster       string `json:"version_cluster,omitempty"`
+	NewestOfCluster      bool   `json:"newest_of_cluster,omitempty"`
+	ClusterSize          int    `json:"cluster_size,omitempty"`
+	LastVerified         string `json:"last_verified,omitempty"` // RFC3339
 }
 
 // ReadEntity is a named entity linked to a specific engram.
