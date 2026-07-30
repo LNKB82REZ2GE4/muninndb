@@ -2766,11 +2766,12 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	metrics.ActivateDuration.WithLabelValues(req.Vault).Observe(d.Seconds())
 
 	return &mbp.ActivateResponse{
-		QueryID:     queryID,
-		TotalFound:  result.TotalFound,
-		Activations: items,
-		LatencyMs:   result.LatencyMs,
-		Brief:       briefSentences,
+		QueryID:          queryID,
+		TotalFound:       result.TotalFound,
+		Activations:      items,
+		LatencyMs:        result.LatencyMs,
+		Brief:            briefSentences,
+		SemanticDegraded: result.SemanticDegraded,
 	}, nil
 }
 
