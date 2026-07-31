@@ -2403,7 +2403,19 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// ACT-R-calibrated value — made #590's fix unreachable on every production
 	// transport. ACT-R/weighted_sum default behavior is unchanged.
 	if actReq.Threshold == 0 && !actReq.Weights.UseRRFFusion {
-		actReq.Threshold = 0.1
+		if actReq.Weights.UseACTR {
+			// The value COG-26's b=0.520 was calibrated against, on the
+			// absolute-score scale the ACT-R gate now compares.
+			actReq.Threshold = 0.1
+		} else {
+			// Legacy weighted_sum: its blended Final gives content-irrelevant
+			// fresh memories ~0.3 from decay/recency/access alone, and the only
+			// bar ever validated against that formula is the old 0.5 surface
+			// default. 0.1 was measured on the ACT-R absolute scale ONLY —
+			// applying it here would let recency spam through (#754 review,
+			// finding 5).
+			actReq.Threshold = 0.5
+		}
 	}
 
 	// Apply the recall-mode preset (#704) — resolved into modePreset above the
@@ -2577,6 +2589,8 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 			Recency:               float32(scored.Components.Recency),
 			Raw:                   float32(scored.Components.Raw),
 			Final:                 float32(scored.Components.Final),
+			ContentMatch:          float32(scored.Components.ContentMatch),
+			AbsoluteScore:         float32(scored.Components.AbsoluteScore),
 		}
 
 		// Add hop path if present
@@ -2772,6 +2786,8 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 		LatencyMs:        result.LatencyMs,
 		Brief:            briefSentences,
 		SemanticDegraded: result.SemanticDegraded,
+		Abstained:        result.Abstained,
+		AbstainedReason:  result.AbstainedReason,
 	}, nil
 }
 
@@ -3761,9 +3777,37 @@ func (e *Engine) Consolidate(ctx context.Context, vault string, ids []string, me
 		return nil, fmt.Errorf("consolidate: write merged: %w", err)
 	}
 
+	// NEVER archive the merged result itself. Write is exact-content deduplicated,
+	// so when mergedContent matches an input byte-for-byte — the NATURAL case,
+	// because the obvious merged text for a set of near-duplicates is usually one
+	// of them verbatim — Write returns THAT input's existing id rather than
+	// creating a new engram. Archiving every input then soft-deletes the very
+	// engram just returned as the survivor, and the fact disappears from recall
+	// while the response still reports success and names the (now dead) id.
+	//
+	// Verified before this guard: consolidate(ids=[A,B], merged=<A's content>)
+	// returned {"id": A, "archived": [A, B]} and left BOTH soft-deleted, so a
+	// caller using the merge tool exactly as documented lost the memory.
 	var archived []string
 	var warnings []string
+	// Compare PARSED ULIDs, not raw strings: ULID parsing is case-insensitive
+	// and Forget accepts lowercase ids, so a lowercase input whose content
+	// matched the merge text slipped past a string comparison and the survivor
+	// was archived anyway — the same data loss through a one-character-class
+	// gap (adversarial review of #754, finding 7).
+	mergedULIDForGuard, guardErr := storage.ParseULID(mergedResp.ID)
 	for _, id := range ids {
+		if guardErr == nil {
+			if inputULID, err := storage.ParseULID(id); err == nil && inputULID == mergedULIDForGuard {
+				// This input IS the merged result (dedup hit). Keep it alive; it
+				// is the consolidated memory the caller is being handed.
+				continue
+			}
+		} else if id == mergedResp.ID {
+			// Unparseable merged id (should not happen): fall back to the exact
+			// string match rather than skipping the guard entirely.
+			continue
+		}
 		_, err := e.Forget(ctx, &mbp.ForgetRequest{ID: id, Hard: false, Vault: vault})
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("failed to archive %s: %v", id, err))

@@ -283,6 +283,15 @@ type ActivateResponse struct {
 	// Carried on MBP + REST (alias) + MCP muninn_recall; gRPC does NOT yet map it
 	// (pb.ActivateResponse has no field — a documented deferral, tracked separately).
 	SemanticDegraded bool `msgpack:"semantic_degraded,omitempty" json:"semantic_degraded,omitempty"`
+	// Abstained is true when the recall pipeline ran to completion and
+	// DELIBERATELY returned nothing: candidates were scored and every one fell
+	// below the relevance bar (or was filtered). It distinguishes "the vault
+	// has no answer" from "nothing matched this run" — without it an empty
+	// result is indistinguishable from an un-run one, the silent-substitution
+	// class fixed across #742..#746. AbstainedReason is machine-readable:
+	// no_candidates | below_threshold | filtered. Empty iff Abstained is false.
+	Abstained       bool   `msgpack:"abstained,omitempty"        json:"abstained,omitempty"`
+	AbstainedReason string `msgpack:"abstained_reason,omitempty" json:"abstained_reason,omitempty"`
 }
 
 // ActivationItem is a single activated engram.
@@ -364,6 +373,14 @@ type ScoreComponents struct {
 	Recency               float32 `msgpack:"recency"                       json:"recency"`
 	Raw                   float32 `msgpack:"raw"                           json:"raw"`
 	Final                 float32 `msgpack:"final"                         json:"final"`
+	// ContentMatch is the absolute aboutness term (w_sem*semCal +
+	// w_fts*ftsCoverage) BEFORE the ACT-R prior, per-query normalization and
+	// Confidence — the quantity the COG-26 relevance calibration is stated on.
+	// AbsoluteScore = min(Raw, ContentMatch, 1) * Confidence is the quantity
+	// the recall gate compares (Final is max-normalized per query, so its
+	// argmax is always ~1.0 and it cannot be compared across queries).
+	ContentMatch  float32 `msgpack:"content_match,omitempty"  json:"content_match,omitempty"`
+	AbsoluteScore float32 `msgpack:"absolute_score,omitempty" json:"absolute_score,omitempty"`
 }
 
 // SubscribeRequest registers a context subscription.
