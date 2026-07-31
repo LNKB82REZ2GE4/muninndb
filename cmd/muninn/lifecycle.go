@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -126,9 +127,25 @@ func runStart(webEnabled bool) error {
 
 	// Check already running
 	if pid, err := readPID(pidPath); err == nil {
-		if isProcessRunning(pid) {
+		switch probeProcess(pid) {
+		case processRunning:
 			fmt.Printf("muninn already running (pid %d)\n", pid)
 			return nil
+		case processUnknown:
+			// Same rule as stop: a PID we could not resolve is not a stale
+			// PID. Clearing it here and starting a second daemon would race
+			// the first one for the database. The Pebble lock check below
+			// catches that on Unix, but it always reports "not held" on
+			// Windows.
+			err := fmt.Errorf(
+				"cannot determine whether pid %d from %s is running — refusing to start a second daemon",
+				pid, pidPath)
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "Check whether the daemon is still alive, and remove the PID file only")
+			fmt.Fprintln(os.Stderr, "once you know it is not:")
+			fmt.Fprintf(os.Stderr, "  %s\n", pidPath)
+			return err
 		}
 		os.Remove(pidPath)
 	}
@@ -226,6 +243,20 @@ func runStart(webEnabled bool) error {
 	return fmt.Errorf("health check timed out")
 }
 
+// removeSidecars deletes the PID file and the address file that the daemon
+// leaves next to its data directory. A file that is already gone is not an
+// error; anything else is reported so callers do not announce a cleanup that
+// did not happen.
+func removeSidecars(dataDir, pidPath string) error {
+	var errs []error
+	for _, p := range []string{pidPath, filepath.Join(dataDir, addrsFileName)} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // runStop signals the running daemon to shut down.
 func runStop() {
 	dataDir := defaultDataDir()
@@ -233,22 +264,49 @@ func runStop() {
 	pid, err := readPID(pidPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		osExit(1)
+		return
 	}
+	switch probeProcess(pid) {
+	case processDead:
+		// Stale PID file: the daemon crashed or was kill -9'd without cleanup.
+		// Signalling this dead PID would fail with "process already finished";
+		// instead remove the stale sidecars and report the daemon as stopped.
+		if err := removeSidecars(dataDir, pidPath); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"muninn not running (pid %d), but its stale files could not be removed: %v\n", pid, err)
+			osExit(1)
+			return
+		}
+		fmt.Printf("muninn not running (removed stale PID file for pid %d)\n", pid)
+		return
+	case processUnknown:
+		// We could not establish that the process is gone. Removing the
+		// sidecars here would orphan a daemon that is still holding the
+		// database lock, leaving nothing on disk to find it by.
+		fmt.Fprintf(os.Stderr,
+			"cannot determine whether pid %d is running — leaving %s in place\n", pid, pidPath)
+		osExit(1)
+		return
+	}
+	// processRunning: signal it, below.
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "process not found: %v\n", err)
-		os.Exit(1)
+		osExit(1)
+		return
 	}
 	if err := stopProcess(proc); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to stop: %v\n", err)
-		os.Exit(1)
+		osExit(1)
+		return
 	}
 
 	if err := waitForProcessExit(pid, 35*time.Second); err != nil {
 		fmt.Fprintf(os.Stderr, "muninn (pid %d) did not stop within 35s — aborting\n", pid)
 		fmt.Fprintf(os.Stderr, "Check 'muninn logs' for details. You can force-kill with: kill -9 %d\n", pid)
-		os.Exit(1)
+		osExit(1)
+		return
 	}
 
 	fmt.Printf("muninn stopped (pid %d)\n", pid)
