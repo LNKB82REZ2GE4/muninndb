@@ -94,7 +94,20 @@ func (a *mcpEngineAdapter) Evolve(ctx context.Context, vault, oldID, newContent,
 	if err != nil {
 		return nil, err
 	}
-	return &WriteResult{ID: id.String()}, nil
+	// Echo the concept that was actually stored. The successor's concept is
+	// either the caller's override or the one carried from the predecessor, so
+	// it cannot be reconstructed from the arguments alone — read it back. The
+	// previous {"concept":""} response led two evaluators to conclude the
+	// write had lost data when the record was in fact correct.
+	res := &WriteResult{ID: id.String()}
+	if eng, err := a.eng.GetEngram(ctx, vault, id); err == nil && eng != nil {
+		res.Concept = eng.Concept
+	} else if err != nil {
+		// Never fail an accepted write over a cosmetic read-back; say so rather
+		// than reporting an empty concept as if that were the stored value.
+		res.Warnings = append(res.Warnings, fmt.Sprintf("evolve succeeded but the stored concept could not be read back: %v", err))
+	}
+	return res, nil
 }
 func (a *mcpEngineAdapter) Consolidate(ctx context.Context, vault string, ids []string, merged string) (*ConsolidateResult, error) {
 	res, err := a.eng.Consolidate(ctx, vault, ids, merged)
@@ -123,7 +136,7 @@ func (a *mcpEngineAdapter) Decide(ctx context.Context, vault, decision, rational
 	if err != nil {
 		return nil, err
 	}
-	return &WriteResult{ID: res.ID.String(), Warnings: res.Warnings}, nil
+	return &WriteResult{ID: res.ID.String(), Concept: res.Concept, Warnings: res.Warnings}, nil
 }
 
 func (a *mcpEngineAdapter) Restore(ctx context.Context, vault, id string) (*RestoreResult, error) {
@@ -178,21 +191,38 @@ func (a *mcpEngineAdapter) Explain(ctx context.Context, vault string, req *Expla
 	if err != nil {
 		return nil, err
 	}
-	return &ExplainResult{
+	res := &ExplainResult{
 		EngramID:    data.EngramID,
+		Concept:     data.Concept,
+		Found:       data.Found,
+		Scored:      data.Scored,
 		WouldReturn: data.WouldReturn,
 		Threshold:   data.Threshold,
-		FinalScore:  data.FinalScore,
-		Components: ExplainComponents{
-			FullTextRelevance:     float64(data.Components.FullTextRelevance),
-			SemanticSimilarity:    float64(data.Components.SemanticSimilarity),
-			SemanticSimilarityRaw: float64(data.Components.SemanticSimilarityRaw),
-			DecayFactor:           float64(data.Components.DecayFactor),
-			HebbianBoost:          float64(data.Components.HebbianBoost),
-			AccessFrequency:       float64(data.Components.AccessFrequency),
-		},
-	}, nil
+		Note:        data.Note,
+	}
+	// Stored confidence never depends on the query: report it whenever the
+	// engram exists. (It was previously unmapped entirely, so muninn_explain
+	// reported confidence 0 — an impossible value — for every engram.)
+	if data.Found {
+		res.Components.Confidence = f64(data.Confidence)
+	}
+	// The query-dependent components exist only if this query scored the
+	// engram. Otherwise they stay nil → JSON null → "not computed".
+	if data.Scored {
+		res.FinalScore = f64(data.FinalScore)
+		res.Components.FullTextRelevance = f64(float64(data.Components.FullTextRelevance))
+		res.Components.SemanticSimilarity = f64(float64(data.Components.SemanticSimilarity))
+		res.Components.SemanticSimilarityRaw = f64(float64(data.Components.SemanticSimilarityRaw))
+		res.Components.DecayFactor = f64(float64(data.Components.DecayFactor))
+		res.Components.HebbianBoost = f64(float64(data.Components.HebbianBoost))
+		res.Components.AccessFrequency = f64(float64(data.Components.AccessFrequency))
+	}
+	return res, nil
 }
+
+// f64 boxes a float64 so an explain component can distinguish a real 0 from
+// "never computed" (nil → JSON null).
+func f64(v float64) *float64 { return &v }
 
 func (a *mcpEngineAdapter) UpdateState(ctx context.Context, vault, id, state, reason string) error {
 	return a.eng.UpdateLifecycleState(ctx, vault, id, state)
