@@ -289,7 +289,15 @@ type ActivateResponse struct {
 	// has no answer" from "nothing matched this run" — without it an empty
 	// result is indistinguishable from an un-run one, the silent-substitution
 	// class fixed across #742..#746. AbstainedReason is machine-readable:
-	// no_candidates | below_threshold | filtered. Empty iff Abstained is false.
+	// no_candidates | below_threshold | filtered | superseded_only |
+	// ambiguous_version. The last two come from COG-28 version-head resolution
+	// (#763): the query's only admission-worthy evidence sat in a declared
+	// supersession chain with, respectively, no reachable current head or a
+	// fork the engine refuses to choose a branch of. Both fields are
+	// RECOMPUTED on the final response, after every injection and gate phase:
+	// Abstained is true iff Activations is empty, so a version-head
+	// substitution that fills a below-threshold response also clears the
+	// flag. Empty iff Abstained is false.
 	Abstained       bool   `msgpack:"abstained,omitempty"        json:"abstained,omitempty"`
 	AbstainedReason string `msgpack:"abstained_reason,omitempty" json:"abstained_reason,omitempty"`
 }
@@ -343,6 +351,29 @@ type ActivationItem struct {
 	VersionCluster       string `msgpack:"version_cluster,omitempty"        json:"version_cluster,omitempty"`
 	NewestOfCluster      bool   `msgpack:"newest_of_cluster,omitempty"      json:"newest_of_cluster,omitempty"`
 	ClusterSize          int    `msgpack:"cluster_size,omitempty"           json:"cluster_size,omitempty"`
+	// SubstitutedFor / SubstitutionBasis / ChainTruncated / HeadNotIndexedYet
+	// are COG-28 version-head substitution (#763) — ASSERTED, from a declared
+	// RelSupersedes chain, siblings of SupersededBy above and explicitly NOT
+	// part of the advisory PossiblySupersededBy block.
+	//
+	// SubstitutedFor names the SUPERSEDED PREDECESSOR whose match admitted or
+	// boosted this row: the query's wording reached the older version, and
+	// recall resolved it to this current one. Two cases, both attributed: on
+	// an INJECTED row (this memory's own wording did not clear the gate) the
+	// displayed Score AND ScoreComponents are the predecessor's measurements;
+	// on a RAISED row (this memory matched on its own, but the predecessor
+	// matched harder) only Score is the predecessor's Final — ScoreComponents
+	// remain this memory's own. SubstitutionBasis repeats the predecessor's
+	// load-bearing measurements in both cases so the score's origin is
+	// unmissable. ChainTruncated: the chain was longer than the walk limit, so
+	// this may not be the very latest version. HeadNotIndexedYet: this memory
+	// has no stored embedding yet (indexing pending) — "not indexed" rather
+	// than "not relevant". All empty on a row that earned its own place at its
+	// own score.
+	SubstitutedFor    string             `msgpack:"substituted_for,omitempty"      json:"substituted_for,omitempty"`
+	SubstitutionBasis *SubstitutionBasis `msgpack:"substitution_basis,omitempty"   json:"substitution_basis,omitempty"`
+	ChainTruncated    bool               `msgpack:"chain_truncated,omitempty"      json:"chain_truncated,omitempty"`
+	HeadNotIndexedYet bool               `msgpack:"head_not_indexed_yet,omitempty" json:"head_not_indexed_yet,omitempty"`
 	// Valid-time annotations. ValidFrom is set only when it differs from
 	// CreatedAt (an explicitly backdated/forward-dated fact); ValidUntil is set
 	// only when the window is closed. Expired marks a fact whose ValidUntil <=
@@ -353,6 +384,18 @@ type ActivationItem struct {
 	// Importance is the STORED caller-asserted importance (0 = unset; the
 	// presentation layer derives the effective value — see ReadResponse).
 	Importance float32 `msgpack:"importance,omitempty" json:"importance,omitempty"`
+}
+
+// SubstitutionBasis is the evidence that admitted a COG-28 substituted row:
+// the SUPERSEDED PREDECESSOR's measured scores against this query. AbsoluteScore
+// is the exact quantity that was compared against the caller's threshold, so a
+// caller can verify for itself that the substitution redirected admission-worthy
+// evidence rather than manufacturing it.
+type SubstitutionBasis struct {
+	AbsoluteScore      float32 `msgpack:"absolute_score"      json:"absolute_score"`
+	ContentMatch       float32 `msgpack:"content_match"       json:"content_match"`
+	SemanticSimilarity float32 `msgpack:"semantic_similarity" json:"semantic_similarity"`
+	FullTextRelevance  float32 `msgpack:"full_text_relevance" json:"full_text_relevance"`
 }
 
 // ScoreComponents breaks down the activation score.
