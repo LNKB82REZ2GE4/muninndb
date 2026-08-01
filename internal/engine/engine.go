@@ -218,6 +218,25 @@ type Engine struct {
 	// Resets on server restart. Cleared per-engram by ResetReplayFailCount.
 	replayFailCounts map[storage.ULID]int
 
+	// contradictionsDeclared is the per-vault ([8]byte ws prefix -> struct{})
+	// in-process record that THIS process has written a RelContradicts edge in
+	// that vault. It closes COG-29's fast-path gate over the window between an
+	// explicit muninn_link(contradicts) and the batch detector's 0x0A marker,
+	// so a single-binary deployment honors a declaration on the very next
+	// query instead of up to one worker interval later. Resets on restart —
+	// by then the marker exists.
+	contradictionsDeclared sync.Map
+
+	// contradictionProbeClean memoises the once-per-process declared-edge scan
+	// in vaultMayHaveContradictions ([8]byte ws prefix -> struct{}): presence
+	// means "this vault was scanned to completion and had NO declared
+	// contradicts edge". It closes the hole where a process restarts between
+	// muninn_link(contradicts) and the batch worker's 0x0A flush — the marker
+	// was never written and the in-process flag is gone, so without a re-probe
+	// recall would silently stop honoring the declaration forever. Cleared by
+	// noteContradictionDeclared.
+	contradictionProbeClean sync.Map
+
 	// mergeMu serialises concurrent MergeEntity calls that touch the same entities.
 	// Uses a dedicated stripe array separate from the storage-layer entity locks to
 	// avoid reentrancy deadlock (UpsertEntityRecord acquires storage stripes internally).
@@ -842,6 +861,15 @@ func (e *Engine) spawnJob(fn func()) bool {
 // first (and, downstream, whether NoticesForRecall sees the corroborator or
 // the intention's own engram at rank 0). Refs #722.
 func (e *Engine) waitWriteTimeIdle() {
+	e.WaitWriteTimeIdle()
+}
+
+// WaitWriteTimeIdle is the exported test seam over waitWriteTimeIdle, for
+// tests OUTSIDE this package (e.g. internal/mcp) that seed through the real
+// engine and must not poll wall-clock deadlines for async index visibility
+// (#722 doctrine; the SetFlushInterval precedent). Production code has no
+// reason to call it — recall is eventually consistent by design.
+func (e *Engine) WaitWriteTimeIdle() {
 	if e.autoAssoc != nil {
 		e.autoAssoc.WaitIdle()
 	}
@@ -2590,11 +2618,36 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// final truncation so it sees exactly the survivor set truncation will cut.
 	result.Activations = e.applyCurrencyAnnotation(ctx, wsPrefix, result.Activations, vaultSize, actReq.MaxResults)
 
+	// COG-29 contradiction honesty (#764). Runs LAST of the post-pipeline
+	// phases and before truncation: after the COG-19 gate so a side already
+	// removed for being invalid/soft-deleted is neither resurrected nor
+	// referenced (this is what makes evolve/forget stop the theater), after
+	// supersession/substitution because a declared RelSupersedes between the
+	// pair IS the resolution, after currency because COG-25 may reorder exact
+	// ties and this phase's ordering must be the last word, and before
+	// truncation so the adjacency guarantee holds.
+	var conflictKeep int
+	var conflictBlock *mbp.ConflictBlock
+	result.Activations, conflictBlock, conflictKeep = e.applyContradictionHonesty(
+		ctx, wsPrefix, result.Activations, actReq, injectorGate, gateNow)
+
 	// Re-apply MaxResults: entity boost / supersession / the validity gate may have
 	// changed the set. All re-sort or preserve score order, so truncation keeps top-K.
-	if actReq.MaxResults > 0 && len(result.Activations) > actReq.MaxResults {
-		result.Activations = result.Activations[:actReq.MaxResults]
+	// COG-29 may raise the cut by up to contradictionMaxCluster-1 so a conflict
+	// cluster is never returned half-truncated; the overflow is reported in the
+	// conflict block rather than applied silently.
+	truncateAt := actReq.MaxResults
+	if conflictKeep > truncateAt {
+		truncateAt = conflictKeep
 	}
+	if truncateAt > 0 && len(result.Activations) > truncateAt {
+		result.Activations = result.Activations[:truncateAt]
+	}
+
+	// A conflict cluster that fell entirely outside the caller's cut must not
+	// be reported: the block describes what the caller RECEIVED. Prune to the
+	// pairs with a surviving endpoint, and drop the block when none remain.
+	conflictBlock = pruneConflictBlock(conflictBlock, result.Activations)
 
 	// ABSTENTION IS RECOMPUTED HERE, on the FINAL set, and nowhere earlier.
 	// Phase 6's verdict described ITS set, not this one: the substitution and
@@ -2678,6 +2731,27 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 					FullTextRelevance:  float32(b.FullTextRelevance),
 				}
 			}
+		}
+		// COG-29 contradiction honesty (#764): ASSERTED, from a declared
+		// RelContradicts edge that is still unresolved. Always-on for the same
+		// reason superseded_by is — a caller must never be handed a disputed
+		// fact without being told, and this row's score was demoted and capped
+		// because of it.
+		if c := scored.UnresolvedContradiction; c != nil {
+			item := &mbp.ContradictionConflict{
+				With:             c.With.String(),
+				WithConcept:      c.WithConcept,
+				Side:             c.Side,
+				PartnerInResults: c.PartnerInResults,
+				ClusterSize:      c.ClusterSize,
+				ClusterTruncated: c.ClusterTruncated,
+			}
+			// Zero means UNKNOWN (a legacy edge with no stamp): omit it rather
+			// than serialising the Go zero time as if it were an instant.
+			if !c.DeclaredAt.IsZero() {
+				item.DeclaredAt = c.DeclaredAt.UTC().Format(time.RFC3339)
+			}
+			items[i].UnresolvedContradiction = item
 		}
 		// Heuristic currency annotation (advisory; from applyCurrencyAnnotation).
 		if (scored.PossiblySupersededBy != storage.ULID{}) {
@@ -2910,6 +2984,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 		SemanticDegraded: result.SemanticDegraded,
 		Abstained:        result.Abstained,
 		AbstainedReason:  result.AbstainedReason,
+		Conflict:         conflictBlock,
 	}, nil
 }
 
@@ -3029,6 +3104,11 @@ func (e *Engine) Link(ctx context.Context, req *mbp.LinkRequest) (*mbp.LinkRespo
 	// When a "contradicts" link is explicitly created via Link(), notify the
 	// ContradictWorker so it can flag the pair and drive confidence updates.
 	if storage.RelType(req.RelType) == storage.RelContradicts {
+		// Tell COG-29's fast-path gate this vault has a declared contradiction
+		// NOW, rather than when the batch detector's 0x0A marker lands. The
+		// declaration is durable the moment the association above committed,
+		// so recall must honor it on the very next query.
+		e.noteContradictionDeclared(wsPrefix)
 		_, linkContra, _ := e.cogWorkers()
 		if linkContra != nil {
 			linkContra.Submit(cognitive.ContradictItem{
