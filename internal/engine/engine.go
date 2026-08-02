@@ -2471,6 +2471,12 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// (unlike SemanticSimilarity/FullTextRelevance, which an explicit caller
 	// override legitimately replaces).
 	actReq.Weights.SemanticBaseline = float32(e.resolveSemanticBaseline(req.Vault, wsPrefix, resolved))
+	// Distinguish the two causes of a zero baseline for the relevance-band
+	// phase: an operator who explicitly set `semantic_floor: 0` (documented
+	// "disable the floor") must not be told their model is unregistered
+	// (semantic_floor_disabled vs no_model_baseline — G6 refute of #773,
+	// finding 3). Scoring math is identical either way (identity transform).
+	actReq.Weights.SemanticFloorDisabled = semanticFloorExplicitlyDisabled(resolved)
 
 	// COG-6: the effective default threshold is mode-aware and keyed on the
 	// EFFECTIVE scoring mode (actReq.Weights.UseRRFFusion), decided here in one
@@ -2483,19 +2489,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// ACT-R-calibrated value — made #590's fix unreachable on every production
 	// transport. ACT-R/weighted_sum default behavior is unchanged.
 	if actReq.Threshold == 0 && !actReq.Weights.UseRRFFusion {
-		if actReq.Weights.UseACTR {
-			// The value COG-26's b=0.520 was calibrated against, on the
-			// absolute-score scale the ACT-R gate now compares.
-			actReq.Threshold = 0.1
-		} else {
-			// Legacy weighted_sum: its blended Final gives content-irrelevant
-			// fresh memories ~0.3 from decay/recency/access alone, and the only
-			// bar ever validated against that formula is the old 0.5 surface
-			// default. 0.1 was measured on the ACT-R absolute scale ONLY —
-			// applying it here would let recency spam through (#754 review,
-			// finding 5).
-			actReq.Threshold = 0.5
-		}
+		actReq.Threshold = cog6DefaultThreshold(actReq.Weights.UseRRFFusion, actReq.Weights.UseACTR)
 	}
 
 	// Apply the recall-mode preset (#704) — resolved into modePreset above the
@@ -2681,6 +2675,19 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 		}
 	}
 
+	// #773 score-presentation honesty. Runs LAST of the post-pipeline phases —
+	// after currency, contradiction honesty, the final truncation and the
+	// abstention recompute — so it bands exactly the rows the caller receives.
+	// READ-ONLY: no score change, no reorder, no truncation, no removal, no
+	// write. See engine_relevance.go for why the calibration gate, and not
+	// actReq.Threshold, is the anchor.
+	relevanceBands, relevanceBases := applyRelevanceBands(
+		result.Activations,
+		result.Calibration,
+		cog6DefaultThreshold(actReq.Weights.UseRRFFusion, actReq.Weights.UseACTR),
+		result.SemanticDegraded,
+	)
+
 	// Convert result.Activations to []mbp.ActivationItem
 	items := make([]mbp.ActivationItem, len(result.Activations))
 	for i, scored := range result.Activations {
@@ -2703,6 +2710,10 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 			TypeLabel:   scored.Engram.TypeLabel,
 			Tags:        scored.Engram.Tags,
 			Importance:  scored.Engram.Importance,
+			// #773: the absolute relevance band and, for filter_match /
+			// uncalibrated, why.
+			RelevanceBand:      relevanceBands[i],
+			RelevanceBandBasis: relevanceBases[i],
 		}
 
 		// Supersession annotation from the supersedes-aware ranking phase (always-on
@@ -4287,6 +4298,17 @@ func (e *Engine) resolveSemanticBaseline(vaultName string, ws [8]byte, resolved 
 			"vault", vaultName, "embed_model", model)
 	}
 	return 0
+}
+
+// semanticFloorExplicitlyDisabled reports whether this vault's operator
+// explicitly set `semantic_floor: 0` — the documented way to disable the
+// COG-26 floor. Deliberately narrower than "the resolved baseline is 0":
+// an unset override, a positive override, and an out-of-range override that
+// resolveSemanticBaseline rejects (WARN + registry fallthrough) are all
+// false. Kept beside resolveSemanticBaseline so the two read the same
+// override field and cannot drift.
+func semanticFloorExplicitlyDisabled(resolved auth.ResolvedPlasticity) bool {
+	return resolved.SemanticFloorOverride != nil && *resolved.SemanticFloorOverride == 0
 }
 
 // PruneVault prunes a vault according to its resolved MaxEngrams and RetentionDays policy.

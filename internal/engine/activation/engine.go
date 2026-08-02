@@ -50,10 +50,19 @@ type Weights struct {
 	// pre-COG-26 behavior. Only the root engine resolves and sets a nonzero
 	// value for calibrated models.
 	SemanticBaseline float32
-	DecayFactor      float32
-	HebbianBoost     float32
-	AccessFrequency  float32
-	Recency          float32
+	// SemanticFloorDisabled records that SemanticBaseline is 0 BECAUSE the
+	// vault's operator explicitly set `semantic_floor: 0` (the documented way
+	// to disable the COG-26 floor), not because the model has no calibrated
+	// baseline. Set only by the root engine's baseline resolution; changes no
+	// scoring math (b=0 is the identity transform either way) — it exists so
+	// the relevance-band phase reports the true cause
+	// (semantic_floor_disabled vs no_model_baseline, G6 refute of #773,
+	// finding 3).
+	SemanticFloorDisabled bool
+	DecayFactor           float32
+	HebbianBoost          float32
+	AccessFrequency       float32
+	Recency               float32
 	// CGDN mode: set UseCGDN=true to enable Cognitive-Gated Divisive Normalization.
 	UseCGDN   bool
 	CGDNAlpha float32 // Ebbinghaus gate exponent (0 → default 1.5)
@@ -78,10 +87,12 @@ type resolvedWeights struct {
 	FullTextRelevance  float64
 	// SemanticBaseline is COG-26's resolved b; see Weights.SemanticBaseline.
 	SemanticBaseline float64
-	DecayFactor      float64
-	HebbianBoost     float64
-	AccessFrequency  float64
-	Recency          float64
+	// SemanticFloorDisabled — see Weights.SemanticFloorDisabled.
+	SemanticFloorDisabled bool
+	DecayFactor           float64
+	HebbianBoost          float64
+	AccessFrequency       float64
+	Recency               float64
 
 	// CGDN: Cognitive-Gated Divisive Normalization (Carandini & Heeger 2012).
 	// When UseCGDN=true, replaces the additive weighted sum with:
@@ -160,6 +171,18 @@ type ScoreComponents struct {
 	// Without this field a caller cannot check that claim, and cannot tell a
 	// weak hit that recency promoted from a strong one.
 	ContentMatch float64
+	// ContentMatchFloored records that ContentMatch above is NOT this row's
+	// measured aboutness: the COG-5 S1 tag-match floor replaced a lower measured
+	// value because an explicit tag filter named this row. Set ONLY by
+	// computeACTR (the one producer that applies the floor — computeComponents
+	// applies no floor, so CGDN/weighted-sum rows never carry it, and the RRF
+	// path builds its components literal without it). admissionOf reads it so
+	// the filter_match classification tracks the REASON a row was admitted, not
+	// where the floored arithmetic happens to land relative to the threshold —
+	// tagMatchFloor (0.1) numerically equals the COG-6 ACT-R default gate, so a
+	// fresh confidence-1.0 floored row lands EXACTLY ON that boundary (G6
+	// refute of #773, finding 1). Never on the wire.
+	ContentMatchFloored bool
 	// AbsoluteScore is Raw before the per-query 1/maxRaw rescale, clamped to
 	// [0,1] and multiplied by Confidence. Unlike Final it is not relative to
 	// the rest of THIS query's candidate set, so it is comparable across
@@ -243,6 +266,13 @@ type ScoredEngram struct {
 	SubstitutionBasis *ScoreComponents
 	ChainTruncated    bool
 	HeadNotIndexedYet bool
+
+	// Admission records HOW this row entered the response — see the Admission
+	// type in relevance.go. Set by Run's scoring paths; the ZERO VALUE
+	// (AdmissionInjected) is what an engine-layer injector's fresh literal
+	// gets, which is correct: those rows carry no phase-6 measurement.
+	// Read by the #773 relevance-band phase. Never on the wire.
+	Admission Admission
 
 	// UnresolvedContradiction is set by COG-29 contradiction honesty (#764,
 	// engine_contradiction.go) on a row joined to another memory by an
@@ -390,6 +420,12 @@ type ActivateResult struct {
 	// shadowMatchCap; nil on every query that produced none, which is almost
 	// all of them. See shadow.go.
 	ShadowMatches []ShadowMatch
+
+	// Calibration reports the scale this run's AbsoluteScores live on, resolved
+	// at the ONE site that resolves weights (#773 D4/principle #6). The
+	// engine-layer relevance-band phase reads it instead of re-resolving
+	// weights and hoping the two agree. See RelevanceCalibration.
+	Calibration RelevanceCalibration
 }
 
 // Abstention reasons. Distinct values, not free text, so surfaces can branch.
@@ -1934,6 +1970,11 @@ func (e *ActivationEngine) phase6Score(
 		final      float64
 		components ScoreComponents
 		hopPath    []storage.ULID
+		// admission: AdmissionScored when this row cleared the gate on its own
+		// measured evidence, AdmissionTagFilter when it is below the bar and
+		// only an explicit tag filter admitted it (COG-5 S1). Carried to
+		// ScoredEngram for the #773 band phase; never on the wire.
+		admission Admission
 	}
 
 	now := time.Now()
@@ -2002,6 +2043,9 @@ func (e *ActivationEngine) phase6Score(
 					Final:                 final,
 				},
 				hopPath: c.hopPath,
+				// floored=false: the RRF components literal above carries no
+				// COG-5 floor — RRF honors inTagPool via its own pool boost.
+				admission: admissionOf(final, req.Threshold, c.inTagPool, false),
 			})
 		}
 		sort.Slice(scored, func(i, j int) bool {
@@ -2082,6 +2126,13 @@ func (e *ActivationEngine) phase6Score(
 				r := math.Pow(cc.activation, n) / denom
 				final := r * cc.components.Confidence
 				// Absolute, cross-query-comparable aboutness (see the gate below).
+				//
+				// ORDERING IS LOAD-BEARING (#773 R4): `absolute` reads
+				// cc.components.Raw and MUST be computed BEFORE Raw is
+				// overwritten with the CGDN ratio `r` five lines down. A
+				// refactor that reorders those two statements silently
+				// corrupts AbsoluteScore — and therefore the abstention gate
+				// AND every relevance band — on this path.
 				absolute := math.Min(math.Min(cc.components.Raw, cc.components.ContentMatch), 1.0) *
 					cc.components.Confidence
 				cc.components.AbsoluteScore = absolute
@@ -2094,6 +2145,11 @@ func (e *ActivationEngine) phase6Score(
 				cc.components.Final = final
 				scored = append(scored, scoredItem{
 					id: cc.id, final: final, components: cc.components, hopPath: cc.hopPath,
+					// ContentMatchFloored is structurally false on this path —
+					// computeComponents applies no COG-5 floor — passed through
+					// so the two producers cannot drift apart silently.
+					admission: admissionOf(absolute, req.Threshold, cc.inTagPool,
+						cc.components.ContentMatchFloored),
 				})
 			}
 		}
@@ -2235,6 +2291,12 @@ func (e *ActivationEngine) phase6Score(
 			// this package. (An early draft edited rest/server.go:1772 as "the
 			// REST recall default" — that line is SUBSCRIBE, a different
 			// formula; REST /activate has no surface default.)
+			//
+			// ORDERING IS LOAD-BEARING (#773 R4): this reads the UNSCALED
+			// cc.components.Raw and MUST stay above the `cc.components.Raw =
+			// raw` assignment below. Reordering those two statements replaces
+			// the absolute quantity with the per-query-rescaled one and
+			// silently corrupts the abstention gate AND every relevance band.
 			absolute := math.Min(math.Min(cc.components.Raw, cc.components.ContentMatch), 1.0) *
 				cc.components.Confidence
 			cc.components.AbsoluteScore = absolute
@@ -2249,7 +2311,9 @@ func (e *ActivationEngine) phase6Score(
 			}
 			cc.components.Raw = raw
 			cc.components.Final = final
-			scored = append(scored, scoredItem{id: cc.id, final: final, components: cc.components, hopPath: cc.hopPath})
+			scored = append(scored, scoredItem{id: cc.id, final: final, components: cc.components, hopPath: cc.hopPath,
+				admission: admissionOf(absolute, req.Threshold, cc.inTagPool,
+					cc.components.ContentMatchFloored)})
 		}
 		// COG-28 shadow pass. Deliberately a SECOND pass over a disjoint
 		// candidate set: `scale` above was computed from maxRaw over the LIVE
@@ -2297,7 +2361,12 @@ func (e *ActivationEngine) phase6Score(
 		if final < req.Threshold && !c.inTagPool {
 			continue
 		}
-		scored = append(scored, scoredItem{id: c.id, final: final, components: components, hopPath: c.hopPath})
+		// ContentMatchFloored is structurally false here (computeComponents
+		// applies no COG-5 floor); passed through, not hardcoded, so the
+		// producers cannot drift apart silently.
+		scored = append(scored, scoredItem{id: c.id, final: final, components: components, hopPath: c.hopPath,
+			admission: admissionOf(final, req.Threshold, c.inTagPool,
+				components.ContentMatchFloored)})
 	}
 	// COG-28 shadow pass, weighted_sum edition: this path gates on Final, so
 	// shadows are gated on Final too — the same quantity, per design §4.2, so
@@ -2372,6 +2441,7 @@ cgdnDone:
 			HopPath:     append([]storage.ULID(nil), s.hopPath...),
 			HopConcepts: hopConcepts,
 			Dormant:     !w.UseACTR && eng.Relevance <= minFloor*1.1,
+			Admission:   s.admission,
 		})
 	}
 
@@ -2401,7 +2471,33 @@ cgdnDone:
 		Abstained:        abstained,
 		AbstainedReason:  abstainReason,
 		ShadowMatches:    shadowMatches,
+		Calibration:      relevanceCalibration(w),
 	}, nil
+}
+
+// relevanceCalibration reports the scale this run's AbsoluteScores live on
+// (#773). Reads the RESOLVED weights — the single site that decided which
+// scoring math actually ran — so the engine-layer band phase can never band
+// against a mode or a ceiling the run did not use.
+func relevanceCalibration(w resolvedWeights) RelevanceCalibration {
+	mode := FusionACTR
+	switch {
+	case w.UseRRFFusion:
+		// Resolved above: rrf wins over cgdn when both are set.
+		mode = FusionRRF
+	case w.UseCGDN:
+		mode = FusionCGDN
+	case !w.UseACTR:
+		mode = FusionWeightedSum
+	}
+	return RelevanceCalibration{
+		// The structural maximum an honest ContentMatch can reach:
+		// w_sem*semCal + w_fts*ftsCoverage with both channels saturated.
+		ContentCeiling:             w.SemanticSimilarity + w.FullTextRelevance,
+		FusionMode:                 mode,
+		SemanticBaseline:           w.SemanticBaseline,
+		BaselineExplicitlyDisabled: w.SemanticFloorDisabled,
+	}
 }
 
 // computeComponents calculates all scoring components for a candidate engram.
@@ -2595,8 +2691,10 @@ func computeACTR(vectorScore, ftsScore, hebbianBoost, transitionBoost float64, e
 	// the floor only rescues candidates that would otherwise score exactly
 	// zero. RRF scoring already honors inTagPool via its own pool boost and
 	// is unaffected by this change. See docs/internals/invariants.md COG-5.
+	contentMatchFloored := false
 	if inTagPool && contentMatch < tagMatchFloor {
 		contentMatch = tagMatchFloor
+		contentMatchFloored = true
 	}
 
 	// Compute ACT-R base-level activation B(M).
@@ -2654,6 +2752,7 @@ func computeACTR(vectorScore, ftsScore, hebbianBoost, transitionBoost float64, e
 		SemanticSimilarityRaw: vectorScore,
 		FullTextRelevance:     normalizedFTS,
 		ContentMatch:          contentMatch,
+		ContentMatchFloored:   contentMatchFloored,
 		DecayFactor:           math.Max(0.05, math.Exp(-ageDays/math.Max(float64(eng.Stability), 1.0))), // kept for reporting; guard against Stability=0
 		HebbianBoost:          hebbianBoost,
 		TransitionBoost:       transitionBoost,
@@ -2880,6 +2979,13 @@ func asPair(v interface{}) *[2]string {
 	return nil
 }
 
+// DefaultACTRHebScale is the production default Hebbian amplifier inside
+// softplus (see computeACTR). Exported so tests that reason about the prior's
+// documented ceiling (softplus(bLevelCap + scale)/actrDenominator ≈ 3.24x)
+// read the value resolveWeights actually applies instead of hardcoding 4.0 —
+// a silent edit here must move those tests with it.
+const DefaultACTRHebScale = 4.0
+
 func resolveWeights(req *Weights, def DefaultWeights) resolvedWeights {
 	if req == nil {
 		// No weights provided (e.g. tests): use ACT-R with defaults. Decay path is not reachable for now.
@@ -2892,20 +2998,21 @@ func resolveWeights(req *Weights, def DefaultWeights) resolvedWeights {
 			Recency:            float64(def.Recency),
 			UseACTR:            true, // default path always uses ACT-R
 			ACTRDecay:          0.5,
-			ACTRHebScale:       4.0,
+			ACTRHebScale:       DefaultACTRHebScale,
 		}
 	}
 	rw := resolvedWeights{
-		SemanticSimilarity: float64(req.SemanticSimilarity),
-		FullTextRelevance:  float64(req.FullTextRelevance),
-		SemanticBaseline:   float64(req.SemanticBaseline),
-		DecayFactor:        float64(req.DecayFactor),
-		HebbianBoost:       float64(req.HebbianBoost),
-		AccessFrequency:    float64(req.AccessFrequency),
-		Recency:            float64(req.Recency),
-		UseCGDN:            req.UseCGDN,
-		UseACTR:            !req.DisableACTR,
-		UseRRFFusion:       req.UseRRFFusion,
+		SemanticSimilarity:    float64(req.SemanticSimilarity),
+		FullTextRelevance:     float64(req.FullTextRelevance),
+		SemanticBaseline:      float64(req.SemanticBaseline),
+		SemanticFloorDisabled: req.SemanticFloorDisabled,
+		DecayFactor:           float64(req.DecayFactor),
+		HebbianBoost:          float64(req.HebbianBoost),
+		AccessFrequency:       float64(req.AccessFrequency),
+		Recency:               float64(req.Recency),
+		UseCGDN:               req.UseCGDN,
+		UseACTR:               !req.DisableACTR,
+		UseRRFFusion:          req.UseRRFFusion,
 	}
 	// Apply CGDN defaults when enabled.
 	if req.UseCGDN {
@@ -2927,7 +3034,7 @@ func resolveWeights(req *Weights, def DefaultWeights) resolvedWeights {
 	if req.ACTRDecay > 0 {
 		rw.ACTRDecay = float64(req.ACTRDecay)
 	}
-	rw.ACTRHebScale = 4.0
+	rw.ACTRHebScale = DefaultACTRHebScale
 	if req.ACTRHebScale > 0 {
 		rw.ACTRHebScale = float64(req.ACTRHebScale)
 	}
