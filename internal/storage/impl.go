@@ -130,6 +130,11 @@ type PebbleStore struct {
 	// Like decayNow, it is read without synchronization, so it MUST be set
 	// before the store is shared across goroutines.
 	readFault func(key []byte) error
+	// guardReadFaults counts the times the STO-12 endpoint-liveness read failed
+	// and the guard failed open (see engramExists). guardReadFaultLoggedAt is
+	// the unix-nano stamp of the last WARN, used to rate-limit it.
+	guardReadFaults        atomic.Uint64
+	guardReadFaultLoggedAt atomic.Int64
 }
 
 // pointGet is the single-key read used by the metadata helpers that must tell
@@ -402,6 +407,13 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 		eng.LastAccess = eng.CreatedAt
 	}
 
+	// STO-12: inline associations are a creator. Checked BEFORE anything is
+	// encoded or queued, so a refusal is a clean no-op rather than a partly
+	// written engram. No sibling set: this call makes exactly one engram live.
+	if err := ps.checkInlineAssocTargets(wsPrefix, [16]byte(eng.ID), eng.Associations, nil); err != nil {
+		return ULID{}, err
+	}
+
 	erfEng := toERFEngram(eng)
 	erfBytes, err := erf.EncodeV2(erfEng)
 	if err != nil {
@@ -553,6 +565,34 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 	batch := ps.db.NewBatch()
 	defer batch.Close()
 
+	// STO-12 sibling set for the inline-association guard: every CALLER-SUPPLIED
+	// id in this call, which the single commit below makes live atomically.
+	// Built up front from the whole slice rather than accumulated as the loop
+	// walks it, so the guard is ORDER-INDEPENDENT — an item may name a sibling
+	// that appears later. (pebbleStoreBatch cannot do this: its WriteAssociation
+	// is called before the later WriteEngram exists to be seen. See
+	// TestSTO12_BatchAssociationGuardIsQueueOrderDependent.)
+	// Auto-assigned ids are deliberately absent: a caller cannot reference an id
+	// the store has not generated yet.
+	sameCall := make(map[[24]byte]struct{}, len(items))
+	for i := range items {
+		if items[i].Engram != nil && items[i].Engram.ID != (ULID{}) {
+			var k [24]byte
+			copy(k[:8], items[i].WSPrefix[:])
+			copy(k[8:], items[i].Engram.ID[:])
+			sameCall[k] = struct{}{}
+		}
+	}
+	inSameCall := func(ws [8]byte) func([16]byte) bool {
+		return func(id [16]byte) bool {
+			var k [24]byte
+			copy(k[:8], ws[:])
+			copy(k[8:], id[:])
+			_, ok := sameCall[k]
+			return ok
+		}
+	}
+
 	for i := range items {
 		eng := items[i].Engram
 		ws := items[i].WSPrefix
@@ -614,6 +654,15 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 			continue
 		}
 
+		// STO-12, for the same reason and in the same place as the tag
+		// validation above: the batch is shared and a mid-item `continue`
+		// cannot un-queue Sets already added, so a dangling inline target has
+		// to be caught before this item queues anything at all.
+		if err := ps.checkInlineAssocTargets(ws, [16]byte(eng.ID), eng.Associations, inSameCall(ws)); err != nil {
+			errs[i] = err
+			continue
+		}
+
 		id16 := [16]byte(eng.ID)
 		batch.Set(keys.EngramKey(ws, id16), erfBytes, nil)
 		batch.Set(keys.MetaKey(ws, id16), erf.MetaKeySlice(erfBytes), nil)
@@ -670,6 +719,90 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 		}
 
 		ids[i] = eng.ID
+	}
+
+	// STO-12, second half of the sameCall exception. sameCall promises that
+	// every caller-supplied id in this call is made live by the single commit
+	// below — but the per-item validations above can `continue` without ever
+	// queueing that item's 0x01 key, so an item the guard accepted as a live
+	// endpoint may never commit. A referrer naming it would otherwise commit
+	// three association rows pointing at nothing, with a nil error of its own.
+	//
+	// Which validations those are, precisely, because it matters:
+	//
+	//   - encode, the up-front ValidateRawTagValue loop, and
+	//     checkInlineAssocTargets `continue` BEFORE the item queues anything.
+	//     Those are the ones this block repairs.
+	//   - WriteRawTagIndexEntry and the 0x22 laKey batch.Set `continue` AFTER
+	//     the item's 0x01 and association Sets are already queued. If either
+	//     ever fired, the item would COMMIT and have its inbound edges deleted —
+	//     the inverse of the intended repair. Both are unreachable today:
+	//     WriteRawTagIndexEntry re-runs the identical validation the loop above
+	//     already passed, and pebble.Batch.Set fails only on a >4 GB batch. Said
+	//     plainly here rather than claimed away, so that anyone who moves a
+	//     validation knows which side of the queueing it has to stay on.
+	//
+	// THE PREDICATE IS ENGRAM EXISTENCE, NOT THE BATCH OUTCOME. A refused item
+	// is not necessarily a dead endpoint: a refused UPDATE of an engram that is
+	// already in Pebble leaves that engram's 0x01 record exactly where it was,
+	// so a referrer's edge to it is legitimate and deleting it is unrecoverable
+	// data loss (the hole above only leaks a dangling row, which the deferred
+	// integrity pass can repair — losing a live edge has no repair). The
+	// committed-sibling check covers the same id appearing twice in one call,
+	// once successfully.
+	//
+	// Repaired after the loop rather than by accumulating sameCall as the loop
+	// walks: an incremental set would make the guard queue-order dependent (the
+	// documented pebbleStoreBatch limitation) and refuse the legitimate
+	// referrer-first ordering. Pebble applies a batch in order, so a Delete
+	// queued here wins over a Set queued earlier for the same key, whatever the
+	// item order was.
+	committedIDs := make(map[[24]byte]struct{})
+	for i := range items {
+		if errs[i] != nil || items[i].Engram == nil {
+			continue
+		}
+		var k [24]byte
+		copy(k[:8], items[i].WSPrefix[:])
+		copy(k[8:], items[i].Engram.ID[:])
+		committedIDs[k] = struct{}{}
+	}
+	failedIDs := make(map[[24]byte]struct{})
+	for i := range items {
+		if errs[i] == nil || items[i].Engram == nil || items[i].Engram.ID == (ULID{}) {
+			continue
+		}
+		var k [24]byte
+		copy(k[:8], items[i].WSPrefix[:])
+		copy(k[8:], items[i].Engram.ID[:])
+		if _, ok := committedIDs[k]; ok {
+			continue // another item in this call makes the same id live
+		}
+		if ps.engramExists(items[i].WSPrefix, [16]byte(items[i].Engram.ID)) {
+			continue // a refused UPDATE — the endpoint is live and its edges are real
+		}
+		failedIDs[k] = struct{}{}
+	}
+	if len(failedIDs) > 0 {
+		for i := range items {
+			if errs[i] != nil || items[i].Engram == nil {
+				continue
+			}
+			ws := items[i].WSPrefix
+			id16 := [16]byte(items[i].Engram.ID)
+			for _, assoc := range items[i].Engram.Associations {
+				var k [24]byte
+				copy(k[:8], ws[:])
+				copy(k[8:], assoc.TargetID[:])
+				if _, dead := failedIDs[k]; !dead {
+					continue
+				}
+				dst := [16]byte(assoc.TargetID)
+				batch.Delete(keys.AssocFwdKey(ws, id16, assoc.Weight, dst), nil)
+				batch.Delete(keys.AssocRevKey(ws, dst, assoc.Weight, id16), nil)
+				batch.Delete(keys.AssocWeightIndexKey(ws, id16, dst), nil)
+			}
+		}
 	}
 
 	syncOption := pebble.Sync
