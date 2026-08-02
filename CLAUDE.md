@@ -96,6 +96,19 @@ Distilled from real decisions across the project's history (each traced to its P
 10. **Honest negative results and scope discipline are first-class.** #609 reported that
     ambient-push memory had zero uptake and killed the idea — that's valued, not dismissed.
 
+11. **Calibration is per-vault and self-derived, never hardcoded from one dataset.** A
+    threshold, baseline, or vocabulary a feature needs must be derived from each vault's OWN
+    data (self-calibrating, like #711's per-corpus IDF) or exposed as a per-vault override —
+    with model/cold-start defaults as hints only, never fixed constants that define someone
+    else's data for them. A number tuned on one sample vault imposes that vault's shape on
+    every other (a code vault versions with git SHAs; a notes app has no version tags; a
+    medical vault is different again) where it is wrong or a silent no-op. A sample vault
+    (e.g. a maintainer's own) is for FINDING bugs and VALIDATING generalization on messy real
+    data — never for tuning a constant into the product. Everyone calibrates their own vault;
+    we ship mechanisms and hints, not their answers. (The semantic-abstention floor self-
+    measures each vault's embedding-anisotropy baseline instead of shipping bge-small's; #712
+    currency was held partly because its version-marker vocabulary was one-vault-specific.)
+
 ---
 
 ## 3. How we work
@@ -108,17 +121,48 @@ Distilled from real decisions across the project's history (each traced to its P
    the project's own tooling build — a whole analysis pass ran against a branch missing six
    merged PRs.)
 
-2. **Build and test the actual change**, not just the diff: `go build ./... && go vet ./...
-   && gofmt -l .` plus the relevant `go test`. Use `-race` for anything touching storage,
-   the Hebbian/PAS workers, the pruner, replication, or MCP session state.
+2. **Build and test the actual change**, not just the diff — and **keep `-tags localassets`**:
+   `go build -tags localassets ./... && go vet -tags localassets ./... && gofmt -l .` plus the
+   relevant `go test -tags localassets`. CI builds, vets, and tests everything with that tag
+   (obligation #9), so a bare `go build ./...` exercises a different code path than the gate
+   you have to pass. It needs the embed assets — `make fetch-assets` once. Use `-race` for
+   anything touching storage, the Hebbian/PAS workers, the pruner, replication, or MCP
+   session state.
 
 3. **RED-sanity-check bug fixes.** A test for a fixed bug or closed race must be shown to
-   *fail without the fix*. A test that passes both ways proves nothing.
+   *fail without the fix*. A test that passes both ways proves nothing. If a test asserts
+   on state produced by an async worker, drain it deterministically instead of
+   `time.Sleep` — see `docs/internals/testing-hermeticity.md` (#722).
 
 4. **Honor the invariants and cross-surface obligations.** Check `docs/internals/invariants.md`,
    the keyspace registry, and `docs/internals/drift-and-obligations.md`. Touching an MCP
    handler means updating the registry smoke test; adding a Pebble prefix means checking the
    collision guard; changing a preset means updating the web UI and adding a pinning test; etc.
+   Four of those obligations now warn automatically via `.claude/hooks/drift-guard.mjs`
+   (marked 🪝 in that doc) — a reminder, not a gate, and no substitute for walking the list.
+
+**This repository is public. Measure on real vaults; never name them.** Mechanisms get proven
+against real corpora — that is the point, and a measurement without a real substrate is not
+worth much. But the vault a measurement ran on is not ours to publish. It belongs to a user, a
+client, or another product, and naming it links them to this project permanently.
+
+The rule, in committed content — source, tests, code comments, design records, commit messages,
+**and filenames**:
+
+- Refer to a measurement corpus as **"a production vault"**. Keep the numbers; drop the name.
+  "Measured on a real 3,296-memory production vault" carries every bit of the evidence that
+  naming it would, and costs nothing.
+- Use invented names in fixtures and examples. Not a real colleague, customer, or contact —
+  and not a real product's module names either.
+- No client, tenant, employer, or fund identifiers. No pricing, rates, or commercial terms.
+- If a design record can't make its point without those, it isn't publishable. Keep it local;
+  `.claude/deep-review/README.md` has the triage rule and the `private/` convention.
+
+This is not hypothetical. A vault name reached `origin/develop` in #715 and was scrubbed at the
+tip a day later by #734 — but a public repo's history is public forever, and a scrub of the tip
+is not a scrub. **Getting it right before the commit is the only version of this that works.**
+Maintainers additionally run a local pre-commit guard; do not rely on it, and note that
+contributors don't have it.
 
 **Keep CI fast and cheap.** The full gate must stay **under ~10 minutes** (baseline ~6–7
 min; job map in `drift-and-obligations.md`). Unit and invariant tests are nearly free —

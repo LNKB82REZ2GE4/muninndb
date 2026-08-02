@@ -32,6 +32,14 @@ type MCPServer struct {
 
 	sseSessionsMu sync.RWMutex
 	sseSessions   map[string]*sseSession // sessionID → session
+
+	// THE PUSH (prospective memory) — opt-in via MUNINN_PROSPECTIVE=1.
+	// When false, the notices path on recall/remember is fully inert
+	// (muninn_intend still arms durable intentions). noticeSeen tracks
+	// per-session delivered-notice dedup keys (see prospective.go).
+	prospective bool
+	noticeMu    sync.Mutex
+	noticeSeen  map[string]map[string]struct{} // sessionKey → delivered dedup keys
 	// NOTE: idempotencyLocks grows by one entry per unique op_id seen during the
 	// process lifetime. In practice op_id cardinality is low (client-generated,
 	// not per-request UUIDs), so growth is bounded by usage patterns. The
@@ -71,6 +79,8 @@ func New(addr string, eng EngineInterface, token string, keyAuth apiKeyValidator
 		capKeys:          capAuth,
 		agentVaultCreate: agentVaultCreate,
 		sseSessions:      make(map[string]*sseSession),
+		prospective:      os.Getenv("MUNINN_PROSPECTIVE") == "1",
+		noticeSeen:       make(map[string]map[string]struct{}),
 		tlsConfig:        tlsConfig,
 	}
 	// The create-workflow-vault handler needs the concrete *auth.Store for
@@ -225,6 +235,15 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 				sendError(w, req.ID, -32001, "forbidden: write-mode key cannot call this tool")
 				return
 			}
+		case auth.ModeAppend:
+			// Append: read + create-new only. Destructive/modifying mutating
+			// tools (forget/evolve/trust/merge/…) are refused. The engine also
+			// refuses Evolve/Forget for append-mode as a transport-agnostic
+			// backstop, so this is defense in depth, not the only gate.
+			if !isReadOnlyTool(toolName) && !isAdditiveTool(toolName) {
+				sendError(w, req.ID, -32001, "forbidden: append-mode key cannot call this tool (create-new and read only)")
+				return
+			}
 		case auth.ModeFull:
 			// full mode: no tool restriction within the pinned vault.
 		default:
@@ -325,6 +344,9 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 
 		// RFC #597: privileged workflow-vault creation (recursion-guarded above).
 		"muninn_create_workflow_vault": s.handleCreateWorkflowVault,
+
+		// THE PUSH: prospective memory (arm an intention on entity cues).
+		"muninn_intend": s.handleIntend,
 	}
 
 	handler, found := handlers[req.Params.Name]
@@ -332,6 +354,26 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 		sendError(w, req.ID, -32602, "unknown tool: "+req.Params.Name)
 		return
 	}
+
+	// COG-11: inject the credential's mode into ctx so engine-layer code (e.g.
+	// engine.go:2005's auth.ObserveFromContext(ctx)) can see it. gRPC
+	// (internal/transport/grpc/server.go:172) and REST (internal/auth/middleware.go:49)
+	// already do this; the MCP surface must match so observe-mode credentials get
+	// ReadOnly=true and skip Hebbian/PAS/activation-log side effects.
+	//
+	// An authorized session with no explicit mode — the static mdb_ token and the
+	// open-server (zero-config) deployment, which both have full tool access — is
+	// mapped to ModeFull, matching REST's public path (internal/auth/middleware.go:74).
+	// Without this, resolveTrust (SEC-14) would reject trust=verified on the default
+	// deployment even though the caller has full access. mk_/cap_ sessions carry
+	// their real key/cap Mode and are left untouched, so an observe key still cannot
+	// stamp verified.
+	mode := a.Mode
+	if mode == "" && a.Authorized {
+		mode = auth.ModeFull
+	}
+	ctx = context.WithValue(ctx, auth.ContextMode, mode)
+
 	handler(ctx, w, req.ID, vault, args)
 }
 
@@ -356,6 +398,7 @@ func registeredToolNames() []string {
 		"muninn_trust",
 		"muninn_compare_and_set", "muninn_claim", "muninn_release",
 		"muninn_create_workflow_vault",
+		"muninn_intend",
 	}
 }
 
@@ -490,6 +533,8 @@ func (s *MCPServer) handleSSEMessage(w http.ResponseWriter, r *http.Request) {
 	// The session auth is authoritative for vault pinning and mode enforcement;
 	// the POST auth check above ensures the caller is still authenticated.
 	r = r.WithContext(contextWithAuth(r.Context(), sess.auth))
+	// SSE transport: the SSE session ID is the notice-session identity.
+	r = r.WithContext(withNoticeSession(r.Context(), sessionID))
 	s.processAndPushSSE(w, r, []chan []byte{sess.ch}, sessionID)
 }
 
@@ -513,6 +558,9 @@ func (s *MCPServer) handleStreamablePost(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	r = r.WithContext(contextWithAuth(r.Context(), a))
+	// Notice-session identity for prospective-memory dedup: Streamable HTTP
+	// clients echo the Mcp-Session-Id header minted at initialize.
+	r = r.WithContext(withNoticeSession(r.Context(), r.Header.Get(mcpSessionHeader)))
 
 	// If the client also has SSE streams open, route through the async
 	// SSE handler so the response is pushed to ALL matching event streams
@@ -574,6 +622,11 @@ func (s *MCPServer) processAndPushSSE(w http.ResponseWriter, r *http.Request, ch
 	// before a slow tool call completes.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// The detached context loses request values — re-carry the notice-session
+	// identity so prospective-memory dedup survives the detach.
+	if key, ok := r.Context().Value(noticeSessionCtxKey{}).(string); ok {
+		ctx = withNoticeSession(ctx, key)
+	}
 
 	var buf bytes.Buffer
 	recorder := &responseCapture{header: http.Header{}, buf: &buf}

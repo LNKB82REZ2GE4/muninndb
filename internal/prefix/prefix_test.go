@@ -115,6 +115,10 @@ func TestAll_ConstSliceComplete(t *testing.T) {
 		{"ContentHash", ContentHash},
 		{"RecallEvent", RecallEvent},
 		{"Lease", Lease},
+		{"EvolveRepairMark", EvolveRepairMark},
+		{"RawTagRange", RawTagRange},
+		{"ProspectiveIntent", ProspectiveIntent},
+		{"AssocWeightRepairMark", AssocWeightRepairMark},
 		// Capability (0x40/0x41)
 		{"Capability", Capability},
 		{"CapabilityVaultIdx", CapabilityVaultIdx},

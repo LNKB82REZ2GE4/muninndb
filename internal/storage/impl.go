@@ -93,6 +93,24 @@ type PebbleStore struct {
 	archiveBloom *archiveBloom
 	// repLogAppend is the cluster replication callback. nil in non-cluster mode.
 	repLogAppend func(op uint8, key, value []byte) error
+	// decayNow is the clock used by DecayAssocWeights. nil = time.Now.
+	// Association decay is a pure function of elapsed wall-clock time since an
+	// edge's lastActivated (COG-27), so it needs an injectable clock to be
+	// tested at all: the cadence-independence property is a statement about two
+	// different evaluation grids over the *same* simulated interval.
+	// Test-only seam; never set in production code. It is read without
+	// synchronization by every decay pass, so it MUST be set before the store
+	// is shared across goroutines — setting it after any background worker
+	// has started is a data race.
+	decayNow func() time.Time
+}
+
+// now returns the decay clock: the injected test clock, or wall time.
+func (ps *PebbleStore) now() time.Time {
+	if ps.decayNow != nil {
+		return ps.decayNow()
+	}
+	return time.Now()
 }
 
 // assocCacheEntry holds a cached association list.
@@ -320,6 +338,13 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 		batch.Set(keys.TagIndexKey(wsPrefix, keys.Hash(tag), [16]byte(eng.ID)), []byte{}, nil)
 	}
 
+	// 0x2C: ordered raw-tag-range index (key:value tags only)
+	for _, tag := range eng.Tags {
+		if err := WriteRawTagIndexEntry(batch, wsPrefix, tag, [16]byte(eng.ID)); err != nil {
+			return ULID{}, err
+		}
+	}
+
 	// 0x0D: creator index
 	batch.Set(keys.CreatorIndexKey(wsPrefix, keys.Hash(eng.CreatedBy), [16]byte(eng.ID)), []byte{}, nil)
 
@@ -451,6 +476,30 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 			continue
 		}
 
+		// Validate every tag BEFORE queueing any Set for this item. The batch is
+		// shared and committed as a whole, so a mid-item `continue` cannot un-queue
+		// Sets already added — validating a NUL tag value only after the engram/meta/
+		// index keys were queued would report the item failed yet still commit a
+		// half-indexed engram (missing creator/relevance/last-access keys → invisible
+		// to the pruner and where_left_off). Reject up front instead.
+		// Validate every tag BEFORE queueing any Set for this item. The batch is
+		// shared and committed as a whole, so a mid-item `continue` cannot un-queue
+		// Sets already added — validating a NUL tag value only after the engram/meta/
+		// index keys were queued would report the item failed yet still commit a
+		// half-indexed engram (missing creator/relevance/last-access keys → invisible
+		// to the pruner and where_left_off). Reject up front instead.
+		tagErr := error(nil)
+		for _, tag := range eng.Tags {
+			if err := ValidateRawTagValue(tag); err != nil {
+				tagErr = fmt.Errorf("write engram batch: raw tag index: %w", err)
+				break
+			}
+		}
+		if tagErr != nil {
+			errs[i] = tagErr
+			continue
+		}
+
 		id16 := [16]byte(eng.ID)
 		batch.Set(keys.EngramKey(ws, id16), erfBytes, nil)
 		batch.Set(keys.MetaKey(ws, id16), erf.MetaKeySlice(erfBytes), nil)
@@ -483,6 +532,17 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 		batch.Set(keys.StateIndexKey(ws, uint8(eng.State), id16), []byte{}, nil)
 		for _, tag := range eng.Tags {
 			batch.Set(keys.TagIndexKey(ws, keys.Hash(tag), id16), []byte{}, nil)
+		}
+		var rawTagErr error
+		for _, tag := range eng.Tags {
+			if err := WriteRawTagIndexEntry(batch, ws, tag, id16); err != nil {
+				rawTagErr = err
+				break
+			}
+		}
+		if rawTagErr != nil {
+			errs[i] = fmt.Errorf("write engram batch: raw tag index: %w", rawTagErr)
+			continue
 		}
 		batch.Set(keys.CreatorIndexKey(ws, keys.Hash(eng.CreatedBy), id16), []byte{}, nil)
 		batch.Set(keys.RelevanceBucketKey(ws, eng.Relevance, id16), []byte{}, nil)
