@@ -906,7 +906,23 @@ func TestVersionHead_ShadowsDoNotEnterPerQueryNormalization_Saturating(t *testin
 	// predecessor is already a shadow here and shadows are never logged, so no
 	// LIVE row acquires a Hebbian boost (their assoc target — the predecessor —
 	// is absent from the recency window) and both arms stay deterministic.
-	h.recall("vacuum sweeper runs nightly against telemetry rows in every shard")
+	// Heat n1 by RECORDING its activation directly. Two recall-based priming
+	// shapes failed on CI while passing locally (real-embedder cosine drifts
+	// across ONNX platforms; then the measured FTS-only arms themselves
+	// returned zero live rows on linux/amd64), because a recall-shaped prime
+	// couples this fixture to every platform-sensitive stage of the pipeline
+	// when all it needs is one entry in the recency structure phase 4 reads.
+	// ActivationLog.Record is the exact structure the async drainer writes,
+	// keyed by the SAME VaultID the measured runs below pass — deterministic
+	// on every platform, no drain to race.
+	n1ULID, err := storage.ParseULID(n1.ID)
+	if err != nil {
+		t.Fatalf("parse n1: %v", err)
+	}
+	h.eng.activation.AssocLog().Record(activation.LogEntry{
+		VaultID: wsVaultID(h.ws), At: time.Now(),
+		EngramIDs: []storage.ULID{n1ULID}, Scores: []float64{1.0},
+	})
 	h.eng.waitWriteTimeIdle()
 
 	// FTS-only weights: under the noop embedder ContentMatch is capped at the
@@ -918,6 +934,7 @@ func TestVersionHead_ShadowsDoNotEnterPerQueryNormalization_Saturating(t *testin
 	run := func(excludeTags []string) *activation.ActivateResult {
 		t.Helper()
 		res, err := h.eng.activation.Run(h.ctx, &activation.ActivateRequest{
+			VaultID:     wsVaultID(h.ws),
 			VaultPrefix: h.ws, Context: []string{retentionQuery}, MaxResults: 10, Threshold: 0.1,
 			ExcludeTags: excludeTags,
 			Weights:     &activation.Weights{SemanticSimilarity: 0.0, FullTextRelevance: 1.0, UseACTR: true},
