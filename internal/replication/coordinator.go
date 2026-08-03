@@ -162,6 +162,13 @@ type ClusterCoordinator struct {
 	// deleting WAL segments that the snapshot receiver still needs.
 	snapshotInProgress atomic.Int32
 
+	// lastLoggedPruneSeq is the highest watermark the periodic prune loop has
+	// already logged. ReplicationLog.Prune is a cheap no-op once a watermark
+	// has already been pruned (#726), so the loop calls it unconditionally
+	// every tick — this just keeps that from writing an identical INFO line
+	// every PruneIntervalSec once the log is caught up.
+	lastLoggedPruneSeq atomic.Uint64
+
 	// reconciler runs post-partition cognitive reconciliation.
 	// Set via SetReconciler after the coordinator is created.
 	reconciler *Reconciler
@@ -2315,8 +2322,76 @@ func (c *ClusterCoordinator) SnapshotInProgress() bool {
 // startPeriodicPrune launches a goroutine that prunes fully-replicated WAL
 // segments every 60 seconds. Only runs on the Cortex (leader) node.
 // Pruning is skipped while a snapshot transfer is in progress.
+// pruneWatermark returns the sequence to prune up to, and whether the backlog
+// ceiling forced it past what replicas have acknowledged.
+//
+// Replica acks are the preferred watermark: pruning past a Lobe forces it to
+// rejoin via snapshot. But MinReplicatedSeq() is a *minimum* across replicas
+// and returns 0 when none have acked, so a single Lobe that never catches up
+// pins the watermark forever and the log grows without bound. That is not a
+// hypothetical — a Lobe stuck in a join/drop loop did exactly this, and the
+// resulting bloat slowed writes enough to keep the stream timing out.
+//
+// So: honour replica progress, but never retain more than MaxLogBacklog
+// entries behind the head. A Lobe left behind re-snapshots, which is the
+// documented consequence and strictly better than an unbounded Cortex.
+func (c *ClusterCoordinator) pruneWatermark() (uint64, bool) {
+	minSeq := c.MinReplicatedSeq()
+
+	maxBacklog := uint64(0)
+	if c.cfg.MaxLogBacklog > 0 {
+		maxBacklog = uint64(c.cfg.MaxLogBacklog)
+	}
+	if maxBacklog == 0 || c.repLog == nil {
+		return minSeq, false
+	}
+
+	head := c.repLog.CurrentSeq()
+	if head <= maxBacklog {
+		return minSeq, false
+	}
+	ceiling := head - maxBacklog
+	if ceiling > minSeq {
+		return ceiling, true
+	}
+	return minSeq, false
+}
+
+// evictLobesBehind drops the connection to every replica whose acknowledged
+// seq is below untilSeq, so it reconnects, re-joins and receives a fresh
+// snapshot.
+//
+// This is what makes the backlog ceiling safe. Without it, a forced prune
+// deletes entries a still-connected Lobe has not received, and nothing on
+// either side notices: ReadSince simply returns the first surviving entry,
+// the Applier only skips seq <= lastApplied and has no contiguity check, and
+// the Lobe then ACKs the head — so the Cortex sees a fully caught-up replica
+// that is permanently missing every write in the hole. Silently-wrong, which
+// is the failure class this project refuses (principle 2). Dropping the peer
+// converts it into a loud, self-healing re-snapshot, which is exactly what
+// Prune's own doc comment promises. Closing the peer so the Lobe retries is
+// the same mechanism the snapshot-failure path already uses.
+func (c *ClusterCoordinator) evictLobesBehind(untilSeq uint64) {
+	var behind []string
+	c.replicaSeqs.Range(func(key, value any) bool {
+		if value.(uint64) < untilSeq {
+			behind = append(behind, key.(string))
+		}
+		return true
+	})
+	for _, nodeID := range behind {
+		slog.Warn("cluster: dropping lobe left behind the prune watermark — it will rejoin via snapshot",
+			"lobe", nodeID, "until_seq", untilSeq)
+		c.stopStreamerForLobe(nodeID)
+		if peer, ok := c.mgr.GetPeer(nodeID); ok {
+			_ = peer.Close()
+		}
+		c.replicaSeqs.Delete(nodeID)
+	}
+}
+
 func (c *ClusterCoordinator) startPeriodicPrune(ctx context.Context) {
-	if c.mol == nil {
+	if c.mol == nil && c.repLog == nil {
 		return
 	}
 	go func() {
@@ -2338,15 +2413,40 @@ func (c *ClusterCoordinator) startPeriodicPrune(ctx context.Context) {
 					slog.Warn("cluster: skipping WAL prune — snapshot transfer in progress")
 					continue
 				}
-				minSeq := c.MinReplicatedSeq()
-				if minSeq == 0 {
+				pruneSeq, forced := c.pruneWatermark()
+				if pruneSeq == 0 {
 					continue
 				}
-				pruned, err := c.mol.SafePrune(minSeq)
-				if err != nil {
-					slog.Warn("cluster: periodic prune failed", "err", err)
-				} else if pruned > 0 {
-					slog.Info("cluster: pruned WAL segments", "pruned", pruned, "min_replicated_seq", minSeq)
+				if c.mol != nil {
+					pruned, err := c.mol.SafePrune(pruneSeq)
+					if err != nil {
+						slog.Warn("cluster: periodic prune failed", "err", err)
+					} else if pruned > 0 {
+						slog.Info("cluster: pruned WAL segments", "pruned", pruned, "min_replicated_seq", pruneSeq)
+					}
+				}
+				// A forced prune goes past what replicas have acked. Drop those
+				// replicas BEFORE deleting the entries they still need, so they
+				// re-snapshot instead of silently skipping the hole.
+				if forced {
+					c.evictLobesBehind(pruneSeq)
+				}
+				// The MOL prune above only unlinks sealed segment FILES. The
+				// replication log lives in its own Pebble sub-range
+				// (prefix.Replication|subEntry, #726) and needs its own prune,
+				// or it grows without bound (observed: ~10 GB/day on an
+				// otherwise idle primary). ReplicationLog.Prune is a cheap
+				// no-op once a watermark has already been pruned, so this can
+				// run unconditionally every tick without an entry count to
+				// gate on.
+				if c.repLog != nil {
+					if err := c.repLog.Prune(pruneSeq); err != nil {
+						slog.Warn("cluster: replication log prune failed", "err", err)
+					} else if pruneSeq > c.lastLoggedPruneSeq.Load() {
+						c.lastLoggedPruneSeq.Store(pruneSeq)
+						slog.Info("cluster: pruned replication log",
+							"until_seq", pruneSeq, "forced_by_backlog", forced)
+					}
 				}
 			}
 		}

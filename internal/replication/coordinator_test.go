@@ -1622,3 +1622,98 @@ func TestClusterCoordinator_HandleIncomingJoin_SnapshotFails_NoCallback(t *testi
 		t.Error("peer still connected after snapshot failure — expected it to be closed for lobe retry")
 	}
 }
+
+// A Lobe that never catches up must not be able to pin the replication log
+// forever. MinReplicatedSeq() is a *minimum* across replicas and returns 0 when
+// none have acked, so before the backlog ceiling existed a single stuck Lobe
+// meant the Cortex log grew without bound — which is exactly what happened in
+// production (~10 GB/day on an otherwise idle primary).
+func TestPruneWatermark_BacklogCeilingForcesPruneWhenReplicaStalls(t *testing.T) {
+	db, err := pebble.Open("", &pebble.Options{FS: vfs.NewMem()})
+	if err != nil {
+		t.Fatalf("open pebble: %v", err)
+	}
+	defer db.Close()
+
+	repLog := NewReplicationLog(db)
+	for i := 1; i <= 1000; i++ {
+		if _, err := repLog.Append(OpSet, []byte("k"), []byte("v")); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+
+	newCoord := func(maxBacklog int) *ClusterCoordinator {
+		return &ClusterCoordinator{
+			cfg:    &config.ClusterConfig{MaxLogBacklog: maxBacklog},
+			repLog: repLog,
+		}
+	}
+
+	t.Run("stalled replica pins watermark without a ceiling", func(t *testing.T) {
+		c := newCoord(0) // ceiling disabled == old behaviour
+		c.replicaSeqs.Store("lobe-a", uint64(5))
+		got, forced := c.pruneWatermark()
+		if got != 5 || forced {
+			t.Fatalf("pruneWatermark() = (%d, %v), want (5, false)", got, forced)
+		}
+	})
+
+	t.Run("ceiling overrides a stalled replica", func(t *testing.T) {
+		c := newCoord(100)
+		c.replicaSeqs.Store("lobe-a", uint64(5))
+		got, forced := c.pruneWatermark()
+		if got != 900 || !forced {
+			t.Fatalf("pruneWatermark() = (%d, %v), want (900, true)", got, forced)
+		}
+	})
+
+	t.Run("no replicas at all still prunes under the ceiling", func(t *testing.T) {
+		c := newCoord(100)
+		got, forced := c.pruneWatermark()
+		if got != 900 || !forced {
+			t.Fatalf("pruneWatermark() = (%d, %v), want (900, true)", got, forced)
+		}
+	})
+
+	t.Run("healthy replica ahead of the ceiling wins", func(t *testing.T) {
+		c := newCoord(100)
+		c.replicaSeqs.Store("lobe-a", uint64(950))
+		got, forced := c.pruneWatermark()
+		if got != 950 || forced {
+			t.Fatalf("pruneWatermark() = (%d, %v), want (950, false)", got, forced)
+		}
+	})
+
+	t.Run("short log never forces a prune", func(t *testing.T) {
+		c := newCoord(5000) // ceiling exceeds head
+		c.replicaSeqs.Store("lobe-a", uint64(5))
+		got, forced := c.pruneWatermark()
+		if got != 5 || forced {
+			t.Fatalf("pruneWatermark() = (%d, %v), want (5, false)", got, forced)
+		}
+	})
+}
+
+// A forced prune deletes entries a still-connected Lobe has not received.
+// Nothing downstream detects that hole — ReadSince returns the first surviving
+// entry, the Applier has no contiguity check, and the Lobe then ACKs the head.
+// So the forced prune must drop those Lobes first, turning a silent divergence
+// into a loud re-snapshot.
+func TestPrune_ForcedWatermarkEvictsLobesLeftBehind(t *testing.T) {
+	c := &ClusterCoordinator{
+		cfg: &config.ClusterConfig{NodeID: "cortex"},
+		mgr: NewConnManager("cortex"),
+	}
+	c.streamers = make(map[string]context.CancelFunc)
+	c.replicaSeqs.Store("lobe-stalled", uint64(5))
+	c.replicaSeqs.Store("lobe-healthy", uint64(950))
+
+	c.evictLobesBehind(900)
+
+	if _, ok := c.replicaSeqs.Load("lobe-stalled"); ok {
+		t.Error("lobe behind the prune watermark was not evicted — it will silently skip the pruned range")
+	}
+	if _, ok := c.replicaSeqs.Load("lobe-healthy"); !ok {
+		t.Error("lobe ahead of the prune watermark must not be evicted")
+	}
+}
