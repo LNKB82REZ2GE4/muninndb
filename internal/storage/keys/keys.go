@@ -1042,6 +1042,21 @@ func EvolveRepairMarkKey(ws [8]byte) []byte {
 	return key
 }
 
+// UpsertKeyKey constructs the upsert forward-index key (0x30 prefix).
+// Maps sha256(idempotent_id) → the engram ID it is pinned to within a vault,
+// enabling O(1) upsert-key lookup at write time (issue #556). Mirrors
+// ContentHashKey's shape exactly — vault-scoped, sha256-suffixed, ULID value.
+// Relocated from 0x2F after #726 (replication) took it
+// Key: 0x30 | wsPrefix(8) | sha256(32) = 41 bytes
+// Value: engramID(16) bytes
+func UpsertKeyKey(ws [8]byte, hash [32]byte) []byte {
+	key := make([]byte, 1+8+32)
+	key[0] = prefix.UpsertKey
+	copy(key[1:9], ws[:])
+	copy(key[9:41], hash[:])
+	return key
+}
+
 // AssocWeightRepairMarkKey constructs the per-vault watermark key (0x2E) for
 // the one-time repair of pre-fix full-weight association keys (#756). Value:
 // one byte, the repair-pass version that last completed cleanly over the

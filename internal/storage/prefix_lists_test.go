@@ -40,7 +40,7 @@ func TestVaultScopedSwapPrefixes_Scope(t *testing.T) {
 		prefix.Trigram, prefix.HNSWNode, prefix.FTSStats, prefix.TermStats,
 		prefix.Contradiction, prefix.StateIndex, prefix.TagIndex, prefix.CreatorIndex,
 		prefix.RelevanceBucket, prefix.AssocWeightIndex, prefix.VaultCount, prefix.Provenance,
-		prefix.BucketMigration, prefix.ContentHash, prefix.RawTagRange,
+		prefix.BucketMigration, prefix.ContentHash, prefix.RawTagRange, prefix.UpsertKey,
 	}
 	assertPrefixListEqual(t, "vaultScopedSwapPrefixes", vaultScopedSwapPrefixes, want)
 }
@@ -59,7 +59,7 @@ func TestVaultScopedExportPrefixes_Scope(t *testing.T) {
 		prefix.TermStats, prefix.Contradiction, prefix.StateIndex, prefix.TagIndex,
 		prefix.CreatorIndex, prefix.RelevanceBucket, prefix.Coherence, prefix.VaultWeights,
 		prefix.AssocWeightIndex, prefix.VaultCount, prefix.Provenance, prefix.BucketMigration,
-		prefix.Embedding, prefix.Episode, prefix.FTSVersion, prefix.ContentHash, prefix.RawTagRange,
+		prefix.Embedding, prefix.Episode, prefix.FTSVersion, prefix.ContentHash, prefix.RawTagRange, prefix.UpsertKey,
 	}
 	assertPrefixListEqual(t, "vaultScopedExportPrefixes", vaultScopedExportPrefixes, want)
 }
@@ -85,7 +85,7 @@ func TestClearVaultDataPrefixes_Scope(t *testing.T) {
 		prefix.CoOccurrence,
 		prefix.ArchiveAssoc, prefix.RelEntityIndex, prefix.DreamState, prefix.ContentHash,
 		prefix.RecallEvent, prefix.Lease, prefix.EvolveRepairMark, prefix.RawTagRange,
-		prefix.ProspectiveIntent, prefix.AssocWeightRepairMark,
+		prefix.ProspectiveIntent, prefix.AssocWeightRepairMark, prefix.UpsertKey,
 	}
 	assertPrefixListEqual(t, "clearVaultDataPrefixes", clearVaultDataPrefixes, want)
 }

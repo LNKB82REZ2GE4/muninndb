@@ -122,6 +122,7 @@ func TestAll_ConstSliceComplete(t *testing.T) {
 		{"AssocWeightRepairMark", AssocWeightRepairMark},
 		// Replication (0x2F — relocated off the double-allocated 0x19 by #726)
 		{"Replication", Replication},
+		{"UpsertKey", UpsertKey},
 		// Capability (0x40/0x41)
 		{"Capability", Capability},
 		{"CapabilityVaultIdx", CapabilityVaultIdx},

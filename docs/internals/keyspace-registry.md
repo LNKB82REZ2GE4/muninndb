@@ -70,6 +70,7 @@ prefix — see the vault-reuse note at the bottom).
 | **0x2D** | ws+EntityNameHash(cue)(8)+intentionID(16) | msgpack {one_shot, created_at, fired_count, last_fired_at, cues[]} | **armed-intention index (THE PUSH, prospective memory).** One key per (intention, cue entity); `ScanArmedForEntity` is a 17-byte-prefix scan consulted ONLY inside recall/remember tool handlers when the cue entity is focal — nothing polls it. The value duplicates the full cue list across an intention's keys so a one-shot fire deletes every sibling key atomically (`MarkIntentionFired`) and entity-merge can rewrite stale cue names (`RelinkProspectiveIntent`, mirroring the 0x26 relink; called from `MergeEntity`). Cleared by `ClearVault`. NOT exported/cloned (intentions are session-arming state; documented residual). Stale keys for a deleted intention engram are inert — the firing rule re-verifies the engram (exists, active, ValidAt) before delivery. The design doc allocated 0x2C for this index, but 0x2C was taken by RawTagRange (S1) first; 0x2D is the real allocation. |
 | **0x2E** | ws | 1B repair version | **pre-fix full-weight association-key repair watermark (#756).** The original `WeightComplement` overflowed at weight exactly 1.0 and wrote those 0x03/0x04 keys at the weight-0.0 complement (`0xFFFFFFFF`), where they read back as weight 0; the encoder was fixed byte-compatibly in #757 but the misplaced keys remain. `Engine.runLegacyFullWeightAssocRepair` scans 0x03 for that complement and, when the pair's 0x14 index reads **exactly 1.0**, relocates fwd/rev to the true 1.0 position (complement `0x00000000`) carrying the value bytes verbatim, deleting the legacy position; any other index value is left alone. Presence at the current version skips the scan. A one-shot watermark is sound because the fixed encoder cannot create new damage of this kind. Cleared by `ClearVault`. Edges a decay pass already clamped or deleted are unrepairable **and unidentifiable** — no count is claimed for them, and neither are pre-0x14-era pairs that carry no weight index at all. `runPruneWorker` gates assoc decay (`Engine.decayAllVaults`) on the pass completing **cleanly**: a pass that errored leaves the gate shut for the process lifetime and logs at ERROR, because decay over a still-damaged vault destroys that evidence permanently and unidentifiably. The pass is **local to each node** — nothing is replicated (the #681 precedent); it is deterministic and idempotent, so nodes converge. Upgrade the **leader first**, and upgrade followers promptly: an ungated old-binary node can destroy its own evidence before it is upgraded. |
 | **0x2F** | 0x01\|seq_be64(8) (log entry) / 0x02\|name (metadata) | msgpack ReplicationEntry / raw | **the whole `internal/replication` keyspace (#726).** Relocated off 0x19, where it overlapped `prefix.Idempotency` byte-for-byte. The second discriminator byte is load-bearing: the entry sub-range is exactly `[0x2F 0x01, 0x2F 0x02)`, so `ReplicationLog.Prune`'s `DeleteRange` is structurally confined to log entries and cannot reach the metadata (seq counter, last-applied, schema version, cluster epoch, node role, snap-complete) or anything else. Constructors in `internal/replication/keys.go`; **global, not vault-scoped**, so it belongs in none of the four `prefix_lists_test.go` lists. Migrated by `internal/storage/migrate/v5_replication_prefix_relocate.go`, which moves the metadata and DROPS the legacy log entries behind a positive per-key identification (never a range delete — receipts share the old range) |
+| **0x30** | ws+sha256(32) | engramID(16) | upsert forward-index — `idempotent_id` → engram pin (#556); relocation history 0x2B → 0x2D → 0x2E → 0x2F → 0x30 (0x2F taken by Replication, #726) |
 
 ## Auth prefixes (`internal/auth/keys.go`)
 
@@ -103,13 +104,13 @@ sequence MaxUint64), `0x19 0x02 "last_app"`, `0x19 0x03 "schema_v" /
 
 ## Free bytes
 
-`0x30`–`0x3F` and `0x46`+ are free for new storage/auth keys (0x2B–0x2F are now
+`0x31`–`0x3F` and `0x46`+ are free for new storage/auth keys (0x2B–0x30 are now
 allocated: 0x2B evolve-repair watermark (#681), 0x2C raw-tag-range index (S1), 0x2D
 armed-intention index (THE PUSH), 0x2E full-weight assoc-key repair watermark (#756),
-0x2F the replication keyspace (#726);
+0x2F the replication keyspace (#726), 0x30 upsert forward-index (#556);
 0x40–0x45 are allocated: 0x40/0x41 capability, 0x42–0x45 auth). (`0x29`/`0x40`/`0x41`
 also appear in `internal/transport/mbp/frame.go` as **wire opcodes**, a different
-keyspace; coincidental, safe, but confusing. Prefer `0x30+` for new storage prefixes.)
+keyspace; coincidental, safe, but confusing. Prefer `0x31+` for new storage prefixes.)
 
 ## Live hazards a reviewer must know
 
