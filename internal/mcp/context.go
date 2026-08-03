@@ -212,6 +212,7 @@ var mutatingTools = map[string]bool{
 	"muninn_replay_enrichment":     true,
 	"muninn_feedback":              true,
 	"muninn_trust":                 true,
+	"muninn_update_tags":           true,
 	"muninn_compare_and_set":       true,
 	"muninn_claim":                 true,
 	"muninn_release":               true,

@@ -1046,13 +1046,152 @@ func (e *Engine) validateClientEmbeddingDim(wsPrefix [8]byte, vec []float32) err
 	return nil
 }
 
-// UpdateTags replaces the tags on an engram.
+// UpdateTags replaces the tags on an engram, keeping the FTS posting lists in
+// sync with the new tag set.
+//
+// The reindex is not housekeeping — it is the difference between correct and
+// silently-wrong recall. Tags are tokenized into the BM25 posting lists under
+// FieldTags (fts.Index.IndexEngram), while store.UpdateTags only rewrites
+// 0x02/0x03/0x0C/0x2C. Stale 0x0C/0x2C tag-index entries are harmless because
+// activation.PassesMetaFilter re-checks tags_all/tags_any/tag_prefix against
+// eng.Tags before a candidate survives; FTS has no such rescue, because
+// ftsScore feeds the RRF/ACT-R blend directly. Without this, a retagged engram
+// scores on a tag it no longer has and cannot score on the tag it just gained
+// (#720, TestUpdateTags_ReindexesFTS).
+//
+// The reindex goes through fts.ReindexEngram, SYNCHRONOUSLY, and that is
+// deliberate on both counts.
+//
+// One call, because delete-then-add is not statistics-neutral: fts.IndexEngram
+// increments the per-term document frequency df_t for every term of the document
+// (and bumps TotalEngrams) while fts.DeleteEngram decrements neither, so pairing
+// them made every retag decay the engram's own score for a query on its own
+// unchanged content — measured at 82.6% over 100 retags against a 10.0% drop for
+// an unretagged control in the same vault. ReindexEngram moves df_t only for
+// terms whose membership actually changed and never touches the global stats;
+// see its doc comment for the arithmetic.
+//
+// Synchronously, because this is the one FTS path that DELETES before it adds.
+// Every other ftsWorker.Submit site only ever adds postings, so a job dropped
+// under queue pressure costs visibility of new content. Here a dropped job — a
+// full queue, a worker stopped mid-shutdown, a crash in the ~100ms window —
+// would leave the engram with NO postings at all, invisible to keyword search
+// under its concept and content, not just its tags, until someone ran
+// reindex-fts. That is strictly worse than the stale-tag bug the reindex
+// replaces. The delete half was already synchronous and a retag is rare, so
+// there is nothing to buy by keeping half of it on the worker.
+//
+// TRASH is de-indexed; HISTORY is reindexed. The drop is gated on
+// activation.CarriesSupersessionSignature, not on State alone. Only a plain
+// soft-delete — muninn_forget without not_true_since, which leaves ValidUntil
+// OPEN — gets its postings dropped: that record is trash, Forget already
+// de-indexed it at delete time, and re-adding it would put a discarded document
+// back where it burns candidate seed slots.
+//
+// Everything else is reindexed, including a CLOSED-stamp soft-delete and an
+// archived record. An earlier revision dropped postings for StateSoftDeleted/
+// StateArchived unconditionally, reasoning that phase 6 filters both before
+// returning candidates. That premise is false in exactly the case that matters:
+// activation.PassesLifecycle ADMITS a soft-deleted engram carrying a closed
+// ValidUntil under as_of or include_invalid — precisely the evolve/supersedes
+// signature — and Evolve deliberately does NOT delete its predecessor's postings
+// the way Forget does, because those postings are what a query phrased in the
+// OLD wording still matches (COG-28 then resolves that evidence forward to the
+// chain head). So retagging an evolve predecessor permanently destroyed the
+// keyword path to a superseded fact that as_of is contracted to still reach,
+// recoverable only by reindex-fts (#720 review, finding 1: one hit before the
+// retag, zero after). Archived is reindexed for the adjacent reason — nothing
+// de-indexes on archival, so dropping here would make a metadata edit the only
+// thing that ever removes those postings, and archival is a storage-tier
+// eviction rather than a statement about truth.
+//
+// The delete side must be keyed on the OLD document — read here BEFORE
+// store.UpdateTags overwrites it, since the terms to remove are derived from the
+// tags handed in. Errors are logged, never returned, matching Write/Evolve/
+// Forget: the record is already durably retagged, so a failed index write must
+// not turn a committed retag into a caller-visible failure.
 func (e *Engine) UpdateTags(ctx context.Context, vault string, id storage.ULID, tags []string) error {
 	if err := e.refuseWrite(ctx); err != nil {
 		return err
 	}
 	wsPrefix := e.store.ResolveVaultPrefix(vault)
-	return e.store.UpdateTags(ctx, wsPrefix, id, tags)
+
+	// Serialize the WHOLE read-prev → write → reindex sequence under the same
+	// per-engram stripe lock the storage write takes, via the unlocked inner
+	// variant (casLocks is not reentrant). Storage being atomic is not enough:
+	// the FTS delta is derived from the tag set read BEFORE the write, so two
+	// concurrent retags of one engram could interleave read/write/reindex and
+	// strand the loser's postings while double-decrementing df_t for the terms
+	// both passes believed they removed — and because df_t is corpus-wide, that
+	// moved an UNINVOLVED third engram's full-text score by 6.5%. Measured at 36
+	// of 40 trials with no artificial delay (#720 review, finding 3). Two agents
+	// retagging the same memory is ordinary cooperative behaviour, not an
+	// adversarial edge, so documenting the race was not sufficient.
+	unlock := e.store.LockEngram(id)
+	defer unlock()
+
+	// Capture the OLD tags (and the text fields the postings were built from)
+	// before the write; this read is what makes the FTS delete exact.
+	//
+	// The snapshot must be a COPY, not the returned pointer: GetEngram hands
+	// back the L1 cache's live entry (DomainCache.Get does not clone), and
+	// store.UpdateTags reassigns Tags on that very object — so holding the
+	// pointer and reading prev.Tags after the write yields the NEW tags and
+	// deletes the wrong postings, which looks like a fix while leaving the bug
+	// in place.
+	prev, prevErr := e.store.GetEngram(ctx, wsPrefix, id)
+	var prevDoc fts.Document
+	if prevErr == nil && prev != nil {
+		prevDoc = fts.Document{
+			Concept:   prev.Concept,
+			CreatedBy: prev.CreatedBy,
+			Content:   prev.Content,
+			Tags:      append([]string(nil), prev.Tags...),
+		}
+	}
+
+	if err := e.store.UpdateTagsLocked(ctx, wsPrefix, id, tags); err != nil {
+		return err
+	}
+
+	if e.fts == nil {
+		return nil
+	}
+	if prevErr != nil || prev == nil {
+		slog.Warn("engine: update_tags: pre-read failed, FTS tag postings left stale until reindex-fts",
+			"id", id.String(), "err", prevErr)
+		return nil
+	}
+
+	// Authoritative post-write record. prev is a pre-write snapshot; the stripe
+	// lock held above means no concurrent writer can have changed the lifecycle
+	// under us, but store.UpdateTagsLocked re-caches the committed record so this
+	// read is cheap and is the one that reflects the commit.
+	cur := prev
+	if committed, err := e.store.GetEngram(ctx, wsPrefix, id); err == nil && committed != nil {
+		cur = committed
+	}
+	if cur.State == storage.StateSoftDeleted && !activation.CarriesSupersessionSignature(cur) {
+		// Trash, not history: an open ValidUntil means muninn_forget threw this
+		// record away rather than superseding it, and Forget already de-indexed
+		// it. Drop whatever postings remain and write nothing back, so a retag
+		// cannot put a discarded document into the candidate pool.
+		if err := e.fts.DeleteEngram(wsPrefix, [16]byte(id),
+			prevDoc.Concept, prevDoc.CreatedBy, prevDoc.Content, prevDoc.Tags); err != nil {
+			slog.Warn("engine: update_tags: fts delete failed", "id", id.String(), "err", err)
+		}
+		return nil
+	}
+
+	// The text fields are unchanged by a retag; only Tags differ between the two
+	// documents, which is exactly what makes ReindexEngram's DF bookkeeping a
+	// no-op for every term the engram keeps.
+	next := prevDoc
+	next.Tags = tags
+	if err := e.fts.ReindexEngram(wsPrefix, [16]byte(id), prevDoc, next); err != nil {
+		slog.Warn("engine: update_tags: fts reindex failed", "id", id.String(), "err", err)
+	}
+	return nil
 }
 
 // CheckIdempotency looks up an op_id receipt. Returns nil, nil if not found.

@@ -909,17 +909,128 @@ func (ps *PebbleStore) SoftDelete(ctx context.Context, wsPrefix [8]byte, id ULID
 	return nil
 }
 
-// UpdateTags replaces the tag list on an engram, re-encodes the full record,
-// and adds any new tag index entries. Old tag index entries for tags no longer
-// present are left as orphans (safe: they point to a valid engram, just stale).
-// For the dedup use-case (tags are always a superset) there are no removals.
+// UpdateTags REPLACES the tag list on an engram (an empty slice clears all
+// tags), re-encodes the full record, and writes 0x0C/0x2C index entries for the
+// new set. A soft-deleted engram is retaggable: the read below does not filter
+// by state, which is deliberate — Restore exists, and refusing to fix a label on
+// a recoverable memory would be a worse contract than allowing it.
+//
+// Tag index entries for REMOVED tags are left behind as orphans. That is not a
+// correctness bug — activation.PassesMetaFilter re-checks tags_all/tags_any/
+// tag_prefix against the engram's real Tags, so a stale seeding entry can never
+// produce a false positive — but it is not free either: the orphans consume the
+// bounded candidate-seeding budget in ListByTagInRange/ListByTagsAllInRange
+// (query.go) and in ScanRawTagRange (raw_tag_range.go), so a heavily-retagged
+// vault can crowd genuine matches out of a tag-filtered recall. The 0x2C
+// raw-tag-range orphans are the sharper edge of the two: every value of a given
+// tag key shares Hash(tagKey), so N retags of ONE engram leave N orphans inside
+// the SAME scanned range, ScanRawTagRange iterates it ascending — oldest value
+// first, exactly where a `due:<=today` scan starts — and breaks on a hard limit
+// with no dedup. The seeding budget is k*3, i.e. 90 with the default
+// CandidatesPerIndex of 30 (activation/engine.go seedTagCandidates call sites),
+// so roughly 90 retags of a SINGLE engram can consume the entire tag-seeding
+// budget for that filter and starve every other engram out of the seed set.
+// Deleting the orphans on removal is deliberately out of scope here (#720).
+// The FTS posting lists are a different story and are NOT self-correcting —
+// Engine.UpdateTags reindexes them (see its doc comment).
+//
+// Takes the per-engram stripe lock (casLocks.For(id) — the SAME striped mutex
+// CompareAndSet/DeleteEngram/SoftDelete/UpdateConfidence/TouchAccess use) across
+// the whole read-mutate-write. Previously this ran unlocked, which reopened the
+// #594 resurrection race ([STO-2]/[STO-3]): because this method re-encodes the
+// FULL record, it writes back every field from its snapshot — State,
+// Confidence, AccessCount, LastAccess — so a snapshot taken before a concurrent
+// SoftDelete committed resurrected the record to active while the 0x0B state
+// index still read soft_deleted (measured: 35/200 engrams resurrected and
+// diverged, and a concurrent TouchAccess reinforcement reverted on 95/200).
+// [STO-2] says "state or lease" and tags are neither, but the code here writes
+// State unconditionally, so the invariant applies. It follows SoftDelete's
+// locking shape — drop the cache entry before the authoritative GetEngram read
+// so a racing DeleteEngram's stale entry can't be reused, mutate the cache under
+// the stripe lock, re-cache the committed record post-commit — with two
+// deliberate additions SoftDelete does not need: an invalidate BEFORE the commit
+// (SoftDelete's only cache write is post-commit, so it has no pre-commit window
+// to close), and a deferred invalidation covering every failure exit, because
+// this method can reject a tag AFTER it has already mutated the cached record
+// (see the comment at that mutation).
 func (ps *PebbleStore) UpdateTags(ctx context.Context, wsPrefix [8]byte, id ULID, tags []string) error {
+	unlock := ps.LockEngram(id)
+	defer unlock()
+	return ps.UpdateTagsLocked(ctx, wsPrefix, id, tags)
+}
+
+// LockEngram acquires the per-engram stripe lock — the SAME casLocks mutex
+// CompareAndSet, SoftDelete, UpdateConfidence and UpdateTags take — and returns
+// its unlock function.
+//
+// Exported for one purpose: a caller whose write is only half-durable inside
+// storage needs to serialize its WHOLE sequence against concurrent writers, not
+// just the storage half. engine.UpdateTags is that caller — its
+// read-previous-tags → store.UpdateTags → fts.ReindexEngram triple derives the
+// FTS delta from the pre-write tag set, so two concurrent retags of the same
+// engram interleaved between the read and the reindex strand the loser's
+// postings and double-decrement df_t for the terms both passes think they
+// removed (#720 review, finding 3: 36 of 40 trials with no artificial delay,
+// and a 6.5% full-text score move on an UNINVOLVED third engram, since df_t is
+// corpus-wide).
+//
+// The mutex is NOT reentrant. A caller holding it must use UpdateTagsLocked;
+// calling UpdateTags under it self-deadlocks.
+//
+// Lock ordering: casLocks is the OUTER lock. engine.UpdateTags takes it and
+// then fts.ReindexEngram takes the index's idx.mu; nothing in internal/index/fts
+// reaches back into PebbleStore (it imports only storage/keys), so the order
+// cannot invert.
+func (ps *PebbleStore) LockEngram(id ULID) func() {
+	mu := ps.casLocks.For(id[:])
+	mu.Lock()
+	return mu.Unlock
+}
+
+// UpdateTagsLocked is UpdateTags without acquiring the stripe lock. The caller
+// MUST already hold it via LockEngram for this engram id; see UpdateTags for
+// the full contract and the resurrection-race reasoning that applies equally
+// here.
+func (ps *PebbleStore) UpdateTagsLocked(ctx context.Context, wsPrefix [8]byte, id ULID, tags []string) error {
+	ps.cache.Delete(wsPrefix, id)
+
 	eng, err := ps.GetEngram(ctx, wsPrefix, id)
 	if err != nil {
 		return err
 	}
 
-	eng.Tags = tags
+	// GetEngram hands back the L1 cache's LIVE entry (DomainCache.Get does not
+	// clone), so the mutation below poisons the cached copy the instant it runs —
+	// before anything has been validated, let alone committed. Every exit path
+	// from here on must therefore drop it. It used to return early from the
+	// WriteRawTagIndexEntry error branch below, ahead of the invalidation:
+	// the call reported failure (a NUL byte in a key:value tag's value is
+	// rejected by ValidateRawTagValue, reachable straight from MCP since
+	// normalizeTags only checks type/emptiness/length), Pebble still held the old
+	// tags, and until eviction GetEngram served the REJECTED ones — so
+	// muninn_read echoed tags that were never stored and
+	// activation.PassesMetaFilter, which re-checks the poisoned eng.Tags,
+	// filtered the engram out of a recall on its REAL tags. An error-returning
+	// call producing a silent false negative is the worst failure class there is.
+	committed := false
+	defer func() {
+		if committed {
+			return // success path already re-cached the committed record below
+		}
+		ps.cache.Delete(wsPrefix, id)
+		ps.metaCache.Remove([16]byte(id))
+	}()
+
+	// Snapshot the OLD tag set BEFORE the mutation below overwrites it — the
+	// removal diff further down is derived from it, and eng.Tags is the live
+	// cached record's own slice header.
+	oldTags := append([]string(nil), eng.Tags...)
+
+	// Copy rather than alias: this slice becomes a field of the shared, cached
+	// engram, so keeping the caller's backing array would hand every reader a
+	// window into memory the caller still owns.
+	eng.Tags = make([]string, len(tags))
+	copy(eng.Tags, tags)
 	eng.UpdatedAt = time.Now()
 
 	erfEng := toERFEngram(eng)
@@ -941,28 +1052,85 @@ func (ps *PebbleStore) UpdateTags(ctx context.Context, wsPrefix [8]byte, id ULID
 	}
 	batch.Set(metaKey, metaSlice, nil)
 
+	// Retire index entries for tags that are GOING AWAY, then write the ones
+	// that stay. Deletes are queued FIRST so that a hash collision between a
+	// departing and an arriving tag self-heals within the batch (delete then
+	// set), rather than depending on the diff alone.
+	//
+	// This is not housekeeping. UpdateTags REPLACES a set, so unlike the
+	// create path it can strand entries, and the 0x0C/0x2C indexes are
+	// CANDIDATE SEEDS with a bounded budget: phase-6's passesMetaFilter
+	// re-checks the real tag on the engram, so an orphan can never produce a
+	// false positive — it burns a seed slot instead. That is a false NEGATIVE
+	// at the pool boundary, which is the silently-wrong class. Measured (#720
+	// review, finding 2): ninety retags of ONE recurring due-date task
+	// starved the tag-seeding budget outright, crowding out ten genuinely
+	// matching engrams. Due-date tags are precisely the workload this tool's
+	// own description and muninn_guide recommend, so the residual is not
+	// deferrable here even though it is invisible in a small vault.
+	//
+	// The diff is computed on the DERIVED KEY, not the tag string — see
+	// RawTagIndexKeyFor for why a string diff is collision-unsafe. The 0x0C
+	// index gets the identical treatment: its key hashes the whole tag.
+	keptTagKeys := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		keptTagKeys[string(keys.TagIndexKey(wsPrefix, keys.Hash(tag), [16]byte(id)))] = struct{}{}
+	}
+	keptRawKeys := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		if k, ok := RawTagIndexKeyFor(wsPrefix, tag, [16]byte(id)); ok {
+			keptRawKeys[string(k)] = struct{}{}
+		}
+	}
+	for _, tag := range oldTags {
+		k := keys.TagIndexKey(wsPrefix, keys.Hash(tag), [16]byte(id))
+		if _, kept := keptTagKeys[string(k)]; !kept {
+			batch.Delete(k, nil)
+		}
+		rawKey, indexed := RawTagIndexKeyFor(wsPrefix, tag, [16]byte(id))
+		if !indexed {
+			continue
+		}
+		if _, kept := keptRawKeys[string(rawKey)]; !kept {
+			batch.Delete(rawKey, nil)
+		}
+	}
+
 	// Write tag index entries for all tags (idempotent for existing tags).
 	for _, tag := range tags {
 		batch.Set(keys.TagIndexKey(wsPrefix, keys.Hash(tag), [16]byte(id)), []byte{}, nil)
 	}
 
 	// Write raw-tag-range index entries for all tags (idempotent for existing
-	// tags; like the 0x0C index above, stale entries for tags that are no
-	// longer present are left as orphans — safe, since phase-6's
-	// passesMetaFilter re-checks the real tag on the engram).
+	// tags).
 	for _, tag := range tags {
 		if err := WriteRawTagIndexEntry(batch, wsPrefix, tag, [16]byte(id)); err != nil {
 			return err
 		}
 	}
 
-	// Invalidate L1 cache BEFORE commit — cached struct has stale tags.
+	// Invalidate L1 cache BEFORE commit — the in-memory struct already carries
+	// the new tags while Pebble still holds the old ones.
 	ps.cache.Delete(wsPrefix, id)
 	ps.metaCache.Remove([16]byte(id))
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
+
+	// Re-cache the committed record, under the stripe lock, as SoftDelete and
+	// UpdateConfidence do. Without this the invalidate-above/commit-here window
+	// is open to an unlocked reader — recall calls GetEngram/GetEngrams
+	// constantly and readers do not take casLocks — which would miss the cache,
+	// read the PRE-commit Pebble value, and re-cache it, leaving a stale tag set
+	// cached indefinitely against a committed new one. The Set stays INSIDE the
+	// lock for the reason UpdateConfidence gives: outside it, a racing
+	// DeleteEngram's post-commit cache.Delete can land first and this Set would
+	// re-cache an engram Pebble has already deleted.
+	ps.cache.Set(wsPrefix, id, eng)
+	ps.metaCache.Remove([16]byte(id))
+	committed = true
+
 	ps.replicateBatch(batch)
 
 	return nil

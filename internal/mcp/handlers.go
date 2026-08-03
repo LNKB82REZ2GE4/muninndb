@@ -88,6 +88,55 @@ func parseEmbeddingArg(args map[string]any) ([]float32, string) {
 	return embedding, ""
 }
 
+// normalizeTags coerces a raw MCP `tags` argument into the canonical tag set:
+// non-strings, empty strings, and tags longer than 128 characters are skipped,
+// and the set is capped at 50. Shared by muninn_remember, muninn_remember_batch,
+// and muninn_update_tags so a tag set applied on update obeys exactly the same
+// rules as one applied at creation — otherwise evolve's tag inheritance could
+// carry forward a set muninn_remember could never have created (#720).
+func normalizeTags(raw []any) []string {
+	tags, _ := normalizeTagsReporting(raw)
+	return tags
+}
+
+// normalizeTagsReporting is normalizeTags with the rejects reported rather than
+// discarded: dropped carries one human-readable reason per rejected entry, in
+// input order, naming the offending value.
+//
+// Create-time leniency (muninn_remember/_batch) is deliberate and stays — one
+// junk entry beside good ones should not fail an entire write. muninn_update_tags
+// REPLACES the set rather than adding to it, so the identical leniency has a
+// different cost there: a `tags` array non-empty on the wire but empty after
+// normalization silently wiped every real tag on the engram and returned ok.
+// Measured at three tags destroyed end-to-end by one 129-byte input (#720
+// review, finding 4). A caller that replaces must reject loudly — see
+// handleUpdateTags.
+func normalizeTagsReporting(raw []any) (tags []string, dropped []string) {
+	for i, t := range raw {
+		tag, ok := t.(string)
+		if !ok {
+			dropped = append(dropped, fmt.Sprintf("entry %d: not a string", i))
+			continue
+		}
+		switch {
+		case len(tag) == 0:
+			dropped = append(dropped, fmt.Sprintf("entry %d: empty string", i))
+		case len(tag) > 128:
+			dropped = append(dropped, fmt.Sprintf("entry %d: %d bytes, over the 128-byte limit (starts %q)",
+				i, len(tag), tag[:32]))
+		default:
+			tags = append(tags, tag)
+		}
+	}
+	if len(tags) > 50 {
+		for _, over := range tags[50:] {
+			dropped = append(dropped, fmt.Sprintf("%q: past the 50-tag limit", over))
+		}
+		tags = tags[:50]
+	}
+	return tags, dropped
+}
+
 func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
 	opID, _ := args["op_id"].(string)
 	if opID != "" {
@@ -124,14 +173,7 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 		req.Concept = c
 	}
 	if tags, ok := args["tags"].([]any); ok {
-		for _, t := range tags {
-			if s, ok := t.(string); ok && len(s) > 0 && len(s) <= 128 {
-				req.Tags = append(req.Tags, s)
-			}
-		}
-		if len(req.Tags) > 50 {
-			req.Tags = req.Tags[:50]
-		}
+		req.Tags = normalizeTags(tags)
 	}
 	if conf, ok := args["confidence"].(float64); ok {
 		if conf < 0 {
@@ -253,14 +295,7 @@ func (s *MCPServer) handleRememberBatch(ctx context.Context, w http.ResponseWrit
 			req.Concept = c
 		}
 		if tags, ok := m["tags"].([]any); ok {
-			for _, t := range tags {
-				if s, ok := t.(string); ok && len(s) > 0 && len(s) <= 128 {
-					req.Tags = append(req.Tags, s)
-				}
-			}
-			if len(req.Tags) > 50 {
-				req.Tags = req.Tags[:50]
-			}
+			req.Tags = normalizeTags(tags)
 		}
 		if conf, ok := m["confidence"].(float64); ok {
 			if conf < 0 {
@@ -806,6 +841,16 @@ func (s *MCPServer) handleStatus(ctx context.Context, w http.ResponseWriter, id 
 }
 
 func (s *MCPServer) handleEvolve(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	// Tags are metadata, and evolve is not a metadata update: it mints a new
+	// ULID and archives the predecessor. Unknown MCP params are not rejected
+	// in general, so accepting `tags` here would return success with the tags
+	// silently discarded — the worst failure class in this project (#720).
+	if _, present := args["tags"]; present {
+		sendError(w, id, -32602, "invalid params: 'tags' is not accepted by muninn_evolve — "+
+			"tags are metadata, and evolving to change them would archive this memory under a new ID; "+
+			"use muninn_update_tags(id, tags) to retag in place")
+		return
+	}
 	engramID, ok1 := args["id"].(string)
 	newContent, ok2 := args["new_content"].(string)
 	reason, ok3 := args["reason"].(string)
@@ -2708,6 +2753,56 @@ func (s *MCPServer) handleSetTrust(ctx context.Context, w http.ResponseWriter, i
 		"trust": trustStr,
 		"ok":    true,
 	})))
+}
+
+// handleUpdateTags replaces an engram's full tag set IN PLACE. Unlike
+// muninn_evolve — which mints a new ULID and archives the predecessor — the
+// ID, version lineage, and access history are preserved, which is the whole
+// reason this tool exists rather than a `tags` argument on evolve (#720).
+func (s *MCPServer) handleUpdateTags(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	engramID, ok := args["id"].(string)
+	if !ok || engramID == "" {
+		sendError(w, id, -32602, "invalid params: 'id' is required")
+		return
+	}
+	rawTags, present := args["tags"]
+	if !present || rawTags == nil {
+		sendError(w, id, -32602, "invalid params: 'tags' is required (pass an empty array to clear all tags)")
+		return
+	}
+	tagsAny, ok := rawTags.([]any)
+	if !ok {
+		sendError(w, id, -32602, "invalid params: 'tags' must be an array of strings")
+		return
+	}
+	tags, dropped := normalizeTagsReporting(tagsAny)
+	// An explicit empty array stays a deliberate clear-all. But a NON-empty
+	// array that normalizes to nothing is a caller mistake, and because this
+	// tool replaces the set, honoring it would erase every tag on the engram and
+	// report ok — the same silent-drop failure class that #720 exists to fix,
+	// pointed the other way. Reject it and name what was wrong.
+	if len(tagsAny) > 0 && len(tags) == 0 {
+		sendError(w, id, -32602, "invalid params: no usable tag in 'tags' — every entry was rejected ("+
+			strings.Join(dropped, "; ")+"). Pass an empty array to clear all tags deliberately.")
+		return
+	}
+	if tags == nil {
+		// REST coerces a nil body field to []string{}; clear-all sends an empty
+		// set, not nil, and the response payload renders [] rather than null.
+		tags = []string{}
+	}
+	if err := s.engine.UpdateTags(ctx, vault, engramID, tags); err != nil {
+		sendError(w, id, -32000, "tool error: "+err.Error())
+		return
+	}
+	// Partial normalization still succeeds — some usable tag survived — but the
+	// caller is told what did not land rather than having to diff the echo.
+	out := map[string]any{"id": engramID, "tags": tags, "ok": true}
+	if len(dropped) > 0 {
+		out["dropped"] = len(dropped)
+		out["dropped_detail"] = dropped
+	}
+	sendResult(w, id, textContent(mustJSON(out)))
 }
 
 func (s *MCPServer) handleCompareAndSet(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {

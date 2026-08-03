@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`muninn_update_tags` MCP tool.** Replaces an engram's tag set in place —
+  the ULID, version lineage, and access history are all preserved (unlike
+  `muninn_evolve`, which mints a new ULID and archives the predecessor).
+  Takes `vault`, `id`, and `tags`; an empty `tags` array clears all tags.
+  The tag set is normalized exactly as `muninn_remember` normalizes it —
+  non-string and over-128-**byte** entries are **dropped, not rejected**, and
+  the set is **truncated to 50** — so diff the `tags` the response echoes back
+  against what you sent. (The limit is bytes, not glyphs: a 50-glyph CJK tag is
+  150 bytes and is dropped.) A soft-deleted memory can still be retagged, but its
+  keyword-search postings stay dropped while it is deleted — that is what keeps a
+  deleted memory out of search results — so retag it again after
+  `muninn_restore` if it must be findable by the new tags. Brings the MCP tool
+  count to 45. (#720)
 - **`--log-file`/`MUNINN_LOG_FILE` and a `SIGHUP` log-reopen signal, so log rotation is possible under a process supervisor** (#850). Previously the daemon handled only `SIGINT`/`SIGTERM`; there was no way to tell it to reopen its log destination, so the standard rotation contract (a rotator renames the file, then signals the writer to reopen it) had nothing to signal — `logrotate` without `copytruncate` and BSD `newsyslog` (which has no copy-truncate equivalent at all) were both unworkable, and copy-truncate itself has a lossy window. When `--log-file`/`MUNINN_LOG_FILE` names a path, the daemon opens its own descriptor on it (independent of inherited stderr) and `SIGHUP` closes and reopens it under a lock, so no log line is dropped or split across the swap. Without an explicit log file, `SIGHUP` is a documented no-op (a WARN is logged) rather than guessing at a destination — there is no portable way to resolve "whatever stderr currently is" back to a path. `muninn start` sets `MUNINN_LOG_FILE` automatically to its historical `muninn.log` path, so the common case gets rotation support with no configuration change. SIGHUP was chosen over SIGUSR1: it's the long-standing reopen/reload convention (syslog, nginx, Apache) and nothing in this codebase used it; it also compiles on the Windows build of `syscall` (unraisable there, so the reopen path is simply unreachable) where `syscall.SIGUSR1` does not exist at all. **This log-rotation mechanism is POSIX-only** — Windows has no process-signal equivalent to deliver `SIGHUP` with, so there is no trigger for reopen on that platform at all; see `docs/self-hosting.md`.
 - **`MUNINN_ACCESS_LOG` decouples the REST per-request access log from `--log-level`** (#851). The access log line was `slog.Info`, so silencing it meant raising the global level to `warn` — which also discarded every other INFO event (startup, migrations, enrichment, decay, pruner activity). `MUNINN_ACCESS_LOG=0` now silences only the per-request line; every other INFO log is unaffected. On by default, matching existing `MUNINN_LOCAL_EMBED`-style opt-out-with-`"0"` knobs.
 
@@ -231,6 +244,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   siblings committing as before; gRPC and MBP return their existing error for an
   invalid ID. `relationships[]` is unchanged in this
   release — it still logs a warning and succeeds (#817).
+
+- **A retag no longer leaves stale full-text-search postings.** Tags are
+  tokenized into the BM25 posting lists, but the storage-level tag update only
+  rewrote the record and the tag indices, so after changing a tag recall scored
+  the memory on a tag it no longer had and could not score it on the tag it had
+  just gained. `Engine.UpdateTags` now rebuilds the engram's postings in one
+  atomic operation, keyed on the document captured before the write. (The tag
+  *indices* were never affected — the recall pipeline re-checks them against the
+  engram's real tags — but the full-text score feeds ranking directly with
+  nothing to re-verify it.) This also stops a retagged-then-forgotten memory from
+  staying keyword-searchable under a tag it used to have. (#720)
+
+- **Curating a memory's tags no longer makes it harder to find.** The obvious way
+  to rebuild an engram's postings — delete them, then index the new document —
+  is not statistics-neutral: indexing increments the per-term document frequency
+  for *every* term the memory contains (and the corpus size), while deleting
+  decrements neither. Because BM25's inverse document frequency is
+  `ln((N+1)/(df+0.5))`, each edit moved the denominator by a whole document and
+  the numerator barely at all, so a memory's score for a query on its own
+  **unchanged** content decayed on every retag: measured on a 60-memory vault,
+  −8.1% from a single retag, below a 0.3 recall threshold by ten, and −82.6%
+  after a hundred against a −10.0% drop for an untouched control in the same
+  vault. Since `muninn_update_tags` exists precisely for `due:<ISO-date>`-style
+  conventions, ten retags is under two weeks of ordinary use, and nothing
+  surfaced the loss. Retagging is now stats-neutral by construction: one
+  full-text-index operation that leaves the corpus size alone and moves a term's
+  document frequency only when the term genuinely entered or left the memory.
+  Scoped honestly: that neutrality is with respect to how many times you retag,
+  not to how big the tag set is. A memory whose tag set grows in place is still
+  length-normalized by BM25 like any longer document, and because the rebuild
+  leaves the corpus *average* document length alone, that penalty is slightly
+  over-applied until the next `muninn reindex-fts` — the conservative direction,
+  scores under-credited rather than inflated. There is no ratchet either way:
+  returning to a previous tag set restores the previous score exactly. (#720)
+
+- **A retag no longer makes a deleted memory keyword-searchable again.** A retag
+  rebuilt the posting lists with no state check, undoing the soft delete's own
+  full-text cleanup. Recall never returned the memory (the pipeline filters
+  deleted and archived memories out before scoring), but the postings still
+  consumed candidate slots. A soft-deleted or archived memory now gets its
+  postings dropped and nothing written back — it stays retaggable, and the
+  record is updated as before. (#720)
+
+- **A rejected retag no longer leaves the wrong tags visible.** `muninn_read`
+  could echo tags that had been rejected and never stored, and — worse — a recall
+  filtered on the memory's *real* tags could drop it, because the same in-memory
+  copy backs both. The storage-level tag update mutated the cached record before
+  validating it and then returned from the validation-failure path without
+  dropping the cache entry, so a call that reported an error still changed what
+  every reader saw until the entry was evicted. Reachable from MCP with a tag
+  whose `key:value` value contains a NUL byte. The cache entry is now dropped on
+  every exit path, and the committed record is re-cached after the write — which
+  also closes the window where a concurrent reader could re-cache the
+  pre-commit tags on top of a committed update. (#720)
+
+- **A concurrent retag can no longer resurrect a deleted memory.** The
+  storage-level tag update re-encodes the whole record, so unlocked it wrote back
+  every field from a snapshot that could predate a committed delete — leaving the
+  memory `active` in the record while the state index said `soft_deleted`
+  (`muninn_forget` succeeds, `muninn_list_deleted` shows it as deleted, and
+  recall keeps returning it), and reverting a concurrent access-count
+  reinforcement. It now holds the same per-engram stripe lock every sibling
+  read-modify-write holds ([STO-2]/[STO-3]). (#720)
+
+### Changed
+
+- **`muninn_evolve` now rejects a `tags` argument** with JSON-RPC `-32602`,
+  naming `muninn_update_tags` in the error message. Previously it accepted
+  `tags` and silently discarded them, returning success with no signal the
+  tags were dropped — so a caller could see success, see a `concept` change
+  in the same call take effect, and never learn the tags didn't. This is a
+  behavior change: a call combining `new_content` with `tags` used to
+  *partially* succeed — the content evolution landed and only the tags were
+  dropped — and now fails outright. Nothing that previously worked *completely*
+  breaks; partially-succeeding calls now fail loudly instead. (#720)
 
 ### Internal
 

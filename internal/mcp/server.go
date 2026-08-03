@@ -403,6 +403,9 @@ func (s *MCPServer) toolHandlers() map[string]toolHandlerFunc {
 		// Trust label
 		"muninn_trust": s.handleSetTrust,
 
+		// In-place retag (#720)
+		"muninn_update_tags": s.handleUpdateTags,
+
 		// RFC #597: privileged workflow-vault creation (recursion-guarded in
 		// dispatchToolCall).
 		"muninn_create_workflow_vault": s.handleCreateWorkflowVault,

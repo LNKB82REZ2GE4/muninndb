@@ -114,8 +114,9 @@ var expectedToolClassification = map[string]toolClass{
 	"muninn_retry_enrich":          classMutating,
 	// #731: handleState → Engine.UpdateLifecycleState. Transitions an EXISTING
 	// engram (up to "archived"), so mutating and NOT additive.
-	"muninn_state": classMutating,
-	"muninn_trust": classMutating,
+	"muninn_state":       classMutating,
+	"muninn_trust":       classMutating,
+	"muninn_update_tags": classMutating,
 }
 
 // registeredToolSet returns registeredToolNames() as a set, failing if it

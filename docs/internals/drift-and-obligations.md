@@ -153,6 +153,8 @@ and remain the reviewer's job.
     `localassets || cognitiontrial` so its own unit tests DO run in CI — a rule that
     decides whether a subsystem lives must itself be tested.
 
+15. **A path that rewrites an ALREADY-indexed engram's FTS entries** (`internal/index/fts/`) → call `fts.ReindexEngram`, never `DeleteEngram` followed by `IndexEngram`. The pair is not statistics-neutral — `IndexEngram` bumps `TotalEngrams`/`AvgDocLen` and increments `df_t` for every term of the document, `DeleteEngram` decrements neither — so it silently decays the engram's own BM25 score on every call (COG-24; measured −82.6% over 100 retags, #720). **One carve-out, named by mechanism:** a FULL-VAULT rebuild that first range-tombstones the 0x08 global-stats and 0x09 per-term-stats prefixes via `store.ClearFTSKeys` may call `IndexEngram` on already-indexed engrams — `Engine.ReindexFTSVault` does (`internal/engine/engine_reindex_fts.go:67` clears, `:80` re-indexes), and it is correct precisely because the stats it would otherwise inflate no longer exist. Do **not** read this as "unless the stats are handled": if a path has not range-tombstoned 0x08/0x09, it is in violation. There is no automated check: nothing stops a new call site from pairing them, and nothing distinguishes a legitimate post-`ClearFTSKeys` rebuild from an illegitimate in-place one. 🪝
+
 ## Live drift found during the guardian audit (worth fixing)
 
 - ~~**Windows CI tests the wrong embedding model.**~~ — fixed. `ci.yml`'s Windows job now
