@@ -11,6 +11,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`hebbian_enabled` now governs the read side too** (COG-32). The phase-4
+  Hebbian boost ran unconditionally during recall while its neighbour, the PAS
+  transition boost, was gated — so a vault with `hebbian_enabled: false` (the
+  `scratchpad` preset) was still scored by association edges it would never
+  update and never decay. The flag is now symmetric: it gates learning, decay
+  and the read-side boost. **User-visible:** `scratchpad` vaults score recall
+  without any Hebbian contribution, and rows can reorder on such vaults.
+- **An explicit `actr_heb_scale: 0` is honored** instead of being silently
+  replaced by the 4.0 default. Two layers substituted it; the config layer had
+  always admitted it. `actr_heb_scale` scales both the Hebbian and the PAS
+  transition boost, so 0 is the "no cognitive prior at all" switch — it now
+  works.
+- **Co-activation writes carry their own timestamp.** `CoActivationEvent.At`
+  was set by the engine and then dropped, so an association's `lastActivated`
+  was stamped at write time rather than at co-activation time. An event that
+  waited in the worker's channel was stamped late. Zero-value behaviour is
+  unchanged.
+- **An association's decay anchor never moves backwards** (COG-27). Making the
+  co-activation timestamp writable also made it *remotely* writable: in a
+  cluster, a cog-forwarded co-activation carries the peer's clock verbatim.
+  `lastActivated` is COG-27's elapsed-time input, so a stale stamp collapsed a
+  live edge's decay ceiling on the next pass — irreversibly, since decay never
+  raises a weight. Both association writers now keep the later of the stored and
+  the incoming stamp, the same shape `peakWeight` already had beside them.
+  **User-visible in cluster mode only:** a lagging or skewed peer, or a
+  cog-forward backlog delivered after a partition heals, can no longer age
+  another node's associations by the size of the clock gap.
+- `RecallEvent`'s doc comment no longer claims a "positives = surfaced AND
+  cited" ground-truth join that is not implementable from what is on disk (no
+  join key, no identity on either side, context-free residue, and a citation
+  side damaged by the #757 class).
 - **An association edge can no longer outlive its endpoints** (#803). Hard
   deletes left the dead engram in the FTS and vector indexes, so the automatic
   association workers kept finding it and minting fresh edges to an ID that no
@@ -31,6 +62,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   siblings committing as before; gRPC and MBP return their existing error for an
   invalid ID. `relationships[]` is unchanged in this
   release — it still logs a warning and succeeds (#817).
+
+### Internal
+
+- The cognition trial's machinery: a build-tagged (`cognitiontrial`) offline
+  harness that puts the Hebbian / PAS / ACT-R base-level layer on trial against
+  real recorded queries, a co-activation replay driver, and the pre-registered
+  acceptance rule as executable code with its own unit tests. None of it
+  compiles into a shipped binary.
 
 ### Security
 
