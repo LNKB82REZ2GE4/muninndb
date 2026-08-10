@@ -27,7 +27,11 @@ var appendInfra = map[string]bool{
 	"ClearCognitiveWorkers": true, "SetCognitiveWorkers": true, "SetCoordinator": true,
 	"SetEnrichPlugin": true, "SetLatencyTracker": true, "SetOnWrite": true,
 	"SetReplayEnrichTimeout": true, "SetRetroactiveProcessors": true, "SetTransitionWorker": true,
-	"Store": true, "ResetReplayFailCount": true, "Stop": true, "Checkpoint": true,
+	// SetReplicaProbe installs the cluster-role probe the COG-29 debt scan
+	// cache consults; server wiring only, no credential-reachable path, no
+	// engram/vault mutation.
+	"SetReplicaProbe": true,
+	"Store":           true, "ResetReplayFailCount": true, "Stop": true, "Checkpoint": true,
 	// SetWriteGate installs the cluster single-writer gate (#596) — wiring, and
 	// it can only ever REFUSE writes, never perform one.
 	"SetWriteGate":  true,
@@ -35,6 +39,11 @@ var appendInfra = map[string]bool{
 	// WaitWriteTimeIdle drains the write-time async workers and writes
 	// nothing itself — an out-of-package test seam (#722 doctrine, #764).
 	"WaitWriteTimeIdle": true,
+	// DeclaredScanRunsForTest reads an in-process counter of COG-29 debt-scan
+	// executions. Test-only seam, no store access at all, writes nothing — it
+	// exists because the fast-path gate and the scan cache change only I/O and
+	// are otherwise unassertable.
+	"DeclaredScanRunsForTest": true,
 	// ResetRepairWatermark (#761) deletes a per-vault REPAIR-PASS watermark
 	// (0x2B/0x2E), never an engram/entity/lease — refuseAppend's guarantee is
 	// specifically about existing MEMORIES, and this touches none. It is also
@@ -51,6 +60,10 @@ var appendReadOnly = map[string]bool{
 	"Explain": true, "ExportGraph": true, "ExportVault": true, "FindByEntity": true,
 	"FindSimilarEntities": true, "GetAnnotations": true, "GetAssociations": true,
 	"GetAssociationsBatch": true, "GetContradictions": true, "GetContradictionReport": true,
+	// ContradictionDebt is the COG-29 vault-wide debt readout: it gates on the
+	// existing fast path and then derives entirely from GetContradictionReport,
+	// which is itself read-only.
+	"ContradictionDebt":       true,
 	"GetEngram":               true,
 	"GetEnrichmentCandidates": true, "GetEnrichmentMode": true, "GetEntityAggregate": true,
 	"GetEntityClusters": true, "GetEntityTimeline": true, "GetNoveltyDrops": true,

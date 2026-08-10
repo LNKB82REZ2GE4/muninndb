@@ -632,6 +632,18 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 	if resp.Conflict != nil {
 		result["conflict"] = resp.Conflict
 	}
+	// COG-29 amendment: the vault-wide unresolved-contradiction debt readout,
+	// on mode="recent" ONLY. That condition is not a heuristic guess at "is this
+	// a session start" — it is the exact call generateGuide instructs agents to
+	// make for session continuity, in BOTH the shared and single-user branches,
+	// so it is an agent-DECLARED orientation intent. Default-mode recall, the hot
+	// path, is untouched.
+	if mode == "recent" {
+		rp := s.orientationPlasticity(ctx, vault)
+		if block := s.contradictionDebtAttachment(ctx, vault, rp, time.Now()); block != nil {
+			result["unresolved_contradictions"] = block
+		}
+	}
 	// THE PUSH: prospective notices — focal set derives from the RETURNED
 	// results; readOnly (COG-11) suppresses the fired-marker write. Omitted
 	// when empty; inert unless MUNINN_PROSPECTIVE=1.
@@ -1289,15 +1301,22 @@ func (s *MCPServer) handleWhereLeftOff(ctx context.Context, w http.ResponseWrite
 	if entries == nil {
 		entries = []WhereLeftOffEntry{}
 	}
+	rp := s.orientationPlasticity(ctx, vault)
 	hint := "These are your most recently accessed memories. Use them to orient yourself for this session."
-	if p, perr := s.engine.GetVaultPlasticity(ctx, vault); perr == nil && p != nil && p.MultiUser {
+	if rp.MultiUser {
 		hint = "These are the most recently accessed memories across ALL users of this shared vault — not necessarily yours. For your own session context, use muninn_recall scoped to your per-user tag."
 	}
-	sendResult(w, id, textContent(mustJSON(map[string]any{
+	out := map[string]any{
 		"memories": entries,
 		"count":    len(entries),
 		"hint":     hint,
-	})))
+	}
+	// COG-29 amendment: the vault-wide unresolved-contradiction debt readout.
+	// Absent, not empty, when the vault owes nothing.
+	if block := s.contradictionDebtAttachment(ctx, vault, rp, time.Now()); block != nil {
+		out["unresolved_contradictions"] = block
+	}
+	sendResult(w, id, textContent(mustJSON(out)))
 }
 
 func (s *MCPServer) handleRetryEnrich(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
@@ -1332,7 +1351,14 @@ func (s *MCPServer) handleGuide(ctx context.Context, w http.ResponseWriter, id j
 		EngramCount: statResp.EngramCount,
 		VaultCount:  statResp.VaultCount,
 	}
-	guide := generateGuide(vault, *plasticity, stats)
+	// COG-29 amendment: the vault-wide unresolved-contradiction debt readout,
+	// rendered into the guide's contradiction section. nil ⇒ nothing is added.
+	debt, debtFailed := s.contradictionDebtFor(ctx, vault, *plasticity)
+	debtSection := contradictionDebtGuideSection(debt, plasticity.MultiUser, time.Now())
+	if debtFailed {
+		debtSection = "\n**This vault's unresolved-contradiction state could not be read.** It is UNKNOWN, not zero — `muninn_contradictions` reads the same data directly.\n"
+	}
+	guide := generateGuide(vault, *plasticity, stats, debtSection)
 	sendResult(w, id, textContent(guide))
 }
 

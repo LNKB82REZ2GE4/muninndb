@@ -108,6 +108,139 @@ Format: **[INV-n]** assertion — `file:anchor` — *why it matters / what break
 
   Surface scope: MCP + MBP + REST (alias). gRPC and the non-Go SDKs carry NO annotation fields at all, so adding only this one would be the silently-wrong class — obligation #3, a deliberate omission. Pinned by `internal/engine/engine_contradiction_honesty_test.go`, `..._resolution_test.go` (every resolution path, RED-checked at `bb10f30`) and `internal/mcp/contradiction_honesty_test.go` (the two places an MCP field silently vanishes). **Accepted residual:** an agent that declares a conflict and walks away leaves both facts demoted 10% — visible, recoverable via three named actions the warning spells out, and strictly better than one of them being presented as the truth.
 
+  *Amendment (debt readout, increment 1 — MCP only).* The accepted residual above claims a
+  declared-and-abandoned conflict stays "visible". It was not: every notice in this invariant
+  is conditional on RETRIEVAL — the per-row annotation rides a returned row, and
+  `pruneConflictBlock` prunes the `conflict` block to pairs whose endpoints survived into the
+  caller's final cut — so a conflict on a topic that stops being queried stops being spoken
+  about, while the one-time asynchronous confidence penalty has already been charged and the
+  10% demote waits to be charged the moment either side IS retrieved. (The stronger claim
+  "the penalty is unconditional" is FALSE and was corrected before build:
+  `applyContradictionHonesty` mutates scores over the retrieved window only.) The same
+  unresolved-DECLARED set is therefore also reported VAULT-WIDE, as an additive top-level
+  `unresolved_contradictions` block, by `Engine.ContradictionDebt`
+  (`internal/engine/engine_contradiction.go`). It derives from `GetContradictionReport` and
+  nothing else, so `markResolvedContradictions` stays the SINGLE definition of "unresolved"
+  and a third one cannot appear (pinned by `TestContradictionDebt_ResolvedPairsDisappear`
+  over all three resolution verbs; RED with `markResolvedContradictions` bypassed). It is
+  gated by `vaultMayHaveContradictions`, changes no score, order or
+  row membership, is ABSENT (not empty) at zero debt, reports the TRUE count while showing at
+  most `debtPairsShown` (3) pairs oldest-first, propagates `scan_complete` so a capped scan is
+  never reported as exhaustive, renders an unknown declaration time as absent plus
+  `declared_at_unknown` (never 1970), and uses **no age threshold** — age is reported, never a
+  trigger (principle #11). **DECLARED pairs only**: a detected-only pair is excluded both by
+  the asserted/inferred boundary and because COG-23's un-migrated fabricated 0x0A markers are
+  mechanically indistinguishable from genuine ones, so counting them would nag upgraded vaults
+  about conflicts that never existed. Per-vault switch `PlasticityConfig.ContradictionDebt`
+  (non-preset-varying, resolved default TRUE): setting it false suppresses the RECEIPT only —
+  the demote, the annotation, the `conflict` block and `muninn_contradictions` are unaffected.
+  Exposure follows `muninn_contradictions`, not recall: `fillContradictionConcepts` does not
+  apply the COG-22 visibility gate, so this block can name a concept recall's
+  `resolveContradictionPartners` would have hidden. That is not an escalation today — every
+  credential that reaches these three tools already reaches `muninn_contradictions`, and SEC-9
+  makes toolset filtering advertisement-only — but if toolsets ever become a dispatch
+  boundary, this block must route through the COG-22 gate.
+  **Surface scope is narrower than this invariant's**: increment 1 attaches the block on
+  **MCP only** — `muninn_guide` (as prose, since that response is markdown), and the JSON
+  responses of `muninn_where_left_off` and `muninn_recall` **when `mode="recent"`**, which is
+  the exact orientation call `guide.go` prescribes in both the shared and single-user branches.
+  Default-mode recall, the hot path, is untouched and pinned untouched
+  (`TestContradictionDebt_DefaultModeRecallIsUntouched`). MBP/REST parity via an additive
+  `mbp.ActivateResponse` field, plus a count-only readout on `StatResponse`/`muninn_status`,
+  is **committed as increment 2 and is NOT shipped** — until it lands, an MBP or REST caller
+  issuing the identical `Mode: "recent"` activate gets the demote window without the receipt.
+  When it does land, the MCP handler must read FROM the shared struct field rather than
+  keeping this second construction site. 
+  **COG-11 has two halves here and both are enforced.** It writes nothing to storage — no
+  marker, no `TouchAccess`. It also must not stamp the L1 cache's RECENCY clock, and it did:
+  the endpoint read (`fillContradictionConcepts` → `store.GetEngrams`) ran on the raw handler
+  ctx, so every orientation call freshened `EngramLastAccessNs` on BOTH members of every
+  declared pair — engrams the call never returned, on a query about something else — and that
+  value is a real recency SCORING input for a LATER, unrelated recall. The readout was quietly
+  making the very memories it demotes look freshly used. Fixed by threading
+  `storage.ContextWithNoAccessCacheStamp` through the derivation, **unconditionally, not only
+  for `read_only`**: naming a memory in a vault-wide report is never a user access, whatever
+  the caller's flag says. Pinned by
+  `TestContradictionDebt_DoesNotStampAccessRecencyOnItsEndpoints`, whose control arm is an
+  unrelated `read_only` recall that leaves both endpoints at 0.
+
+  **The declared-edge scan is CACHED; the resolution is NOT.** The scan
+  (`DeclaredContradictions`) is the entire cost and is O(all forward associations), capped at
+  `DefaultDeclaredContradictionScanCap`; a vault at that cap measured ~55ms per orientation
+  call, and — worse — a vault whose single conflict had been RESOLVED paid the full scan
+  forever to emit nothing, because the fast-path flag is sticky and resolution never deletes
+  the declaring edge. `Engine.declaredContradictionsCached` memoises the scan per vault,
+  validated against `PebbleStore.ContradictsWriteGen`, a per-vault counter of `RelContradicts`
+  association writes. **Only the scan is cached.** The 0x0A read, the endpoint fill and
+  `markResolvedContradictions` re-run on every call, because the scan is a pure function of the
+  vault's contradicts edges (so a write counter is an exact invalidation signal) while
+  resolution depends on engram STATE and on the CLOCK — and a `ValidUntil` that simply elapses
+  has no event to invalidate on. Caching the derived ANSWER would have re-created the "resolved
+  it and the theater continued" bug #764 closed, on a timer nobody could see; that is
+  RED-checked — `TestContradictionDebt_CachedScanStillSeesAResolution` fails when the sabotage
+  caches the answer. The counter lives in the STORE, not in an engine hook list, because the
+  engine path misses the inline association writers used by `Write`/`WriteBatch` and — in
+  cluster mode — replication applying a peer's write, which never calls `Engine.Link`; its
+  completeness is pinned behaviourally, one arm per public write path
+  (`TestContradictsWriteGen_BumpsOnEveryAssociationWritePath`), and it deliberately ignores
+  every other relation so ordinary Hebbian churn cannot invalidate it. The cache is engine
+  in-memory state, writes nothing, and is per-process. **Named residual:** association DELETION
+  does not bump the counter, so a contradicts edge pruned by weight decay can leave a cached
+  scan listing a pair whose edge is gone — an OVER-warn, dropped downstream as dangling if the
+  endpoints are also gone. Under-warning is what the counter prevents; over-warning is what it
+  accepts.
+
+  **Both the gate and the cache change only I/O**, so deleting either leaves the entire suite
+  green — the adversary pass demonstrated exactly that. `Engine.DeclaredScanRunsForTest` (an
+  atomic counter with a test-only accessor) is the seam that makes them assertable, and
+  `TestContradictionDebt_GateAndCacheAreBothPinned` pins all three properties: a clean vault
+  drives the derivation's scan **zero** times (the gate), ten calls on a debt-carrying vault
+  drive it **once** (the cache), and a fully-resolved vault drives it **zero** times.
+
+  Measured (`BenchmarkContradictionDebt_*`, Apple M5 Max, 2,000-association vault carrying 20
+  declared pairs): clean vault **~1.2µs/op, 3 allocs** (inside the noise of a ~350µs recall);
+  with debt, steady state **~41µs/op** (was ~206-244µs before the cache); the cold first call
+  after a declaration **~206µs/op**; a fully-resolved vault **~37µs/op** (was ~206-253µs, and
+  it paid that on every orientation call forever). The scan portion implied by cold-minus-warm
+  is ~8.3ms per 100k associations, independently reproducing the in-tree
+  `BenchmarkDeclaredContradictions` figure of 8.5ms/100k. **The steady-state number contains no
+  scan at all** — pinned structurally by the scan counter rather than argued by extrapolation —
+  **but it is not flat: what remains scales with pair count × association fan-out**, because the
+  0x0A record read and `markResolvedContradictions`' two per-pair `GetAssociations` calls run
+  fresh on every derivation. Adversarially measured: 196µs at 100k associations / 40 pairs,
+  380µs at 600k / 40, and **~2.97ms with ~14MB allocated per call at 600k / 400 pairs** — far
+  under the ~50ms line, but "no growth" would be the wrong sentence, and the allocation figure
+  is real GC pressure on a recall-adjacent path if pair counts ever get pathological. An
+  earlier version of this paragraph projected "near a second" for a 10M-association vault; that
+  was wrong twice over — the scan cap bounds the uncached cost at roughly its ~55ms ceiling,
+  and after the cache only the first call following a declaration pays it at all. On a cluster
+  FOLLOWER the cache is bypassed entirely and every orientation call pays the uncached cost:
+  the invalidation counter is store-level and replication applies below the store (#869's
+  layering), so a follower cache would under-report the leader's declarations forever —
+  honest-but-slower until #869's applier invalidation callback exists to ride
+  (`TestContradictionDebt_FollowerBypassesTheScanCache`, and the write-side ordering is pinned
+  by `TestContradictionDebt_StagedDeclarationDoesNotPoisonTheCache`: the generation bumps
+  post-commit, never at stage time).
+
+  **Two more named residuals, both deliberate.** (a) #713's per-vault `ExcludeTags` drops a
+  memory from recall RANKING but does not filter this readout, so an excluded memory's concept
+  can still be named — reproduced behaviourally, with a control proving recall does drop it
+  (`TestContradictionDebt_ExcludeTagsDoesNotFilterTheReadout`). Accepted because `ExcludeTags`
+  is documented as ranking-only and explicitly not a hiding mechanism; that test is the flag if
+  it is ever re-scoped into a visibility control. (b) The block attaches to an ABSTAINED
+  response. That is not a contradiction: abstention describes the ANSWER to this query ("the
+  vault has nothing for you"), the block describes what the VAULT OWES. Suppressing it there
+  would make a debt least visible exactly when the agent got no results to read.
+
+  **A derivation error is reported, not swallowed.** Failing open on presentation (principle
+  #4) must not mean failing SILENT: emitting nothing on a store fault makes the vault look
+  debt-free while the confidence penalty stays charged — the motivating incident restored. The
+  response carries `{"unavailable": true, "note": …}` instead: no count, no pairs, no age,
+  because an invented zero is the silently-wrong class.
+  **Whether it STAYS is not decided by these tests.** The pre-committed field rule
+  (`.claude/deep-review/2026-08-10-contradiction-debt-push-design.md` §7 Stage B) can kill it,
+  and #609 — ambient push, 523 deliveries, zero uptake — is the precedent it has to beat.
+
 - **[COG-30]** **Every recall row carries an ABSOLUTE `relevance_band` (a WORD, never a float), and the phase that assigns it is a PURE ANNOTATION** (#773, `internal/engine/engine_relevance.go` `applyRelevanceBands` + `internal/engine/activation/relevance.go`). It runs LAST of the post-pipeline phases — after currency (COG-25), contradiction honesty (COG-29), truncation and the abstention recompute — and changes **no score, no order, no row membership, and writes nothing** (observe-safe, COG-11; pinned by `TestRelevanceBands_IsAPureAnnotation` and `TestRelevanceBands_EngineRowsMatchRawActivation`). The band is derived from `ScoreComponents.AbsoluteScore` against the vault's OWN resolved calibration — the COG-6 default gate and the resolved content-channel ceiling, **never `req.Threshold`** (a caller passing `threshold: 0.01` must not band a below-noise row `moderate`; pinned by `TestRelevanceBands_CallerThresholdIsNotAnInput`). Band edges are self-derived ratios of landed invariants (2x the gate = weak ceiling per COG-26's noise placement; half the content ceiling = strong floor per the measured saturation bound), never corpus-tuned constants (principle #11). Classification rules, each the product of a review round: **(a)** `filter_match` is decided by the REASON a row was admitted (`Admission`, carried from the scoring path; a COG-5 floored row is `AdmissionTagFilter` via `ScoreComponents.ContentMatchFloored`), never by threshold arithmetic — `tagMatchFloor` numerically equals the COG-6 ACT-R gate, so a fresh confidence-1.0 tag-only reminder lands EXACTLY ON the boundary and an arithmetic test banded it `weak` while its 0.9-confidence twin banded `filter_match` (G6 refute finding 1; pinned by `TestAdmissionOf`, `TestRawTagRange_TagOnlyAdmission_IndependentOfConfidenceAndRecency`, `TestRecall_TagOnlyHit_BandsFilterMatch_RegardlessOfConfidenceAndRecency`, all RED-checked at `dda8a3e`). **(b)** `uncalibrated` bases name the TRUE cause: an operator's explicit `semantic_floor: 0` reports `semantic_floor_disabled`, never `no_model_baseline` — same identity transform, opposite cause (G6 finding 3, RED-checked at `dda8a3e`); rrf/weighted_sum are response-wide uncalibrated (they do not gate on AbsoluteScore); post-pipeline injections with zero-value components are `not_scored` ("not measured" ≠ "measured and low"); a COG-28 substituted head is NOT `not_scored` — it bands on the predecessor's real measurements, which `substitution_basis` already attributes. **(c)** The response-level weak-band hint is DEFERRED under its own pre-committed rule (U(combined) 16.7% < 70%, A(moderate) 10% > 0% — the honest-negative record in `engine_relevance.go`, now drift-guarded by bounded assertions in `relevance_band_measure_test.go`). **Named conservative residual (cold start):** while a fresh write's embedding is still pending, the semantic channel is silent and a row's absolute score is capped at `w_fts` (0.4 default) — below the 0.5 strong floor — so `strong` is unreachable and genuine matches may under-band until indexing catches up; the error direction is deliberate (understate, never overstate). **Surface sync obligation:** the band and basis enums live on three wire surfaces (`internal/mcp/types.go`, `internal/transport/mbp/types.go`, `internal/transport/rest/openapi.yaml`) plus the guide's reading section (`internal/mcp/guide.go`); adding a band or basis value must land on ALL of them in the same change — gRPC and the non-Go SDKs deliberately carry no band (obligation #3's silently-wrong class).
 
 - **[COG-31]** **Symmetry is a property of `storage.RelType`, and only the recall RANKING phases may read an edge from both endpoints.** `RelType.IsSymmetric()` (STRICT: `RelCoActivated` 0x0000 — the Hebbian relation, which until #800 was the only RelType with no name — plus `RelRelatesTo` and `RelContradicts`; everything else, **including `RelUserDefined`**, is directional) and `RelType.BidirectionalForRanking()` (`IsSymmetric` ∪ the ≥`0x8000` user-defined range, admitted under principle #4's fail-open-on-presentation) are the single source of truth — `internal/storage/types.go`. Two classes of edge are therefore read backwards during ranking without their author having declared them symmetric: the user-defined range above, and LEGACY BLANK-VALUED edges, which `decodeAssocValue` returns as relType 0 — indistinguishable from `RelCoActivated`, a collision that predates #800 but that #800 gave a second consequence (before it, relType 0 only fed `profile.AllowsEdge`; now it also decides reverse admissibility). Both are bounded by the same blast radius as everything else here — ranking and traversal only, no writer, no direction-presenting surface — so they can nudge an ordering and cannot manufacture a presented fact. Separating a real co-activation from a blank legacy value needs a value-format change and a migration. **`PebbleStore.GetAssociations` is FORWARD-ONLY by contract**, because its consumers include a WRITER (`consolidation/transitive.go` persists inferred edges) and direction-presenting surfaces (`Engine.Traverse`, REST `/associations`, `GetAnnotations`); unioning `0x04` into it made dream consolidation persist manufactured transitive facts and made REST report "the OLD version supersedes the NEW one" with a green suite. The union lives in `PebbleStore.GetRankingNeighbors`, whose only legitimate consumers are `phase4HebbianBoost` and `phase5Traverse` — **of which only the first emits anything today: #801 measured `phase5Traverse` as inert on every real corpus (its hop gate has sat above the phase's own score ceiling since the initial commit), so this invariant's user-visible effect is currently carried entirely by `phase4HebbianBoost`, and the `hop_path` clause below describes a response field that is always empty in practice. The traversal consumer and its pins are kept deliberately (decision record, #801); nothing here is relaxed by that, because a consumer that is revived later must land on a correct read** — it LOSES edge direction by construction and must never be consumed by a writer, or by a presenter OF EDGE DIRECTION. That last clause is narrower than it first reads and the distinction is load-bearing: `phase5Traverse`'s BFS output does reach a caller, as `mbp.ActivationItem.hop_path` — but a hop path is a list of engram IDs, an assertion that two memories are connected, not an assertion about which way any relation points; the traversed `RelType` is dropped before the response is built. `traversedCandidate.relType`/`scoringCandidate.relType` are therefore WRITE-ONLY today and nothing pins them unread — a future scorer reading either is reading a relation out of the union whose direction is gone (a `RelSupersedes` there may point either way), which is fine to rank on and forbidden to present or to derive a direction from; the fields say so at their declaration. What must never surface is a DIRECTION read out of this union. *Root cause: writers each picked a direction and picked different ones (Hebbian canonicalises older→newer, the neighbour/autoassoc workers write newer→older), so a forward-only read scored the same single relationship at full strength from one endpoint and exactly ZERO from the other.* Mechanics that are load-bearing, each pinned: **(a)** the reverse half is a SINGLE iterator over the 0x04 range with sorted forward seeks, not N `GetReverseAssociations` calls (BFS passes 20 ids per level); **(b)** the cap is a true top-N over the MERGED list via a two-pointer merge — both ranges are weight-descending — because concatenate-then-truncate fills the cap with floor-weight forward edges and discards a 2000x heavier reverse one (`TestGetRankingNeighbors_CapIsTopNOverMerge`); **(c)** dedup by `TargetID` BEFORE the cap, keeping the larger weight, or a pair written in both directions is counted twice by `phase4HebbianBoost`'s sum (`TestHebbianBoost_PairCountedOnce`); ties go to the forward stream so a reverse edge never displaces an equal-weight forward one. **The reverse adjacency is CACHED** (`revAssocCache`, same 500k/2s shape as `assocCache`, evicted on the DESTINATION at every site that evicts the forward cache on the source): measured, an uncached reverse half cost ~152µs against the cached forward half's ~11µs on a 50-candidate read and pushed whole-recall p50 15-20% over budget, because "one extra bounded iterator like the forward one" ignored that the forward one is served from cache. Its entries carry `truncated` so a later caller asking for a larger cap is re-scanned rather than silently under-served — a trap the forward cache still has (#820, which also covers the forward miss path's aliased return). **Every non-empty slice `GetRankingNeighbors` returns is freshly allocated** (the no-forward-edges exit returns `nil`, which owns nothing), and that is a property of the WHOLE function, not of one half: `rankingReverseEdges` copies on its hit AND its miss path (`TestRankingReverseEdges_MissPathDoesNotAliasTheCache` — the miss path used to return the slice it had just cached, and the symmetric shortcut `if len(fwd) == 0 { return rev }` in the merge would have published the cache's array to both ranking phases for the 2s TTL), and `mergeRankingNeighbors` copies on its `len(rev) == 0` shortcut too (`TestGetRankingNeighbors_NoReverseEdgesDoesNotAliasTheCache`), because that shortcut forwarded `GetAssociations`' own miss-path slice — which DOES alias `assocCache` (#820) — straight to the caller. Until that was fixed the union's return was copy-safe for a node WITH inbound symmetric edges and aliased for a node without, decided by data the caller cannot see; a non-uniform ownership contract is the trap, not the aliasing. `GetAssociations` still owes its other consumers the same guarantee (#820). Cost of the extra copy, measured with `BenchmarkPhase4Read_ForwardOnlyFan` — 50 candidates, `maxPerNode` 20, warm caches, forward edges only (the ONLY shape that reaches the copy with a non-empty list; `BenchmarkPhase4Read`'s ring gives every node inbound edges and its degree-0 arm returns nil, so neither of its arms performs the copy): median per 50-candidate call **+4.1µs at forward degree 2, +6.8µs at 10, +13.2µs at the cap of 20**, with allocations 62 → 112 (exactly one per candidate) and 85.2K → 162.0K B/op at the cap. The cost scales with the number of edges returned, so the cap is its ceiling. Against a whole-recall p50 of ~26 ms (embedder in the path) that is ~0.05%; against the ~0.5 ms no-embedder harness it is ~2.6%, and it is accepted at both because a non-uniform ownership contract is the defect. The fixture's shape is asserted in the gate by `TestForwardOnlyFanFixture_TakesTheMergeCopyShortcut` (every candidate has forward edges, none has inbound ones), so a later edit cannot quietly move the quoted number back onto an arm that does not perform the copy. **When the union read FAILS, the entire Hebbian term is dropped for that recall, loudly** (`slog.Warn`, one per recall, not per candidate) — never a fallback to the forward-only `GetAssociations`. That fallback preserves more absolute signal and reinstates this invariant's own failure mode while doing it: two candidates holding an identically-weighted symmetric edge to the same recent engram score `w` and `0` purely by writer-chosen orientation, and `hebbianBoost` multiplies the final RRF score (measured on the root-cause fixture: healthy 0.5/0.5, forward-only fallback 0.5/0.0, whole-signal drop 0.0/0.0). The trade is signal-preservation against tie-preservation, and ranking that loses a term uniformly beats ranking that keeps a biased half of it — the same reason an unreachable embed backend degrades to BM25-only rather than to a half-applied vector score. Pinned by `TestHebbianBoost_UnionReadFailurePreservesSymmetricOrder`, which asserts the relative ORDER of the two arms (every magnitude assertion on that path passed on the defective fallback) and that the WARN fires. **No new Pebble prefix, no value-format change, no migration: existing vaults are fixed retroactively the moment the read lands, because 0x04 has been fully maintained all along.** Pinned by `TestRelType_SymmetryCensus` (parses `types.go` with go/ast and fails on any declared-but-unclassified RelType, SEC-15 shape — it keys off the const BLOCK that declares `RelSupports` and classifies every name in it regardless of how it is typed, because a parser that required the `X RelType = 0x1` annotation stayed green on `X = RelType(0x1)`, and the person the census exists to catch is exactly the one who will not match the house style; plus any `RelType`-annotated constant elsewhere in `types.go`, parenthesised annotations unwrapped; guarded by `TestRelTypeConstantNames_CatchesUnannotatedDeclarations`. Its residual is wider than "unannotated" suggests and is stated form-by-form at `relTypeConstantNames`: a SECOND const block gets only the annotated sweep, so an `= RelType(0x31)`, an iota continuation or a bare `= 0x32` there escapes; an ALIAS-annotated member (`type RelKind = RelType; const RelAliased RelKind = 0x32`) escapes though it IS annotated, because go/ast alone cannot resolve the alias; and another FILE in the package is not parsed at all. The anchor check `t.Fatal`s if the `RelSupports` block stops existing, so the parser cannot silently census an empty set), `TestGetAssociations_StaysForwardOnly`, `TestGetRankingNeighbors_DirectionalExcluded`, `TestGetRankingNeighbors_ReverseCacheInvalidated`, `TestHebbianBoost_IsSymmetricInPairOrder` (exact equality to 1e-9; RED at `b272c74`: the older→newer arm scored `0.0103`, the newer→older arm `0`) and `TestRecall_HebbianBoostSymmetricEndToEnd` (RED: the same link scored `hebbian_boost` 0.4 from its source and 0 from its target, dropping that row's recall score 0.7150 → 0.3862).
