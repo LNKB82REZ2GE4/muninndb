@@ -34,6 +34,15 @@ func apiKeyGlobIdxBounds() (lower, upper []byte) {
 	return []byte{prefixAPIKeyGlob}, []byte{prefixAPIKeyGlob + 1}
 }
 
+// APIKeyGlobIdxKey is the exported form of apiKeyGlobIdxKey. It exists so the
+// v5 storage migration (internal/storage/migrate, which already imports this
+// package — see v3's RelocateAuthPrefixes) can backfill 0x46 glob-index
+// entries for keys written before the index existed, using the exact same
+// key format as GenerateScopedAPIKey rather than a hand-copied replica.
+func APIKeyGlobIdxKey(keyID []byte) []byte {
+	return apiKeyGlobIdxKey(keyID)
+}
+
 func adminUserKey(username string) []byte {
 	key := make([]byte, 1+len(username))
 	key[0] = prefixAdminUser
