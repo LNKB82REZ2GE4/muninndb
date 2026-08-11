@@ -23,6 +23,19 @@ type mcpEngineAdapter struct {
 	pStore   plugin.PluginStore // needed by RetryEnrich to persist entities/relationships
 }
 
+// RegisterVaultName registers a vault name (idempotent 2-key write).
+// Delegates to engine.Engine.RegisterVaultName (RFC #597: muninn_create_workflow_vault).
+func (a *mcpEngineAdapter) RegisterVaultName(name string) error {
+	return a.eng.RegisterVaultName(name)
+}
+
+// VaultNameExists reports whether a vault name is already registered.
+// Delegates to engine.Engine.VaultNameExists (RFC #597 RedTeam fix:
+// existence-check before minting into a caller-supplied name).
+func (a *mcpEngineAdapter) VaultNameExists(name string) bool {
+	return a.eng.VaultNameExists(name)
+}
+
 // NewEngineAdapter returns an EngineInterface backed by eng with optional enricher.
 // pStore is used by RetryEnrich to persist entity and relationship data; pass nil when
 // no enrichment plugin is configured (RetryEnrich will error before using pStore).
@@ -54,6 +67,20 @@ func (a *mcpEngineAdapter) Link(ctx context.Context, req *mbp.LinkRequest) (*mbp
 func (a *mcpEngineAdapter) Stat(ctx context.Context, req *mbp.StatRequest) (*mbp.StatResponse, error) {
 	return a.eng.Stat(ctx, req)
 }
+
+// THE PUSH increment 1: prospective memory. These satisfy the optional
+// prospectiveCapable interface consulted by muninn_intend and the notices
+// path on recall/remember.
+func (a *mcpEngineAdapter) Intend(ctx context.Context, vault, content string, cues []string, validUntil *time.Time, oneShot bool, importance *float32) (string, error) {
+	return a.eng.Intend(ctx, vault, content, cues, validUntil, oneShot, importance)
+}
+func (a *mcpEngineAdapter) NoticesForRecall(ctx context.Context, vault string, results []engine.ScoredResult, sessionSeen func(string) bool, readOnly bool) ([]engine.Notice, error) {
+	return a.eng.NoticesForRecall(ctx, vault, results, sessionSeen, readOnly)
+}
+func (a *mcpEngineAdapter) NoticesForRemember(ctx context.Context, vault string, focal []string, createdID string, sessionSeen func(string) bool) ([]engine.Notice, error) {
+	return a.eng.NoticesForRemember(ctx, vault, focal, createdID, sessionSeen)
+}
+
 func (a *mcpEngineAdapter) GetContradictions(ctx context.Context, vault string) ([]ContradictionPair, error) {
 	pairs, err := a.eng.GetContradictions(ctx, vault)
 	if err != nil {
@@ -65,12 +92,71 @@ func (a *mcpEngineAdapter) GetContradictions(ctx context.Context, vault string) 
 	}
 	return result, nil
 }
-func (a *mcpEngineAdapter) Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string) (*WriteResult, error) {
-	id, err := a.eng.Evolve(ctx, vault, oldID, newContent, reason, embedding, concept)
+
+// GetContradictionReport is the richer contradictions read: concepts resolved,
+// real detection timestamps, and the pairs an agent has explicitly linked that
+// the 30s batch detector has not flagged yet.
+//
+// It is deliberately NOT part of the mcp.Engine interface. Adding a method
+// there would force every implementation (including test doubles in other
+// packages) to change in lockstep; handleContradictions instead probes for this
+// method and falls back to the flat GetContradictions when an engine does not
+// provide it. Same reason http handlers probe for http.Flusher.
+func (a *mcpEngineAdapter) GetContradictionReport(ctx context.Context, vault string) (*ContradictionsReport, error) {
+	rep, err := a.eng.GetContradictionReport(ctx, vault)
 	if err != nil {
 		return nil, err
 	}
-	return &WriteResult{ID: id.String()}, nil
+	out := &ContradictionsReport{
+		Contradictions: make([]ContradictionPair, 0, len(rep.Pairs)),
+		DetectedCount:  rep.DetectedCount,
+		PendingCount:   rep.PendingCount,
+		ResolvedCount:  rep.ResolvedCount,
+		ScanComplete:   rep.ScanComplete,
+	}
+	for _, p := range rep.Pairs {
+		pair := ContradictionPair{
+			IDa:               p.IDa,
+			ConceptA:          p.ConceptA,
+			IDb:               p.IDb,
+			ConceptB:          p.ConceptB,
+			Status:            p.Status,
+			ConfidencePenalty: p.ConfidencePenalty,
+			ResolvedBy:        p.ResolvedBy,
+		}
+		// Zero means "unknown"; leave the field absent rather than emitting the
+		// Go zero time as if it were a real instant.
+		if !p.DetectedAt.IsZero() {
+			t := p.DetectedAt
+			pair.DetectedAt = &t
+		}
+		if !p.DeclaredAt.IsZero() {
+			t := p.DeclaredAt
+			pair.DeclaredAt = &t
+		}
+		out.Contradictions = append(out.Contradictions, pair)
+	}
+	return out, nil
+}
+func (a *mcpEngineAdapter) Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string, entities []mbp.InlineEntity, importance *float32, effectiveAt time.Time) (*WriteResult, error) {
+	id, err := a.eng.EvolveAt(ctx, vault, oldID, newContent, reason, embedding, concept, entities, importance, effectiveAt)
+	if err != nil {
+		return nil, err
+	}
+	// Echo the concept that was actually stored. The successor's concept is
+	// either the caller's override or the one carried from the predecessor, so
+	// it cannot be reconstructed from the arguments alone — read it back. The
+	// previous {"concept":""} response led two evaluators to conclude the
+	// write had lost data when the record was in fact correct.
+	res := &WriteResult{ID: id.String()}
+	if eng, err := a.eng.GetEngram(ctx, vault, id); err == nil && eng != nil {
+		res.Concept = eng.Concept
+	} else if err != nil {
+		// Never fail an accepted write over a cosmetic read-back; say so rather
+		// than reporting an empty concept as if that were the stored value.
+		res.Warnings = append(res.Warnings, fmt.Sprintf("evolve succeeded but the stored concept could not be read back: %v", err))
+	}
+	return res, nil
 }
 func (a *mcpEngineAdapter) Consolidate(ctx context.Context, vault string, ids []string, merged string) (*ConsolidateResult, error) {
 	res, err := a.eng.Consolidate(ctx, vault, ids, merged)
@@ -99,7 +185,7 @@ func (a *mcpEngineAdapter) Decide(ctx context.Context, vault, decision, rational
 	if err != nil {
 		return nil, err
 	}
-	return &WriteResult{ID: res.ID.String(), Warnings: res.Warnings}, nil
+	return &WriteResult{ID: res.ID.String(), Concept: res.Concept, Warnings: res.Warnings}, nil
 }
 
 func (a *mcpEngineAdapter) Restore(ctx context.Context, vault, id string) (*RestoreResult, error) {
@@ -154,20 +240,47 @@ func (a *mcpEngineAdapter) Explain(ctx context.Context, vault string, req *Expla
 	if err != nil {
 		return nil, err
 	}
-	return &ExplainResult{
+	return explainResultFromEngine(data), nil
+}
+
+// explainResultFromEngine converts the engine's explain data to the MCP shape.
+// Extracted so the null-not-zero serialization contract (Scored=false =>
+// query-dependent components stay nil => JSON null, never 0) is pinned by a
+// hermetic test rather than by manufacturing an unreachable engram — the
+// diagnostic threshold bypass made "unreachable" nearly impossible to fixture.
+func explainResultFromEngine(data *engine.ExplainData) *ExplainResult {
+	res := &ExplainResult{
 		EngramID:    data.EngramID,
+		Concept:     data.Concept,
+		Found:       data.Found,
+		Scored:      data.Scored,
 		WouldReturn: data.WouldReturn,
 		Threshold:   data.Threshold,
-		FinalScore:  data.FinalScore,
-		Components: ExplainComponents{
-			FullTextRelevance:  float64(data.Components.FullTextRelevance),
-			SemanticSimilarity: float64(data.Components.SemanticSimilarity),
-			DecayFactor:        float64(data.Components.DecayFactor),
-			HebbianBoost:       float64(data.Components.HebbianBoost),
-			AccessFrequency:    float64(data.Components.AccessFrequency),
-		},
-	}, nil
+		Note:        data.Note,
+	}
+	// Stored confidence never depends on the query: report it whenever the
+	// engram exists. (It was previously unmapped entirely, so muninn_explain
+	// reported confidence 0 — an impossible value — for every engram.)
+	if data.Found {
+		res.Components.Confidence = f64(data.Confidence)
+	}
+	// The query-dependent components exist only if this query scored the
+	// engram. Otherwise they stay nil → JSON null → "not computed".
+	if data.Scored {
+		res.FinalScore = f64(data.FinalScore)
+		res.Components.FullTextRelevance = f64(float64(data.Components.FullTextRelevance))
+		res.Components.SemanticSimilarity = f64(float64(data.Components.SemanticSimilarity))
+		res.Components.SemanticSimilarityRaw = f64(float64(data.Components.SemanticSimilarityRaw))
+		res.Components.DecayFactor = f64(float64(data.Components.DecayFactor))
+		res.Components.HebbianBoost = f64(float64(data.Components.HebbianBoost))
+		res.Components.AccessFrequency = f64(float64(data.Components.AccessFrequency))
+	}
+	return res
 }
+
+// f64 boxes a float64 so an explain component can distinguish a real 0 from
+// "never computed" (nil → JSON null).
+func f64(v float64) *float64 { return &v }
 
 func (a *mcpEngineAdapter) UpdateState(ctx context.Context, vault, id, state, reason string) error {
 	return a.eng.UpdateLifecycleState(ctx, vault, id, state)
@@ -362,8 +475,8 @@ func (a *mcpEngineAdapter) GetEntityClusters(ctx context.Context, vault string, 
 	return result, nil
 }
 
-func (a *mcpEngineAdapter) WhereLeftOff(ctx context.Context, vault string, limit int) ([]WhereLeftOffEntry, error) {
-	engrams, err := a.eng.WhereLeftOff(ctx, vault, limit)
+func (a *mcpEngineAdapter) WhereLeftOff(ctx context.Context, vault string, limit int, excludeTypeLabels []string) ([]WhereLeftOffEntry, error) {
+	engrams, err := a.eng.WhereLeftOff(ctx, vault, limit, excludeTypeLabels)
 	if err != nil {
 		return nil, err
 	}
@@ -372,15 +485,26 @@ func (a *mcpEngineAdapter) WhereLeftOff(ctx context.Context, vault string, limit
 		if eng == nil {
 			continue
 		}
-		entries = append(entries, WhereLeftOffEntry{
-			ID:         eng.ID.String(),
-			Concept:    eng.Concept,
-			Summary:    eng.Summary,
-			LastAccess: eng.LastAccess,
-			State:      lifecycleStateLabel(eng.State),
-		})
+		entries = append(entries, whereLeftOffEntryFromEngram(eng))
 	}
 	return entries, nil
+}
+
+// whereLeftOffEntryFromEngram projects a stored engram onto the
+// muninn_where_left_off result shape.
+func whereLeftOffEntryFromEngram(eng *storage.Engram) WhereLeftOffEntry {
+	entry := WhereLeftOffEntry{
+		ID:         eng.ID.String(),
+		Concept:    eng.Concept,
+		Summary:    eng.Summary,
+		LastAccess: eng.LastAccess,
+		State:      lifecycleStateLabel(eng.State),
+		Type:       eng.MemoryType.String(),
+		TypeLabel:  eng.TypeLabel,
+		Tags:       eng.Tags,
+	}
+	entry.Importance, entry.ImportanceSource = importanceFields(eng.Importance, eng.MemoryType, eng.Trust)
+	return entry
 }
 
 // lifecycleStateLabel converts a storage.LifecycleState to a display string.
@@ -540,6 +664,17 @@ func (a *mcpEngineAdapter) GetProvenance(ctx context.Context, vault, id string) 
 			AgentID:   e.AgentID,
 			Operation: e.Operation,
 			Note:      e.Note,
+		}
+		// Operation-specific details, when the record carries them. Legacy
+		// entries — and operations that record none — leave these unset, and
+		// omitempty keeps them out of the response entirely: an unknown
+		// predecessor or reason is reported as absent, never as empty.
+		if d := e.Details; d != nil {
+			result[i].PredecessorID = d.PredecessorID
+			result[i].Reason = d.Reason
+			if d.EffectiveAt != nil {
+				result[i].EffectiveAt = d.EffectiveAt.UTC().Format(time.RFC3339)
+			}
 		}
 	}
 	return result, nil

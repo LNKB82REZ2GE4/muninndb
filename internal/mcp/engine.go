@@ -29,7 +29,13 @@ type EngineInterface interface {
 
 	// Higher-level cognitive operations (tools 1-11)
 	GetContradictions(ctx context.Context, vault string) ([]ContradictionPair, error)
-	Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string) (*WriteResult, error)
+	// Evolve replaces a memory with a new version. entities, when non-nil,
+	// replaces the carried entity set. importance overrides the successor's
+	// caller-asserted importance (nil inherits the predecessor's explicit
+	// importance, unset stays unset). effectiveAt is the valid-time moment the
+	// new version became true (predecessor's ValidUntil stamp = successor's
+	// ValidFrom); the zero time defaults to now.
+	Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string, entities []mbp.InlineEntity, importance *float32, effectiveAt time.Time) (*WriteResult, error)
 	Consolidate(ctx context.Context, vault string, ids []string, mergedContent string) (*ConsolidateResult, error)
 	Session(ctx context.Context, vault string, since time.Time) (*SessionSummary, error)
 	Decide(ctx context.Context, vault, decision, rationale string, alternatives, evidenceIDs []string) (*WriteResult, error)
@@ -88,7 +94,10 @@ type EngineInterface interface {
 
 	// WhereLeftOff returns the most recently accessed active engrams, sorted by
 	// LastAccess descending. limit caps results (default 10, max 50).
-	WhereLeftOff(ctx context.Context, vault string, limit int) ([]WhereLeftOffEntry, error)
+	// excludeTypeLabels is an opt-in salience filter (S5): engrams whose
+	// type_label is in the set are skipped and the scan keeps going to fill
+	// limit. A nil/empty excludeTypeLabels is a no-op (default behavior).
+	WhereLeftOff(ctx context.Context, vault string, limit int, excludeTypeLabels []string) ([]WhereLeftOffEntry, error)
 
 	// FindByEntity returns engrams that mention the given entity name,
 	// scanned from the 0x23 reverse index; on zero exact matches the vault's
@@ -194,4 +203,14 @@ type EngineInterface interface {
 	// Used to populate muninn_recall annotation objects when annotate=true.
 	// Returns a non-nil *engine.AnnotationData (possibly with empty fields) on success.
 	GetAnnotations(ctx context.Context, vault, id string) (*engine.AnnotationData, error)
+
+	// RegisterVaultName registers a vault name in the engine's vault registry
+	// (idempotent 2-key write). Used by muninn_create_workflow_vault (RFC #597).
+	RegisterVaultName(name string) error
+
+	// VaultNameExists reports whether a vault with the given name is registered
+	// (i.e. has a 0x0F name→prefix index key). Used by muninn_create_workflow_vault
+	// to reject caller-supplied names that collide with an existing vault
+	// (operator or workflow-scoped), preventing cross-vault config clobber.
+	VaultNameExists(name string) bool
 }

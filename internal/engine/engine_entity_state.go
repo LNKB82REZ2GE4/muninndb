@@ -85,6 +85,9 @@ func (e *Engine) entityVisibleInVault(ctx context.Context, ws [8]byte, entityNam
 // rejected as not-found, even if the entity exists globally under another
 // vault's data — the 0x1F registry is global, but callers are not.
 func (e *Engine) SetEntityState(ctx context.Context, vault, entityName, state, mergedInto, entityType string) error {
+	if err := e.refuseAppend(ctx); err != nil {
+		return err
+	}
 	if entityName == "" {
 		return fmt.Errorf("set_entity_state: entity_name is required")
 	}
@@ -138,6 +141,13 @@ type EntityStateOp struct {
 // (nil = success). Never returns a top-level error — partial success is
 // preserved. Respects context cancellation between items.
 func (e *Engine) SetEntityStateBatch(ctx context.Context, vault string, ops []EntityStateOp) []error {
+	if err := e.refuseAppend(ctx); err != nil {
+		out := make([]error, len(ops))
+		for i := range out {
+			out[i] = err
+		}
+		return out
+	}
 	errs := make([]error, len(ops))
 	for i, op := range ops {
 		if ctx.Err() != nil {

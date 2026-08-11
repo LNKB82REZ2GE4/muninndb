@@ -133,25 +133,32 @@ func (p *OpenAILLMProvider) Complete(ctx context.Context, system, user string) (
 
 		resp, err := p.client.Do(httpReq)
 		if err != nil {
-			return "", fmt.Errorf("request failed: %w", err)
+			return "", providerTransportError(p.Name(), err)
 		}
 
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
 		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("openai returned status %d: %s", resp.StatusCode, string(respBody))
-			// Some OpenAI-compatible backends (e.g. LM Studio) reject json_object.
-			// Retry once without response_format for compatibility.
-			if i == 0 && resp.StatusCode == http.StatusBadRequest && strings.Contains(strings.ToLower(string(respBody)), "response_format") {
+			// Some OpenAI-compatible backends (e.g. LM Studio) reject
+			// json_object. Peek a bounded snippet to detect that case and
+			// retry once without response_format; providerHTTPError drains
+			// and discards the remainder of the body.
+			peek := make([]byte, 4<<10)
+			n, _ := io.ReadFull(resp.Body, peek)
+			retryable := i == 0 && resp.StatusCode == http.StatusBadRequest &&
+				strings.Contains(strings.ToLower(string(peek[:n])), "response_format")
+			httpErr := providerHTTPError(p.Name(), resp)
+			resp.Body.Close()
+			if retryable {
+				lastErr = httpErr
 				continue
 			}
-			return "", lastErr
+			return "", httpErr
 		}
 
 		var chatResp openaiChatResponse
-		if err := json.Unmarshal(respBody, &chatResp); err != nil {
-			return "", fmt.Errorf("failed to parse response: %w", err)
+		decodeErr := json.NewDecoder(resp.Body).Decode(&chatResp)
+		resp.Body.Close()
+		if decodeErr != nil {
+			return "", fmt.Errorf("failed to parse response: %w", decodeErr)
 		}
 
 		if len(chatResp.Choices) == 0 {

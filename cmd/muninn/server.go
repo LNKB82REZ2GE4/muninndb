@@ -954,6 +954,7 @@ func runServer() {
 	uiAddr := flag.String("ui-addr", uiAddrDefault, "Web UI HTTP listen address")
 	mcpToken := flag.String("mcp-token", "", "Bearer token override for MCP auth (leave empty to read from MUNINN_MCP_TOKEN env var or ~/.muninn/mcp.token)")
 	dev := flag.Bool("dev", false, "serve web assets from ./web directory (development mode)")
+	forceMigrationRerun := flag.Bool("force-migration-rerun", false, "Reset the stored migration version to 0 and exit without starting the server. The next normal start re-applies every registered migration. Re-running only re-applies migrations THIS binary knows about — if the DB was last written by a NEWER binary, do NOT use this flag; upgrade instead (the helper refuses a stored version newer than this binary's max). Operator recovery path for a wedged/partial migration (#611). Always back up the DB before a migration-bearing upgrade; use this flag to recover from a wedged/partial migration — not to downgrade.")
 	backupInterval := flag.String("backup-interval", "", "Automated backup interval (e.g. 6h, 30m); empty = disabled")
 	backupDir := flag.String("backup-dir", "", "Directory to write automated backups into")
 	backupRetain := flag.Int("backup-retain", 5, "Number of automated backups to keep")
@@ -1154,6 +1155,33 @@ func runServer() {
 	// during the ordered shutdown sequence) internally closes the Pebble DB
 	// after flushing its own background workers.
 
+	// --force-migration-rerun: reset the stored migration version to 0 and
+	// exit. The next normal start re-applies every registered migration.
+	// This is the operator recovery path for a wedged/partial migration
+	// (#611, Task 7b / RT5): if a version was stamped but the operator needs
+	// to force a re-run (e.g. recover from a partial state), this resets
+	// the marker so the existing Runner re-applies the migrations on the
+	// next Open. It does NOT run migrations itself — that keeps the path
+	// simple and reuses the hardened Runner's fail-loud semantics.
+	//
+	// Refuse-newer guard (RT6): ForceRerunMigrations reads the stored version
+	// and refuses if it exceeds this binary's MaxRegisteredVersion — resetting
+	// to 0 would let an older binary re-apply only its own (smaller) migration
+	// set against a newer schema, a downgrade-bypass surface. The operator
+	// must upgrade the binary, not recover with an older one.
+	if *forceMigrationRerun {
+		if err := migrate.ForceRerunMigrations(db); err != nil {
+			slog.Error("force-migration-rerun failed", "err", err)
+			_ = db.Close()
+			os.Exit(1)
+		}
+		slog.Info("migration version reset to 0; all registered migrations will re-run on next start",
+			"data_dir", *dataDir)
+		fmt.Fprintln(os.Stderr, "migration version reset to 0; re-run on next start. Re-run `muninn start` (without this flag) to apply.")
+		_ = db.Close()
+		os.Exit(0)
+	}
+
 	if err := replication.CheckAndSetSchemaVersion(db); err != nil {
 		slog.Error("schema version check", "err", err)
 		os.Exit(1)
@@ -1161,16 +1189,7 @@ func runServer() {
 
 	// Run versioned schema migrations before the storage layer is built.
 	migRunner := migrate.NewRunner(db)
-	migRunner.Register(migrate.Migration{
-		Version:     1,
-		Description: "backfill embed_dim in ERF records for existing embeddings",
-		Up:          migrate.BackfillEmbedDim,
-	})
-	migRunner.Register(migrate.Migration{
-		Version:     2,
-		Description: "backfill relationship entity index (0x26) for GetEntityAggregate optimisation",
-		Up:          migrate.BackfillRelEntityIndex,
-	})
+	migrate.RegisterMigrations(migRunner)
 	if applied, err := migRunner.Run(); err != nil {
 		slog.Error("migration failed", "err", err)
 		db.Close()
@@ -1298,6 +1317,15 @@ func runServer() {
 	initCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	embedder, embedPlugin, err := buildEmbedder(initCtx, savedPluginCfg, *dataDir)
 	cancel()
+	// Resolve the model identifier for the COG-26 semantic noise-baseline
+	// registry (internal/plugin/embed/baseline.go). embedPlugin's concrete
+	// type (*embedpkg.EmbedService for every built-in provider) exposes it;
+	// an unrecognized plugin type leaves this empty, which resolveSemanticBaseline
+	// treats as "unknown model" — identity transform + WARN, never a guess.
+	embedModelName := ""
+	if m, ok := embedPlugin.(interface{ Model() string }); ok {
+		embedModelName = m.Model()
+	}
 	if err != nil {
 		slog.Error("embedder build failed", "err", err)
 		os.Exit(1)
@@ -1385,6 +1413,7 @@ func runServer() {
 		ConfidenceWorker: confidenceWorkerImpl.Worker,
 		Embedder:         embedder,
 		HNSWRegistry:     hnswRegistry,
+		EmbedModelName:   embedModelName,
 	})
 
 	eng.SetTransitionWorker(transitionWorkerImpl)
@@ -1501,7 +1530,12 @@ func runServer() {
 
 	// Build MCP server
 	mcpAdapter := mcp.NewEngineAdapter(eng, enrichPlugin, pStore)
-	mcpServer := mcp.New(*mcpAddr, mcpAdapter, *mcpToken, authStore, clientTLS)
+	// capAuth wires the live *auth.Store as the cap_ capability validator AND
+	// (via type assertion inside mcp.New) the create-workflow-vault handler's
+	// store for SetVaultConfig + GenerateCapability. With this, cap_ tokens
+	// authenticate on every transport and muninn_create_workflow_vault (opt-in
+	// via MUNINN_AGENT_VAULT_CREATE) can mint workflow capabilities (RFC #597).
+	mcpServer := mcp.New(*mcpAddr, mcpAdapter, *mcpToken, authStore, authStore, clientTLS)
 
 	// Build gRPC server
 	grpcAdapter := grpcpkg.NewEngineAdapter(eng)

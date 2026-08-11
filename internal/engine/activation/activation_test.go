@@ -1,14 +1,17 @@
 package activation_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/scrypster/muninndb/internal/engine/activation"
 	"github.com/scrypster/muninndb/internal/storage"
+	"github.com/scrypster/muninndb/internal/storage/keys"
 )
 
 // ---------------------------------------------------------------------------
@@ -33,7 +36,13 @@ func newStubStore() *stubStore {
 
 func (s *stubStore) writeEngram(eng *storage.Engram) {
 	if eng.ID == (storage.ULID{}) {
-		eng.ID = storage.NewULID()
+		// Mirror PebbleStore.WriteEngram: derive the ULID from CreatedAt when set
+		// so the tag/time indexes are ULID-time-ordered exactly as in production.
+		if !eng.CreatedAt.IsZero() {
+			eng.ID = storage.NewULIDWithTime(eng.CreatedAt)
+		} else {
+			eng.ID = storage.NewULID()
+		}
 	}
 	if eng.Confidence == 0 {
 		eng.Confidence = 1.0
@@ -113,6 +122,29 @@ func (s *stubStore) EngramLastAccessNs(_ [8]byte, _ storage.ULID) int64 {
 	return 0
 }
 
+// GetEmbedding mirrors PebbleStore.GetEmbedding for this in-memory stub: since
+// stubStore keeps Embedding inline on the engram (it never models the ERF v2
+// separate-key split), the fallback simply reads it back off the same record.
+func (s *stubStore) GetEmbedding(_ context.Context, _ [8]byte, id storage.ULID) ([]float32, error) {
+	if e, ok := s.engrams[id]; ok {
+		return e.Embedding, nil
+	}
+	return nil, nil
+}
+
+// GetEmbeddings mirrors PebbleStore.GetEmbeddings for this in-memory stub: same
+// inline-Embedding source as GetEmbedding, just returned positionally for a batch
+// of ids in one call.
+func (s *stubStore) GetEmbeddings(_ context.Context, _ [8]byte, ids []storage.ULID) ([][]float32, error) {
+	out := make([][]float32, len(ids))
+	for i, id := range ids {
+		if e, ok := s.engrams[id]; ok {
+			out[i] = e.Embedding
+		}
+	}
+	return out, nil
+}
+
 func (s *stubStore) EngramIDsByCreatedRange(_ context.Context, _ [8]byte, since, until time.Time, limit int) ([]storage.ULID, error) {
 	var ids []storage.ULID
 	for _, id := range s.recent {
@@ -127,6 +159,109 @@ func (s *stubStore) EngramIDsByCreatedRange(_ context.Context, _ [8]byte, since,
 		}
 	}
 	return ids, nil
+}
+
+// ListByTagInRange returns tagged engrams newest-first within [since, until],
+// truncated at limit. It scans the full engram set (the tag index is independent
+// of the decay/recent pool — that independence is the whole point of #607) and
+// sorts by ULID descending, mirroring the real PebbleStore's newest-first,
+// oldest-sacrificed-on-truncation semantics.
+func (s *stubStore) ListByTagInRange(_ context.Context, _ [8]byte, tag string, since, until time.Time, limit int) ([]storage.ULID, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var matched []storage.ULID
+	for id, eng := range s.engrams {
+		if !tagInEngram(eng, tag) {
+			continue
+		}
+		if (!since.IsZero() && eng.CreatedAt.Before(since)) || (!until.IsZero() && eng.CreatedAt.After(until)) {
+			continue
+		}
+		matched = append(matched, id)
+	}
+	// Newest-first: ULID embeds the millisecond timestamp, so descending byte
+	// order is descending creation time.
+	sort.Slice(matched, func(i, j int) bool {
+		return bytes.Compare(matched[i][:], matched[j][:]) > 0
+	})
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, nil
+}
+
+func tagInEngram(eng *storage.Engram, tag string) bool {
+	for _, t := range eng.Tags {
+		if t == tag {
+			return true
+		}
+	}
+	return false
+}
+
+// ListByTagsAllInRange returns engrams carrying EVERY tag, newest-first within
+// [since, until], with limit bounding the OUTPUT. It computes an exact set
+// intersection over the full engram set (mirroring the real PebbleStore's
+// hash-level stream intersection minus collision false positives) so the limit
+// never truncates the per-tag input the way a per-tag window would.
+func (s *stubStore) ListByTagsAllInRange(_ context.Context, _ [8]byte, tags []string, since, until time.Time, limit int) ([]storage.ULID, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	var matched []storage.ULID
+	for id, eng := range s.engrams {
+		all := true
+		for _, tag := range tags {
+			if !tagInEngram(eng, tag) {
+				all = false
+				break
+			}
+		}
+		if !all {
+			continue
+		}
+		if (!since.IsZero() && eng.CreatedAt.Before(since)) || (!until.IsZero() && eng.CreatedAt.After(until)) {
+			continue
+		}
+		matched = append(matched, id)
+	}
+	sort.Slice(matched, func(i, j int) bool {
+		return bytes.Compare(matched[i][:], matched[j][:]) > 0
+	})
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, nil
+}
+
+// ScanRawTagRange mirrors PebbleStore.ScanRawTagRange: for engrams whose tag
+// splits (via storage.SplitRawTagKV) to tagKey, builds the actual 0x2B key
+// via keys.RawTagRangeKey and checks membership in [lower, upper) with the
+// same byte comparison Pebble applies to real keys.
+func (s *stubStore) ScanRawTagRange(_ context.Context, ws [8]byte, tagKey string, lower, upper []byte, limit int) ([]storage.ULID, error) {
+	tagKeyHash := keys.Hash(tagKey)
+	var matched []storage.ULID
+	for id, eng := range s.engrams {
+		for _, tag := range eng.Tags {
+			tk, v, ok := storage.SplitRawTagKV(tag)
+			if !ok || tk != tagKey {
+				continue
+			}
+			k := keys.RawTagRangeKey(ws, tagKeyHash, []byte(v), [16]byte(id))
+			if bytes.Compare(k, lower) >= 0 && bytes.Compare(k, upper) < 0 {
+				matched = append(matched, id)
+				break
+			}
+		}
+	}
+	sort.Slice(matched, func(i, j int) bool {
+		return bytes.Compare(matched[i][:], matched[j][:]) < 0
+	})
+	if limit > 0 && len(matched) > limit {
+		matched = matched[:limit]
+	}
+	return matched, nil
 }
 
 func (s *stubStore) RestoreArchivedEdgesTransitive(_ context.Context, _ [8]byte, _ storage.ULID, _, _ int) ([]storage.ULID, error) {
@@ -703,7 +838,7 @@ func TestZeroFTSScoreYearsZeroFTRComponent(t *testing.T) {
 	}
 	store.writeEngram(eng1)
 
-	// FTS score = 0.0 → after math.Tanh normalization → 0.0.
+	// FTS score = 0.0 → FullTextRelevance passes through unchanged → 0.0.
 	fts := &stubFTS{results: []activation.ScoredID{
 		{ID: eng1.ID, Score: 0.0},
 	}}
@@ -741,7 +876,9 @@ func TestPositiveFTSScoreYieldsNormalizedFTR(t *testing.T) {
 	store.writeEngram(eng1)
 
 	fts := &stubFTS{results: []activation.ScoredID{
-		{ID: eng1.ID, Score: 5.0}, // BM25 raw score — large but normalized via tanh
+		// Post-#711, fts.Search itself returns a calibrated, absolute [0,1]
+		// coverage score — the activation engine no longer tanh-normalizes it.
+		{ID: eng1.ID, Score: 0.85},
 	}}
 	eng := newTestEngine(store, fts, nil)
 
@@ -1160,9 +1297,9 @@ func TestPhase4_75_ArchiveRestoreRunsDuringActivation(t *testing.T) {
 		t.Fatalf("WriteEngram B: %v", err)
 	}
 
-	// Write A → B association with LastActivated=0 so DecayAssocWeights does
-	// not skip it via the recent-activation grace window (the guard fires only
-	// when lastActivated > 0 and within the grace period).
+	// Write A → B association with LastActivated=0 and a 30-day-old CreatedAt.
+	// Since #762 an unknown lastActivated falls back to createdAt rather than
+	// being read as the Unix epoch, so this edge has 30 days of elapsed time.
 	err = pstore.WriteAssociation(ctx, ws, engramA.ID, engramB.ID, &storage.Association{
 		TargetID:   engramB.ID,
 		Weight:     0.5,
@@ -1182,11 +1319,11 @@ func TestPhase4_75_ArchiveRestoreRunsDuringActivation(t *testing.T) {
 	}
 
 	// Trigger archiving via DecayAssocWeights:
-	//   decayFactor = 0.001 → newW = 0.5 * 0.001 = 0.0005 < minWeight(0.01)
-	//   consolidationScore = peakWeight(0.5) * coActCount(1) / daysSince(~20000)
-	//                      ≈ 0.000025
-	//   archiveThreshold = 0.000001 < 0.000025 → archive condition is satisfied.
-	_, err = pstore.DecayAssocWeights(ctx, ws, 0.001, 0.01, 0.000001)
+	//   H = 1 day, dt = 30 days → ceiling ≈ 0 < minWeight(0.01)
+	//   consolidationScore = peakWeight(0.5) * coActCount(1) / daysSince(30)
+	//                      ≈ 0.0167
+	//   archiveThreshold = 0.000001 < 0.0167 → archive condition is satisfied.
+	_, err = pstore.DecayAssocWeights(ctx, ws, 24*time.Hour, 0.01, 0.000001)
 	if err != nil {
 		t.Fatalf("DecayAssocWeights: %v", err)
 	}
@@ -1379,6 +1516,70 @@ func TestRRF_ReturnsResultsWithDefaultThreshold(t *testing.T) {
 	}
 	t.Logf("RRF returned %d results with auto-lowered threshold (score=%v)",
 		len(result.Activations), result.Activations[0].Score)
+}
+
+// ---------------------------------------------------------------------------
+// Test: Run() applies a mode-appropriate DEFAULT threshold only when the caller
+// leaves Threshold <= 0, and never overrides an explicit user-set value.
+//
+// Regression for the threshold-preservation bug: previously any explicit
+// threshold >= 0.01 was silently trampled down to 0.001 whenever RRF was on,
+// which made the API's threshold parameter meaningless under RRF.
+//
+// Run() mutates req.Threshold in place, so we assert on it after the call.
+// ---------------------------------------------------------------------------
+
+func TestRun_ThresholdDefaulting(t *testing.T) {
+	store := newStubStore()
+	eng1 := &storage.Engram{
+		Concept:    "threshold defaulting",
+		Content:    "engram for threshold defaulting behavior",
+		Confidence: 1.0,
+		Stability:  30.0,
+		Relevance:  0.8,
+	}
+	store.writeEngram(eng1)
+	ftsResults := []activation.ScoredID{{ID: eng1.ID, Score: 0.8}}
+
+	cases := []struct {
+		name      string
+		threshold float64
+		rrf       bool
+		want      float64
+	}{
+		{"explicit value preserved under RRF", 0.02, true, 0.02},
+		{"explicit value preserved without RRF", 0.02, false, 0.02},
+		{"no threshold defaults to 0.001 under RRF", 0, true, 0.001},
+		{"no threshold defaults to 0.05 without RRF", 0, false, 0.05},
+		// NEGATIVE is no longer coerced: it is the documented diagnostic
+		// bypass ("gate nothing") that Explain depends on — coercing it to a
+		// default was exactly what made below-bar engrams unexplainable
+		// (adversarial review of #754, finding 4). The gates compare
+		// `score < Threshold`, so -1 admits everything.
+		{"negative threshold is preserved as the diagnostic bypass (RRF)", -1, true, -1},
+		{"negative threshold is preserved as the diagnostic bypass", -1, false, -1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := newTestEngine(store, &stubFTS{results: ftsResults}, nil)
+			req := &activation.ActivateRequest{
+				Context:    []string{"threshold"},
+				Threshold:  tc.threshold,
+				MaxResults: 10,
+				Weights: &activation.Weights{
+					UseRRFFusion: tc.rrf,
+					DisableACTR:  tc.rrf,
+				},
+			}
+			if _, err := eng.Run(context.Background(), req); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if req.Threshold != tc.want {
+				t.Errorf("Threshold = %v, want %v", req.Threshold, tc.want)
+			}
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------

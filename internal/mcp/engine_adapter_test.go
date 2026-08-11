@@ -309,3 +309,67 @@ func TestRelTypeToString_ZeroValueEmpty(t *testing.T) {
 		t.Errorf("relTypeToString(0) = %q, want empty string", got)
 	}
 }
+
+// TestWhereLeftOffEntryFromEngramMapsType verifies the muninn_where_left_off
+// projection carries the stored memory type — previously this surface dropped
+// it even though the engine hands the adapter full engrams.
+func TestWhereLeftOffEntryFromEngramMapsType(t *testing.T) {
+	eng := &storage.Engram{
+		ID:         storage.ULID{7},
+		Concept:    "typed entry",
+		MemoryType: storage.TypeGoal,
+		TypeLabel:  "quarterly_objective",
+	}
+	entry := whereLeftOffEntryFromEngram(eng)
+	if entry.Type != "goal" {
+		t.Errorf("Type = %q, want %q", entry.Type, "goal")
+	}
+	if entry.TypeLabel != "quarterly_objective" {
+		t.Errorf("TypeLabel = %q, want %q", entry.TypeLabel, "quarterly_objective")
+	}
+	// Zero value presents as "fact" — the field is always present.
+	plain := whereLeftOffEntryFromEngram(&storage.Engram{ID: storage.ULID{8}})
+	if plain.Type != "fact" {
+		t.Errorf("zero-value Type = %q, want %q", plain.Type, "fact")
+	}
+}
+
+// TestWhereLeftOff_ReturnsTags verifies the muninn_where_left_off projection
+// carries the stored tags — S4. whereLeftOffEntryFromEngram must map
+// eng.Tags onto WhereLeftOffEntry.Tags so callers can see them without a
+// follow-up muninn_read.
+func TestWhereLeftOff_ReturnsTags(t *testing.T) {
+	eng := &storage.Engram{
+		ID:      storage.ULID{9},
+		Concept: "tagged entry",
+		Tags:    []string{"alpha", "beta"},
+	}
+	entry := whereLeftOffEntryFromEngram(eng)
+	if len(entry.Tags) != 2 {
+		t.Fatalf("Tags len = %d, want 2 (got %v)", len(entry.Tags), entry.Tags)
+	}
+	if entry.Tags[0] != "alpha" || entry.Tags[1] != "beta" {
+		t.Errorf("Tags = %v, want [alpha beta]", entry.Tags)
+	}
+}
+
+// TestWhereLeftOffEntryFromEngramImportance verifies the muninn_where_left_off
+// projection carries importance + provenance (explicit vs derived), matching
+// the read/recall surfaces.
+func TestWhereLeftOffEntryFromEngramImportance(t *testing.T) {
+	explicit := whereLeftOffEntryFromEngram(&storage.Engram{
+		ID:         storage.ULID{9},
+		MemoryType: storage.TypeTask,
+		Importance: 0.9,
+	})
+	if explicit.Importance != 0.9 || explicit.ImportanceSource != "explicit" {
+		t.Errorf("explicit entry = (%v, %q), want (0.9, explicit)", explicit.Importance, explicit.ImportanceSource)
+	}
+	derived := whereLeftOffEntryFromEngram(&storage.Engram{
+		ID:         storage.ULID{10},
+		MemoryType: storage.TypeGoal,
+	})
+	if derived.Importance != 0.6 || derived.ImportanceSource != "derived" {
+		t.Errorf("derived entry = (%v, %q), want (0.6, derived)", derived.Importance, derived.ImportanceSource)
+	}
+}

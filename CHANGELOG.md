@@ -9,6 +9,180 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+---
+
+## [0.10.0] - 2026-08-01
+
+The trust release. Nine rounds of blind hands-on evaluation by AI agents drove
+this cycle: each round's top complaint was fixed, adversarially reviewed, and
+re-verified live by the evaluator that filed it.
+
+### The cognitive substrate, made honest
+
+- **Full-confidence learning restored** (#757): a key-encoding overflow had sent
+  every weight-1.0 association (declared links, decide evidence, LTP-saturated
+  learning) to the wrong key position since inception, where it read back as 0.
+  "Strengthens with use" works for the first time. A startup repair (#759)
+  relocates identifiable pre-fix keys, watermarked and gated so decay cannot
+  destroy the evidence first.
+- **Association decay is a real forgetting curve** (#766): decay was a per-pass
+  multiplier on a 60-second tick (a 13.5-minute half-life) since February; every
+  learned edge hit the floor within an hour of last use. Now a peak-anchored
+  elapsed-time ceiling (default 30-day half-life, `assoc_half_life_days`),
+  cadence-independent by construction, no on-disk format change. A legacy
+  `assoc_decay_factor` in (0,1) is reinterpreted per-day with a one-time loud
+  WARN; a factor of 1.0 or above skips loudly instead of silently enabling.
+- **Contradictions stopped destroying data** (#747) and started mattering
+  (#772): declaring a `contradicts` link now changes what recall returns — both
+  sides demoted and annotated, a response-level `conflict` block, and every
+  resolution path (evolve, forget(not_true_since), link(supersedes)) actually
+  clears it, immediately, in recall and in the report. The shared worker's flush
+  ticker was a debounce that starved detection (and the confidence penalty)
+  under any active session; fixed.
+
+### Recall that tells the truth
+
+- **Version chains resolve to their head** (#767): a query phrased in a
+  superseded fact's old wording returns the current version, attributed
+  (`substituted_for`, `substitution_basis`), with fork/cycle refusal and loud
+  truncation. Evolve now wakes the embed processor, closing a ~3-minute window
+  where a fresh successor was semantically invisible.
+- **A first-class relevance band** (#778): every recall row carries
+  `relevance_band` (strong/moderate/weak/filter_match/uncalibrated) derived
+  from the absolute score against the vault's own calibration — the per-query
+  score renormalization can no longer dress a weak neighbor as certainty.
+  `absolute_score` and `content_match` are now visible on the wire. The
+  response-level "nothing strongly matched" hint deliberately did not ship: it
+  failed its pre-committed acceptance rule (16.7% vs 70%), and that record is
+  pinned in CI.
+- **Calibrated abstention** (#715, #718, #754): recall can honestly abstain
+  (`abstained`, `abstained_reason`) with an anisotropy-calibrated semantic
+  floor, self-measured per model; embedding failure degrades loudly
+  (`semantic_degraded`, #740). RRF vaults no longer return silently-empty
+  default recall (#705); recall-mode presets no longer bypass the mode-aware
+  threshold (#710); top-N ordering is deterministic (#699).
+- **Currency advisories stopped lying** (#738, #758): the version-cluster
+  advisory ships with a universal version-marker gate and declared-chain
+  suppression — a deliberate near-silencing on vaults without version
+  vocabulary, because a false "possibly superseded" on a live fact is worse
+  than silence.
+
+### The write path and the agent experience
+
+- **The Push, increment 1** (#694): armed intentions with focal-cue notices
+  over MCP, behind `MUNINN_PROSPECTIVE`.
+- **Curator reflex in the on-connect surface** (#741) and evolve-first guidance
+  (#723); six silent-substitution defects from hands-on evaluation fixed in one
+  pass (#746); unrecognized memory types (#742) and link relations (#745) are
+  never silently swallowed; the entity-type enum that cost 64 points of entity
+  coverage is gone (#743); evolve records its real write verb in provenance
+  (#739); optional inline entities on evolve (#680); importance dimension with
+  pruning protection (#689); per-vault exclude-tags (#735).
+- **muninn_remember names the vault it resolved to** when the caller omits one
+  (#772 rider).
+
+### Operations, safety, durability
+
+- Consolidate no longer loses data under concurrent writes (#754). Stale PID
+  files no longer break `muninn stop` (#650). Trigger events carry the full
+  vault prefix (#697). Backup/import test hardening (#753), hermeticity
+  doctrine for async assertions (#727), and four CI timing flakes fixed at the
+  cause. Privacy: design records triaged with a public-repo naming rule
+  enforced by a reviewer-level check (#775, #734).
+
+### Known and named
+
+- The recall gate's answerability ceiling is measured, in-tree, and honest:
+  topically-adjacent unanswerable queries pass at high rates because they carry
+  real evidence; no scalar gate fixes this (#757's labeled query set). The
+  abstain-on-weak default both evaluators now ask for is the next increment's
+  question, gated by that measurement.
+- Pre-#766 decay damage is not retroactively undone: floored edges re-learn
+  from the floor rather than being resurrected by fiat.
+- Open, filed, and tracked: consolidation's embed-lag recall hole (#779), stale
+  concept after evolve (#769), entity co-occurrence staleness after evolve
+  (#780), the same-key relType replacement footgun (#771), CGDN's dead
+  experimental path (#768).
+
+---
+
+## [0.9.0] - 2026-07-20
+
+Adds an agent-oriented credential and multi-agent workflow layer (capability
+tokens and self-provisioned workflow vaults), a `working` plasticity preset,
+recall-event calibration ground truth, and a `muninn remember` CLI write verb,
+alongside a keyspace-collision fix that ships a one-time on-disk migration.
+
+> **Upgrade note — on-disk migration.** This release relocates the auth
+> subsystem's internal Pebble key prefixes to resolve a latent collision with
+> storage keys (#611). A one-time v3 migration rewrites existing admin-user,
+> API-key, and vault-config records on the first start after upgrade. It is
+> idempotent and crash-safe, but **back up your data directory before
+> upgrading**, as with any storage-format change. No action is needed beyond
+> starting the new binary.
+
+### Added
+
+- **Capability tokens (`cap_`) and agent-provisioned workflow vaults.** A new
+  TTL-bound, MCP-only credential type plus a `muninn_create_workflow_vault` tool
+  that lets an agent mint a scoped, expiring `wf-*` vault for a fleet.
+  Capabilities are structurally non-recursive (a capability can never mint
+  another) and the tool is opt-in (`MUNINN_AGENT_VAULT_CREATE`, default off).
+  (#612, RFC #597)
+- **Toolset profiles for `tools/list`.** A `core`/`full` switch via the
+  `MUNINN_MCP_TOOLSET` env var or a per-connection `X-Muninn-Toolset` header
+  trims the advertised tool set to cut per-session schema overhead. Advertisement
+  only — every tool stays callable. Defaults to `full`, fails open on unknown
+  values. (#604, implements #588)
+- **`working` plasticity preset.** `default` cognition (Hebbian + PAS on) plus a
+  7-day retention window, so a shared workflow vault auto-evaporates through the
+  background pruner. (#599, RFC #597)
+- **Recall-event sink.** The set of engrams surfaced by each recall is persisted
+  as calibration ground truth, behind a purpose-gated read allowlist so it can
+  never leak back into recall, replicated like every other write, and cleared
+  with its vault. (#574, closes #573)
+- **`muninn remember` CLI verb.** Store a memory against a running daemon over
+  the REST surface, with `--content-file` for large or JSON-fragile payloads,
+  authenticating from a `0600` key file. (#613, closes #610)
+- **Stored memory type surfaced on reads.** `read`, `recall`, `where_left_off`,
+  and `find_by_entity` now return the stored `memory_type` and `type_label`.
+  (#616)
+- **Search Scoring setting** in the management console. (#590)
+
+### Changed
+
+- **Auth Pebble key prefixes relocated (`0x11`–`0x14` → `0x42`–`0x45`),**
+  resolving a latent collision with storage keys in the shared database (see the
+  upgrade note above). Ships a v3 on-disk migration and a cross-package
+  prefix-disjointness test so the collision class can't recur. (#618, closes
+  #611)
+
+### Fixed
+
+- **Tag-scoped recall no longer silently misses engrams.** `tags_all` /
+  `tags_any` were post-filters over the candidate pool; they now seed candidates
+  from the tag index, so a tagged engram can no longer be structurally absent
+  from a tag-scoped recall. (#619, closes #607)
+- **Revoked or expired `mk_` API keys can no longer keep dispatching on an open
+  MCP SSE session.** The cached session credential is re-validated on every POST,
+  symmetric with the existing `cap_` re-validation. (#617, RFC #597; see
+  Security)
+- **Late HNSW inserts stay reachable.** A node born with zero in-edges could be
+  permanently unfindable; the fresh back-edge is now protected during prune and
+  small orphan sets are repaired on load. (#621, closes #620)
+- **Explicit recall threshold preserved under RRF fusion** instead of being
+  clobbered to the RRF floor. (#590)
+- **`DeleteEngram` serialized with `CompareAndSet`'s per-engram stripe lock,**
+  closing a race that could resurrect a just-deleted engram. (#594)
+
+### Security
+
+- **Revoked `mk_` MCP SSE sessions closed.** A revoked or expired API key could
+  keep serving a long-lived SSE session; it is now re-validated on every POST
+  before dispatch. (#617)
+
 ---
 
 ## [0.8.0] - 2026-07-09
@@ -40,11 +214,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Entity boost no longer floods recall in mature vaults.** The post-BFS
-  entity boost is now rarity-weighted (idf), credited once per entity
-  regardless of seed count, capped so associative evidence can't outrank
-  content evidence, and injection is gated on the caller's threshold.
-  (#581, fixes #569)
 - **Embed provider silent fallback eliminated.** An explicitly configured
   embed provider is never silently substituted for a different model. (#585)
 - **BM25 fallback when the embed backend is unreachable**, with precise
@@ -60,12 +229,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disconnected.
 - **`vault create` registration** in the Pebble index, repairing a
   split-brain window in reindex-fts/export. (#547)
+- **Google enrichment truncation.** The Google provider's `MaxOutputTokens`
+  was raised from 4096 to 8192, and LLM parse failures are now counted in the
+  stats, so long enrichments are no longer silently truncated.
 
 ### Security
 
 - Bump Go toolchain to 1.26.5, fixing [GO-2026-5856](https://pkg.go.dev/vuln/GO-2026-5856)
-  (Encrypted Client Hello privacy leak in `crypto/tls`), reachable via the gRPC server,
-  MCP server, WAL recovery, `doctor` cert dial, and plugin transport. (#591)
+  (Encrypted Client Hello privacy leak in `crypto/tls`), reachable via the gRPC
+  server, MCP server, WAL recovery, `doctor` cert dial, and plugin transport.
+  (#591)
+
+> **Correction (see #602):** the originally-tagged 0.8.0 changelog listed an
+> entity-boost recall-flood fix (#569) under Fixed. That fix did not make the
+> 0.8.0 cut — #569 remains open and its PR (#570) is still in review — so the
+> entry has been removed here. The fuzzy-entity work that did ship (#581) is
+> covered under "Fuzzy entity resolve" above.
 
 ---
 

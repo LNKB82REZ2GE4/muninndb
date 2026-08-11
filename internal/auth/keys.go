@@ -1,11 +1,18 @@
 package auth
 
+import "github.com/scrypster/muninndb/internal/prefix"
+
 const (
-	prefixAdminUser  byte = 0x11
-	prefixAPIKey     byte = 0x12
-	prefixAPIKeyVIdx byte = 0x13
-	prefixVaultCfg   byte = 0x14
-	prefixAPIKeyGlob byte = 0x29 // glob-scope key index; see docs/key-space-schema.md
+	prefixAdminUser      = prefix.AdminUser
+	prefixAPIKey         = prefix.APIKey
+	prefixAPIKeyVIdx     = prefix.APIKeyVaultIdx
+	prefixVaultCfg       = prefix.VaultConfig
+	prefixCapability     = prefix.Capability
+	prefixCapabilityVIdx = prefix.CapabilityVaultIdx
+	// prefixAPIKeyGlob: glob-scope key index; see docs/key-space-schema.md.
+	// Relocated from the inlined 0x29 (which collided with storage's
+	// RecallEvent prefix) to the registry during the v0.10.0 merge.
+	prefixAPIKeyGlob = prefix.APIKeyGlobIdx
 )
 
 // apiKeyGlobIdxKey indexes API keys that have at least one glob-scope entry
@@ -55,6 +62,32 @@ func apiKeyVaultIdxKey(vault string, keyID []byte) []byte {
 func apiKeyVaultIdxPrefix(vault string) []byte {
 	key := make([]byte, 1+len(vault)+1)
 	key[0] = prefixAPIKeyVIdx
+	copy(key[1:], vault)
+	key[1+len(vault)] = 0x00
+	return key
+}
+
+func capabilityStorageKey(hash16 []byte) []byte {
+	key := make([]byte, 1+16)
+	key[0] = prefixCapability
+	copy(key[1:], hash16)
+	return key
+}
+
+// capabilityVaultIdxKey indexes capabilities by vault for listing/revocation.
+func capabilityVaultIdxKey(vault string, capID []byte) []byte {
+	key := make([]byte, 1+len(vault)+1+8)
+	key[0] = prefixCapabilityVIdx
+	copy(key[1:], vault)
+	key[1+len(vault)] = 0x00
+	copy(key[1+len(vault)+1:], capID[:8])
+	return key
+}
+
+// capabilityVaultIdxPrefix returns the scan prefix for all capabilities in a vault.
+func capabilityVaultIdxPrefix(vault string) []byte {
+	key := make([]byte, 1+len(vault)+1)
+	key[0] = prefixCapabilityVIdx
 	copy(key[1:], vault)
 	key[1+len(vault)] = 0x00
 	return key

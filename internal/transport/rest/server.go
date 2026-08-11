@@ -248,6 +248,8 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, sessionSecr
 	mux.HandleFunc("GET /api/admin/plugins", s.withAdminMiddleware(s.handlePlugins))
 	mux.HandleFunc("GET /api/admin/vault/{name}/plasticity", s.withAdminMiddleware(s.handleGetVaultPlasticity(authStore)))
 	mux.HandleFunc("PUT /api/admin/vault/{name}/plasticity", s.withAdminMiddleware(s.handlePutVaultPlasticity(authStore)))
+	mux.HandleFunc("GET /api/admin/vaults/{name}/capabilities", s.withAdminMiddleware(s.handleListCapabilities(authStore)))
+	mux.HandleFunc("DELETE /api/admin/vaults/{name}/capabilities/{capID}", s.withAdminMiddleware(s.handleRevokeCapability(authStore)))
 	mux.HandleFunc("GET /api/admin/plugin-config", s.withAdminMiddleware(s.handleGetPluginConfig))
 	mux.HandleFunc("PUT /api/admin/plugin-config", s.withAdminMiddleware(s.handlePutPluginConfig))
 	mux.HandleFunc("POST /api/admin/provider-models", s.withAdminMiddleware(s.handleProviderModels))
@@ -832,15 +834,31 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid request body")
 		return
 	}
-
 	// Apply recall mode preset if provided (shared by single- and multi-vault paths).
+	// Clamp a negative threshold: below zero is out-of-domain on the wire.
+	// In-process, a negative threshold is the diagnostic gate-bypass Explain
+	// uses (activation.Run treats <0 as "gate nothing"); that contract is
+	// deliberately NOT exposed to external callers, so the wire behaviour for
+	// out-of-range input stays what it always was — the engine default.
+	//
+	// NOTE: vault resolution is deliberately deferred past this point — it
+	// happens per-path below (multi-vault fan-out vs. single-vault) because
+	// resolveHandlerVault defaults an empty req.Vault to "default", which
+	// would break the multi-vault path's mutual-exclusivity check against
+	// req.Vaults just below.
+	if req.Threshold < 0 {
+		req.Threshold = 0
+	}
+	// Validate the recall mode here (fail fast with a 400), but forward it
+	// instead of stamping preset values into the request — the engine is the
+	// single preset decider, because only it knows the effective scoring mode
+	// and preset thresholds are scale-bound (#704: stamping deep's
+	// ACT-R-calibrated 0.1 here silently emptied rrf vaults).
 	if req.Mode != "" {
-		preset, err := auth.LookupRecallMode(req.Mode)
-		if err != nil {
+		if _, err := auth.LookupRecallMode(req.Mode); err != nil {
 			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, err.Error())
 			return
 		}
-		applyRecallModePreset(&req, preset)
 	}
 
 	// Multi-vault merged recall (project-vaults phase 2): "vaults" rides the
@@ -922,34 +940,6 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.sendJSON(w, http.StatusOK, resp)
-}
-
-// applyRecallModePreset applies non-zero recall mode preset fields to an ActivateRequest,
-// only when the caller has not already set the corresponding field.
-func applyRecallModePreset(req *ActivateRequest, preset auth.RecallModePreset) {
-	if preset.Threshold > 0 && req.Threshold == 0 {
-		req.Threshold = preset.Threshold
-	}
-	if preset.MaxHops > 0 && req.MaxHops == 0 {
-		req.MaxHops = preset.MaxHops
-	}
-	if preset.SemanticSimilarity > 0 || preset.FullTextRelevance > 0 || preset.Recency > 0 || preset.DisableACTR {
-		if req.Weights == nil {
-			req.Weights = &mbp.Weights{}
-		}
-		if preset.SemanticSimilarity > 0 && req.Weights.SemanticSimilarity == 0 {
-			req.Weights.SemanticSimilarity = preset.SemanticSimilarity
-		}
-		if preset.FullTextRelevance > 0 && req.Weights.FullTextRelevance == 0 {
-			req.Weights.FullTextRelevance = preset.FullTextRelevance
-		}
-		if preset.Recency > 0 && req.Weights.Recency == 0 {
-			req.Weights.Recency = preset.Recency
-		}
-		if preset.DisableACTR {
-			req.Weights.DisableACTR = true
-		}
-	}
 }
 
 func (s *Server) handleLink(w http.ResponseWriter, r *http.Request) {

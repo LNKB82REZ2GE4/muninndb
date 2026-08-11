@@ -3,7 +3,6 @@ package mcp
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"net/http"
 
@@ -57,14 +56,22 @@ const mcpInstructions = `MuninnDB is a long-term memory server for AI agents. ` 
 	`in a shared vault it is vault-global, so use muninn_recall scoped to your per-user tag instead ` +
 	`(muninn_guide states whether this vault is shared, under Vault Configuration). ` +
 	`Store with muninn_remember (include type, summary, entities). ` +
-	`Update with muninn_evolve, not forget+remember. ` +
-	`Keep memories atomic — one concept each. ` +
+	`You are this memory's curator, not a static store: the moment you write is the moment you know something, so it is the moment to reconcile. ` +
+	`Before adding a fact, recall what's related — if your new knowledge corrects, sharpens, or supersedes an existing memory, muninn_evolve that one instead of adding a rival copy (evolve supersedes and retires the old version; a second muninn_remember leaves a stale duplicate competing in recall). ` +
+	`Reserve muninn_remember for genuinely new facts. Keep memories atomic — one concept each. ` +
 	`Call muninn_guide for the full reference.`
 
 // apiKeyValidator is the subset of auth.Store used by MCP for vault key auth.
 // Using an interface keeps the mcp package testable without a live Pebble store.
 type apiKeyValidator interface {
 	ValidateAPIKey(token string) (auth.APIKey, error)
+}
+
+// capabilityValidator is the subset of auth.Store used by MCP for cap_ token
+// auth (RFC #597). Kept as an interface so the mcp package remains testable
+// without a live Pebble store; the real implementation is *auth.Store.
+type capabilityValidator interface {
+	ValidateCapability(token string) (auth.Capability, error)
 }
 
 // mcpAuthContextKey is the unexported key used to store AuthContext in request context.
@@ -91,7 +98,10 @@ func authFromContext(ctx context.Context) AuthContext {
 //  3. Open-server mode — if no static token configured and no mk_ key present, allow.
 //
 // apiKeyStore may be nil to disable mk_ key auth (legacy mode).
-func authFromRequest(r *http.Request, requiredToken string, apiKeyStore apiKeyValidator) AuthContext {
+// capStore may be nil to disable cap_ capability auth (pre-RFC #597 mode);
+// when non-nil, an invalid or expired cap_ token fails closed (never falls
+// through to open-server), mirroring the mk_ posture.
+func authFromRequest(r *http.Request, requiredToken string, apiKeyStore apiKeyValidator, capStore capabilityValidator) AuthContext {
 	token, found := auth.ParseBearerToken(r.Header.Get("Authorization"))
 
 	// 1. mk_ vault API key — always checked first, regardless of whether a static
@@ -112,6 +122,24 @@ func authFromRequest(r *http.Request, requiredToken string, apiKeyStore apiKeyVa
 		return AuthContext{Authorized: false}
 	}
 
+	// 1b. cap_ capability token — vault-pinned, mode-enforced, TTL'd (RFC #597).
+	// Checked before the open-server fallthrough: an invalid or expired cap_
+	// token must NOT drop into open-server mode. When capStore is nil, cap_
+	// auth is disabled and the branch is skipped (backward-compatible).
+	if found && len(token) > 4 && token[:4] == "cap_" && capStore != nil {
+		if cap, err := capStore.ValidateCapability(token); err == nil {
+			return AuthContext{
+				Token:        token,
+				Authorized:   true,
+				Vault:        cap.Vault,
+				Mode:         cap.Mode,
+				IsCapability: true,
+			}
+		}
+		// Invalid cap_ token: fail-closed.
+		return AuthContext{Authorized: false}
+	}
+
 	// 2. Open-server mode — no static token required and no mk_ key presented.
 	if requiredToken == "" {
 		return AuthContext{Authorized: true}
@@ -125,32 +153,6 @@ func authFromRequest(r *http.Request, requiredToken string, apiKeyStore apiKeyVa
 		return AuthContext{Token: token, Authorized: true}
 	}
 	return AuthContext{Authorized: false}
-}
-
-// sessionFromRequest looks up a session by the Mcp-Session-Id header.
-// Returns (nil, "") if no header present.
-// Returns (nil, sessionID) if header present but session not found or expired.
-func sessionFromRequest(r *http.Request, store sessionStore) (sess *mcpSession, sessionID string) {
-	sessionID = r.Header.Get(mcpSessionHeader)
-	if sessionID == "" {
-		return nil, ""
-	}
-	sess, ok := store.Get(sessionID)
-	if !ok {
-		return nil, sessionID
-	}
-	return sess, sessionID
-}
-
-// validateSessionToken checks that the bearer token matches the session's token hash.
-// Returns an error string if invalid, "" if valid.
-// Precondition: sess must not be nil.
-func validateSessionToken(sess *mcpSession, token string) string {
-	h := sha256.Sum256([]byte(token))
-	if h != sess.tokenHash {
-		return "token does not match session"
-	}
-	return ""
 }
 
 // resolveVault determines the effective vault for a tool call.
@@ -184,7 +186,25 @@ func resolveVault(pinnedVault string, args map[string]any) (vault string, errMsg
 	if hasArg && argVault != "" {
 		return argVault, ""
 	}
-	return "default", ""
+	return defaultVaultName, ""
+}
+
+// defaultVaultName is the vault a request with no pinned vault and no explicit
+// `vault` argument resolves to.
+const defaultVaultName = "default"
+
+// joinHints appends one hint to another with a single separating space,
+// tolerating an empty base. Response hints accumulate from several
+// independent sources and none of them may clobber another.
+func joinHints(base, extra string) string {
+	switch {
+	case extra == "":
+		return base
+	case base == "":
+		return extra
+	default:
+		return base + " " + extra
+	}
 }
 
 // resolveVaultScoped determines the effective vault for a tool call from a
@@ -329,7 +349,9 @@ func isMutatingTool(name string) bool {
 		"muninn_trust",
 		"muninn_compare_and_set",
 		"muninn_claim",
-		"muninn_release":
+		"muninn_release",
+		"muninn_create_workflow_vault",
+		"muninn_intend":
 		return true
 	}
 	return false
@@ -365,6 +387,44 @@ func isReadOnlyTool(name string) bool {
 		return true
 	}
 	return false
+}
+
+// isAdditiveTool returns true for the subset of mutating tools that only CREATE
+// new engrams and never modify or delete existing ones. Append-mode credentials
+// (auth.ModeAppend — the flush write credential) may call these plus read tools,
+// but NOT the destructive mutating tools (evolve/forget/trust/merge/…). Keep this
+// a strict subset of isMutatingTool.
+func isAdditiveTool(name string) bool {
+	switch name {
+	case "muninn_remember",
+		"muninn_remember_batch",
+		"muninn_remember_tree",
+		"muninn_add_child":
+		return true
+	}
+	return false
+}
+
+// resolveReadOnly computes the effective read-only decision (S3) for
+// muninn_recall, muninn_read, and muninn_where_left_off:
+//
+//	effective = credentialObserve(a.Mode via S0, carried on ctx by
+//	            auth.ContextMode) || explicit request "read_only" arg
+//
+// An observe-mode credential combined with an EXPLICIT read_only=false is
+// rejected (errMsg non-empty) rather than silently downgraded to read-only —
+// the request cannot escalate past what the credential allows, and failing
+// loudly here surfaces the caller's mistaken assumption instead of masking
+// it. Omitting "read_only" entirely is NOT treated as explicit false: it
+// simply defers to the credential (backward compatible with callers that
+// never set the flag).
+func resolveReadOnly(ctx context.Context, args map[string]any) (effective bool, errMsg string) {
+	credObserve := auth.ObserveFromContext(ctx)
+	reqReadOnly, hasReadOnly := args["read_only"].(bool)
+	if credObserve && hasReadOnly && !reqReadOnly {
+		return false, "forbidden: observe-mode credential cannot request read_only=false"
+	}
+	return credObserve || reqReadOnly, ""
 }
 
 // vaultFromArgs extracts the vault parameter from tool arguments.

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -20,14 +21,25 @@ import (
 
 // MCPServer serves the MCP JSON-RPC 2.0 protocol on a single HTTP mux.
 type MCPServer struct {
-	engine    EngineInterface
-	token     string          // required Bearer token (mdb_ static token); empty = no auth
-	authKeys  apiKeyValidator // optional: enables mk_ vault API key auth; nil = disabled
-	srv       *http.Server
-	tlsConfig *tls.Config // nil = plain TCP
+	engine           EngineInterface
+	token            string              // required Bearer token (mdb_ static token); empty = no auth
+	authKeys         apiKeyValidator     // optional: enables mk_ vault API key auth; nil = disabled
+	capKeys          capabilityValidator // optional: enables cap_ capability auth (RFC #597); nil = disabled
+	authStore        *auth.Store         // privileged: SetVaultConfig + GenerateCapability (create-workflow-vault); nil = tool disabled
+	agentVaultCreate bool                // opt-in: MUNINN_AGENT_VAULT_CREATE (default off, secure-by-default)
+	srv              *http.Server
+	tlsConfig        *tls.Config // nil = plain TCP
 
 	sseSessionsMu sync.RWMutex
 	sseSessions   map[string]*sseSession // sessionID → session
+
+	// THE PUSH (prospective memory) — opt-in via MUNINN_PROSPECTIVE=1.
+	// When false, the notices path on recall/remember is fully inert
+	// (muninn_intend still arms durable intentions). noticeSeen tracks
+	// per-session delivered-notice dedup keys (see prospective.go).
+	prospective bool
+	noticeMu    sync.Mutex
+	noticeSeen  map[string]map[string]struct{} // sessionKey → delivered dedup keys
 	// NOTE: idempotencyLocks grows by one entry per unique op_id seen during the
 	// process lifetime. In practice op_id cardinality is low (client-generated,
 	// not per-request UUIDs), so growth is bounded by usage patterns. The
@@ -55,14 +67,30 @@ type sseSession struct {
 // New creates an MCPServer. addr is the listen address (e.g., ":8750").
 // token is the required static Bearer token (mdb_ style); pass "" to disable auth.
 // keyAuth, if non-nil, enables mk_ vault API key authentication with automatic vault pinning.
+// capAuth, if non-nil, enables cap_ capability token authentication (RFC #597).
 // tlsConfig, if non-nil, enables TLS on the listener.
-func New(addr string, eng EngineInterface, token string, keyAuth apiKeyValidator, tlsConfig *tls.Config) *MCPServer {
+func New(addr string, eng EngineInterface, token string, keyAuth apiKeyValidator, capAuth capabilityValidator, tlsConfig *tls.Config) *MCPServer {
+	// muninn_create_workflow_vault opt-in: default off (secure-by-default).
+	agentVaultCreate := os.Getenv("MUNINN_AGENT_VAULT_CREATE") == "1"
 	s := &MCPServer{
-		engine:      eng,
-		token:       token,
-		authKeys:    keyAuth,
-		sseSessions: make(map[string]*sseSession),
-		tlsConfig:   tlsConfig,
+		engine:           eng,
+		token:            token,
+		authKeys:         keyAuth,
+		capKeys:          capAuth,
+		agentVaultCreate: agentVaultCreate,
+		sseSessions:      make(map[string]*sseSession),
+		prospective:      os.Getenv("MUNINN_PROSPECTIVE") == "1",
+		noticeSeen:       make(map[string]map[string]struct{}),
+		tlsConfig:        tlsConfig,
+	}
+	// The create-workflow-vault handler needs the concrete *auth.Store for
+	// SetVaultConfig + GenerateCapability. capAuth is typed capabilityValidator
+	// for testability (stub cap_ stores in tests), but in production it holds a
+	// real *auth.Store. Derive authStore via type assertion so the constructor
+	// signature stays unchanged; stub-based tests get authStore == nil (the
+	// recursion guard still fires, the handler returns "not configured").
+	if as, ok := capAuth.(*auth.Store); ok {
+		s.authStore = as
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
@@ -125,7 +153,7 @@ func (s *MCPServer) withMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
-		a := authFromRequest(r, s.token, s.authKeys)
+		a := authFromRequest(r, s.token, s.authKeys, s.capKeys)
 		if !a.Authorized {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -161,7 +189,7 @@ func (s *MCPServer) handleRPC(w http.ResponseWriter, r *http.Request) {
 	case req.Method == "ping":
 		sendResult(w, req.ID, map[string]any{})
 	case req.Method == "tools/list":
-		sendResult(w, req.ID, map[string]any{"tools": allToolDefinitions()})
+		sendResult(w, req.ID, map[string]any{"tools": exposedToolDefinitions(r)})
 	case req.Method == "tools/call":
 		s.dispatchToolCall(ctx, w, &req, a)
 	case req.Method == "":
@@ -200,10 +228,12 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 		}
 	}
 
-	// Mode enforcement for mk_ vault keys.
+	// Mode enforcement for mk_ vault keys and cap_ capability tokens (RFC #597).
 	// Fail-closed: unknown tools (not in either classification list) are blocked
-	// for both observe and write modes. Only full-mode keys bypass this check.
-	if a.IsAPIKey {
+	// for both observe and write modes. Only full-mode credentials bypass this
+	// check. The body switches on a.Mode, which is populated for both credential
+	// types, so only the guard condition needed to include capabilities.
+	if a.IsAPIKey || a.IsCapability {
 		toolName := req.Params.Name
 		switch a.Mode {
 		case auth.ModeObserve:
@@ -216,11 +246,40 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 				sendError(w, req.ID, -32001, "forbidden: write-mode key cannot call this tool")
 				return
 			}
+		case auth.ModeAppend:
+			// Append: read + create-new only. Destructive/modifying mutating
+			// tools (forget/evolve/trust/merge/…) are refused. The engine also
+			// refuses Evolve/Forget for append-mode as a transport-agnostic
+			// backstop, so this is defense in depth, not the only gate.
+			if !isReadOnlyTool(toolName) && !isAdditiveTool(toolName) {
+				sendError(w, req.ID, -32001, "forbidden: append-mode key cannot call this tool (create-new and read only)")
+				return
+			}
 		case auth.ModeFull:
 			// full mode: no tool restriction within the pinned vault.
 		default:
 			// Unknown mode — fail-closed.
 			sendError(w, req.ID, -32001, "forbidden: unrecognized key mode")
+			return
+		}
+	}
+
+	// muninn_create_workflow_vault is privileged: it requires an mk_ full-mode
+	// key AND the opt-in flag. A cap_ bearer (IsCapability, not IsAPIKey) is
+	// rejected here — this is the structural recursion guard. No capability can
+	// mint further capabilities, because capabilities do not satisfy IsAPIKey.
+	// This check runs BEFORE handler dispatch (handlers do not receive
+	// AuthContext) and AFTER mode enforcement. Write-mode keys pass mode
+	// enforcement (the tool is mutating) but fail here because Mode != ModeFull.
+	// NOTE: the guard deliberately checks IsAPIKey, NOT IsCapability — this is
+	// the security-critical invariant (see TestCreateWorkflowVault_RecursionGuard).
+	if req.Params.Name == "muninn_create_workflow_vault" {
+		if !s.agentVaultCreate {
+			sendError(w, req.ID, -32001, "forbidden: agent vault creation disabled (set MUNINN_AGENT_VAULT_CREATE=1)")
+			return
+		}
+		if !(a.IsAPIKey && a.Mode == auth.ModeFull) {
+			sendError(w, req.ID, -32001, "forbidden: muninn_create_workflow_vault requires a full-mode mk_ key")
 			return
 		}
 	}
@@ -293,6 +352,12 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 
 		// Trust label
 		"muninn_trust": s.handleSetTrust,
+
+		// RFC #597: privileged workflow-vault creation (recursion-guarded above).
+		"muninn_create_workflow_vault": s.handleCreateWorkflowVault,
+
+		// THE PUSH: prospective memory (arm an intention on entity cues).
+		"muninn_intend": s.handleIntend,
 	}
 
 	handler, found := handlers[req.Params.Name]
@@ -300,6 +365,26 @@ func (s *MCPServer) dispatchToolCall(ctx context.Context, w http.ResponseWriter,
 		sendError(w, req.ID, -32602, "unknown tool: "+req.Params.Name)
 		return
 	}
+
+	// COG-11: inject the credential's mode into ctx so engine-layer code (e.g.
+	// engine.go:2005's auth.ObserveFromContext(ctx)) can see it. gRPC
+	// (internal/transport/grpc/server.go:172) and REST (internal/auth/middleware.go:49)
+	// already do this; the MCP surface must match so observe-mode credentials get
+	// ReadOnly=true and skip Hebbian/PAS/activation-log side effects.
+	//
+	// An authorized session with no explicit mode — the static mdb_ token and the
+	// open-server (zero-config) deployment, which both have full tool access — is
+	// mapped to ModeFull, matching REST's public path (internal/auth/middleware.go:74).
+	// Without this, resolveTrust (SEC-14) would reject trust=verified on the default
+	// deployment even though the caller has full access. mk_/cap_ sessions carry
+	// their real key/cap Mode and are left untouched, so an observe key still cannot
+	// stamp verified.
+	mode := a.Mode
+	if mode == "" && a.Authorized {
+		mode = auth.ModeFull
+	}
+	ctx = context.WithValue(ctx, auth.ContextMode, mode)
+
 	handler(ctx, w, req.ID, vault, args)
 }
 
@@ -323,6 +408,8 @@ func registeredToolNames() []string {
 		"muninn_entity", "muninn_entities",
 		"muninn_trust",
 		"muninn_compare_and_set", "muninn_claim", "muninn_release",
+		"muninn_create_workflow_vault",
+		"muninn_intend",
 	}
 }
 
@@ -336,7 +423,7 @@ func (s *MCPServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Auth check
-	a := authFromRequest(r, s.token, s.authKeys)
+	a := authFromRequest(r, s.token, s.authKeys, s.capKeys)
 	if !a.Authorized {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -402,10 +489,10 @@ func (s *MCPServer) handleSSEMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Re-validate auth on every POST — defense in depth against session ID leakage.
-	// Run whenever any auth mechanism is active (static token or mk_ key store),
-	// not just when a static token is configured.
-	if s.token != "" || s.authKeys != nil {
-		a := authFromRequest(r, s.token, s.authKeys)
+	// Run whenever any auth mechanism is active (static token, mk_ key store, or
+	// cap_ capability store), not just when a static token is configured.
+	if s.token != "" || s.authKeys != nil || s.capKeys != nil {
+		a := authFromRequest(r, s.token, s.authKeys, s.capKeys)
 		if !a.Authorized {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -422,10 +509,43 @@ func (s *MCPServer) handleSSEMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Re-validate the cached session credential before dispatch (RedTeam finding
+	// CRITICAL #2). The POST's authFromRequest above only checks .Authorized; the
+	// dispatch context below is set to sess.auth (cached at SSE-open). Without
+	// this re-validation, a cap_ token's TTL expiry or revocation is NEVER
+	// re-checked for an active SSE session — the TTL/revocation mitigation is
+	// defeated on /mcp/message. We keep dispatching on sess.auth (the SSE session
+	// model depends on it for vault pinning) — we just refuse to dispatch if the
+	// cached credential is no longer valid.
+	if sess.auth.IsCapability && s.capKeys != nil {
+		if _, err := s.capKeys.ValidateCapability(sess.auth.Token); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32001,"message":"session credential no longer valid (expired or revoked)"}}`))
+			return
+		}
+	}
+
+	// Re-validate mk_ API keys too (issue #615): same confused-deputy shape as
+	// the cap_ branch above. A revoked mk_ key whose AuthContext was cached at
+	// SSE-open would otherwise keep dispatching on sess.auth until the session
+	// times out. auth.Store.ValidateAPIKey fails-closed on a revoked (deleted)
+	// key, so this is the mk_ analogue of the cap_ re-validation added for #612.
+	if sess.auth.IsAPIKey && s.authKeys != nil {
+		if _, err := s.authKeys.ValidateAPIKey(sess.auth.Token); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32001,"message":"session credential no longer valid (expired or revoked)"}}`))
+			return
+		}
+	}
+
 	// Thread the auth context established at SSE stream open time into the request.
 	// The session auth is authoritative for vault pinning and mode enforcement;
 	// the POST auth check above ensures the caller is still authenticated.
 	r = r.WithContext(contextWithAuth(r.Context(), sess.auth))
+	// SSE transport: the SSE session ID is the notice-session identity.
+	r = r.WithContext(withNoticeSession(r.Context(), sessionID))
 	s.processAndPushSSE(w, r, []chan []byte{sess.ch}, sessionID)
 }
 
@@ -441,7 +561,7 @@ func (s *MCPServer) handleStreamablePost(w http.ResponseWriter, r *http.Request)
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 
-	a := authFromRequest(r, s.token, s.authKeys)
+	a := authFromRequest(r, s.token, s.authKeys, s.capKeys)
 	if !a.Authorized {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
@@ -449,6 +569,9 @@ func (s *MCPServer) handleStreamablePost(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	r = r.WithContext(contextWithAuth(r.Context(), a))
+	// Notice-session identity for prospective-memory dedup: Streamable HTTP
+	// clients echo the Mcp-Session-Id header minted at initialize.
+	r = r.WithContext(withNoticeSession(r.Context(), r.Header.Get(mcpSessionHeader)))
 
 	// If the client also has SSE streams open, route through the async
 	// SSE handler so the response is pushed to ALL matching event streams
@@ -510,6 +633,11 @@ func (s *MCPServer) processAndPushSSE(w http.ResponseWriter, r *http.Request, ch
 	// before a slow tool call completes.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// The detached context loses request values — re-carry the notice-session
+	// identity so prospective-memory dedup survives the detach.
+	if key, ok := r.Context().Value(noticeSessionCtxKey{}).(string); ok {
+		ctx = withNoticeSession(ctx, key)
+	}
 
 	var buf bytes.Buffer
 	recorder := &responseCapture{header: http.Header{}, buf: &buf}
@@ -520,7 +648,7 @@ func (s *MCPServer) processAndPushSSE(w http.ResponseWriter, r *http.Request, ch
 	case req.Method == "ping":
 		sendResult(recorder, req.ID, map[string]any{})
 	case req.Method == "tools/list":
-		sendResult(recorder, req.ID, map[string]any{"tools": allToolDefinitions()})
+		sendResult(recorder, req.ID, map[string]any{"tools": exposedToolDefinitions(r)})
 	case req.Method == "tools/call":
 		s.dispatchToolCall(ctx, recorder, &req, authFromContext(r.Context()))
 	case req.Method == "":
@@ -610,7 +738,7 @@ func (s *MCPServer) handleInitialize(w http.ResponseWriter, req *JSONRPCRequest)
 
 func (s *MCPServer) handleListTools(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"tools": allToolDefinitions()})
+	json.NewEncoder(w).Encode(map[string]any{"tools": exposedToolDefinitions(r)})
 }
 
 func (s *MCPServer) handleHealth(w http.ResponseWriter, r *http.Request) {

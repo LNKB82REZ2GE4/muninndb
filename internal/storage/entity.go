@@ -62,6 +62,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/scrypster/muninndb/internal/prefix"
 	"github.com/scrypster/muninndb/internal/storage/erf"
 	"github.com/scrypster/muninndb/internal/storage/keys"
 	"github.com/vmihailenco/msgpack/v5"
@@ -858,6 +859,36 @@ func (ps *PebbleStore) UpdateDigest(ctx context.Context, id ULID, summary string
 	return nil
 }
 
+// IncrementEntityMentionCount increments the MentionCount on the global entity
+// record for the given name without touching any other field — unlike
+// UpsertEntityRecord it never rewrites Type, Source or Confidence, so it is
+// safe to call for links carried from a predecessor whose entity metadata must
+// survive untouched. No-ops if the record does not exist: a carried link whose
+// 0x1F record is already gone has nothing to fund, and DecrementEntityMentionCount
+// floors at 0 on the other side, so the ledger stays consistent.
+// Safe for concurrent calls — uses per-entity locking.
+func (ps *PebbleStore) IncrementEntityMentionCount(ctx context.Context, name string) error {
+	mu := ps.getEntityLock(name)
+	mu.Lock()
+	defer mu.Unlock()
+
+	existing, err := ps.GetEntityRecord(ctx, name)
+	if err != nil {
+		return fmt.Errorf("increment entity mention count: %w", err)
+	}
+	if existing == nil {
+		return nil
+	}
+
+	existing.MentionCount++
+	existing.UpdatedAt = time.Now().UnixNano()
+	val, err := msgpack.Marshal(existing)
+	if err != nil {
+		return fmt.Errorf("increment entity mention count: marshal: %w", err)
+	}
+	return ps.db.Set(keys.EntityKey(keys.EntityNameHash(name)), val, pebble.NoSync)
+}
+
 // DecrementEntityMentionCount decrements the MentionCount on the global entity
 // record for the given name, floored at 0. No-ops if the record does not exist.
 // When the count reaches 0, the 0x23 reverse index is scanned to confirm no live
@@ -1047,12 +1078,12 @@ func (ps *PebbleStore) deleteEntityLinks(ws [8]byte, engramID [16]byte, batch *p
 // FindSimilarEntities). fn is called exactly once per identity, with the first-seen
 // casing as the representative name.
 func (ps *PebbleStore) ScanVaultEntityNames(ctx context.Context, ws [8]byte, fn func(name string) error) error {
-	prefix := make([]byte, 1+8)
-	prefix[0] = 0x20
-	copy(prefix[1:9], ws[:])
+	prefixPre := make([]byte, 1+8)
+	prefixPre[0] = prefix.EntityEngramLink
+	copy(prefixPre[1:9], ws[:])
 
-	upperBound := make([]byte, len(prefix))
-	copy(upperBound, prefix)
+	upperBound := make([]byte, len(prefixPre))
+	copy(upperBound, prefixPre)
 	for i := len(upperBound) - 1; i >= 0; i-- {
 		upperBound[i]++
 		if upperBound[i] != 0 {
@@ -1060,7 +1091,7 @@ func (ps *PebbleStore) ScanVaultEntityNames(ctx context.Context, ws [8]byte, fn 
 		}
 	}
 
-	iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: prefix, UpperBound: upperBound})
+	iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: prefixPre, UpperBound: upperBound})
 	if err != nil {
 		return fmt.Errorf("scan vault entity names: iter: %w", err)
 	}
