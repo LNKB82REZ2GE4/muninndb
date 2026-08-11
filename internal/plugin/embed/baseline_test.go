@@ -16,6 +16,16 @@ func TestNoiseBaseline_RegisteredModel(t *testing.T) {
 	}
 }
 
+func TestNoiseBaseline_BgeM3(t *testing.T) {
+	b, ok := NoiseBaseline("bge-m3")
+	if !ok {
+		t.Fatal("expected bge-m3 to be registered")
+	}
+	if b != 0.363 {
+		t.Errorf("bge-m3 baseline = %v, want 0.363 (mu=0.303 + 1.3*sigma=0.046, measured — see registry comment)", b)
+	}
+}
+
 func TestNoiseBaseline_UnknownModel(t *testing.T) {
 	if _, ok := NoiseBaseline("some-future-model-v2"); ok {
 		t.Error("expected an unregistered model to report ok=false, not a guessed baseline")
