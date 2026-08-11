@@ -280,7 +280,7 @@ func TestHandleRecall_MultiVault_ScopeViolationFailsWholeCallNoLeak(t *testing.T
 		Mode:   auth.ModeFull,
 	})
 	eng := &recordingEngine{}
-	srv := New(":0", eng, "mdb_static", store, nil)
+	srv := New(":0", eng, "mdb_static", store, nil, nil)
 	body := mkToolCallBody("muninn_recall", map[string]any{
 		"vaults":  []any{"agent-memory", "someone-elses-vault"},
 		"context": "test",
@@ -308,7 +308,7 @@ func TestHandleRecall_MultiVault_AllInScopeSucceeds(t *testing.T) {
 		Mode:   auth.ModeFull,
 	})
 	eng := &recordingEngine{}
-	srv := New(":0", eng, "mdb_static", store, nil)
+	srv := New(":0", eng, "mdb_static", store, nil, nil)
 	body := mkToolCallBody("muninn_recall", map[string]any{
 		"vaults":  []any{"agent-memory", "proj-muninndb-3f2a1b9c"},
 		"context": "test",

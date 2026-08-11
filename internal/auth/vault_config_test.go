@@ -142,10 +142,10 @@ func TestRenameVaultConfig_CorruptJSON(t *testing.T) {
 	db := openTestDB(t)
 
 	// Write corrupt (non-JSON) bytes directly to the vault config key.
-	// Key format: 0x14 prefix + vault name bytes (matches vaultConfigKey).
+	// Key format: 0x45 prefix + vault name bytes (matches vaultConfigKey).
 	vaultName := "corrupt-vault"
 	key := make([]byte, 1+len(vaultName))
-	key[0] = 0x14 // prefixVaultCfg
+	key[0] = 0x45 // prefixVaultCfg
 	copy(key[1:], vaultName)
 
 	if err := db.Set(key, []byte("NOT-JSON!!!!}}}}"), pebble.Sync); err != nil {

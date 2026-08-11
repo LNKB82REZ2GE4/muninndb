@@ -33,7 +33,7 @@ func TestMergeRRF_WeightOrdering(t *testing.T) {
 	want := []string{"a1", "a2", "b1", "b2"}
 	for i, id := range want {
 		if merged[i].ID != id {
-			t.Errorf("merged[%d].ID = %q, want %q (full order: %v)", i, merged[i].ID, id, idsOf(merged))
+			t.Errorf("merged[%d].ID = %q, want %q (full order: %v)", i, merged[i].ID, id, idsOfItems(merged))
 		}
 	}
 }
@@ -61,7 +61,7 @@ func TestMergeRRF_FloorGuaranteesSlotForQuietVault(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("quiet vault's only result (q1) was crowded out entirely: %v", idsOf(merged))
+		t.Errorf("quiet vault's only result (q1) was crowded out entirely: %v", idsOfItems(merged))
 	}
 }
 
@@ -76,7 +76,7 @@ func TestMergeRRF_LimitCut(t *testing.T) {
 		t.Fatalf("len(merged) = %d, want 2 (limit)", len(merged))
 	}
 	if merged[0].ID != "a1" || merged[1].ID != "a2" {
-		t.Errorf("merged = %v, want [a1 a2]", idsOf(merged))
+		t.Errorf("merged = %v, want [a1 a2]", idsOfItems(merged))
 	}
 }
 
@@ -92,11 +92,11 @@ func TestMergeRRF_EqualWeightsDefault(t *testing.T) {
 	// Both rank-1 with equal weight: scores tie, stable sort preserves
 	// input order (vault "a" processed first).
 	if merged[0].ID != "a1" || merged[1].ID != "b1" {
-		t.Errorf("merged = %v, want [a1 b1] under tie-break stability", idsOf(merged))
+		t.Errorf("merged = %v, want [a1 b1] under tie-break stability", idsOfItems(merged))
 	}
 }
 
-func idsOf(items []mbp.ActivationItem) []string {
+func idsOfItems(items []mbp.ActivationItem) []string {
 	ids := make([]string, len(items))
 	for i, it := range items {
 		ids[i] = it.ID

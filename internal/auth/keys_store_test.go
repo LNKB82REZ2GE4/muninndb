@@ -203,7 +203,7 @@ func TestGenerateScopedAPIKey_MixedScope_CreateListRevoke(t *testing.T) {
 		t.Error("expected validated key's scope to match proj-* glob")
 	}
 
-	// List by literal vault: found via the literal index (0x13).
+	// List by literal vault: found via the literal index (0x44).
 	literalKeys, err := s.ListAPIKeys("agent-memory")
 	if err != nil {
 		t.Fatalf("ListAPIKeys(agent-memory): %v", err)
@@ -212,7 +212,7 @@ func TestGenerateScopedAPIKey_MixedScope_CreateListRevoke(t *testing.T) {
 		t.Errorf("expected key %s to appear when listing agent-memory", key.ID)
 	}
 
-	// List by glob-matched vault: found via the glob index (0x29), never via
+	// List by glob-matched vault: found via the glob index (0x46), never via
 	// the literal index (since "proj-anything" was never written literally).
 	globKeys, err := s.ListAPIKeys("proj-anything")
 	if err != nil {
@@ -232,7 +232,7 @@ func TestGenerateScopedAPIKey_MixedScope_CreateListRevoke(t *testing.T) {
 	}
 
 	// Revoke via one of the literal scope entries deletes every index entry
-	// (literal 0x13 row and the glob 0x29 row).
+	// (literal 0x44 row and the glob 0x46 row).
 	if err := s.RevokeAPIKey("agent-memory", key.ID); err != nil {
 		t.Fatalf("RevokeAPIKey: %v", err)
 	}
