@@ -479,6 +479,15 @@ func (ts *TriggerSystem) Subscribe(sub *Subscription) error {
 			embedCtx, embedCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer embedCancel()
 			if vec, err := ts.embedder.Embed(embedCtx, sub.Context); err == nil {
+				// Embed returns the flat concatenation of per-phrase vectors.
+				// Pool a multi-phrase context into a single dim-sized vector so
+				// cosine against per-engram vectors is meaningful — same fix as
+				// the activation path and the sweep's subEmbedding (#498); an
+				// unpooled n*dim vector makes every HNSW search for this
+				// subscription fail with a dimension mismatch.
+				if n := len(sub.Context); n > 1 && len(vec)%n == 0 {
+					vec = meanPoolVec(vec, n)
+				}
 				sub.embedding = vec
 				ts.embedCache.Set(sub.Context, vec)
 			}

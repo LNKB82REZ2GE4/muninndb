@@ -234,3 +234,46 @@ func TestTriggerWorker_HandleEmbed_NoDoublePush(t *testing.T) {
 		t.Fatalf("expected no double-push when already pushed at write time, got %d", pushCount.Load())
 	}
 }
+
+// TestSubscribe_PoolsMultiPhraseContext verifies Subscribe pools a multi-phrase
+// context embedding down to one dim-sized vector before storing/caching it —
+// the same #498 class of bug as handleEmbed above, but on the registration
+// path: an unpooled n*dim subscription vector makes every sweep HNSW search
+// fail with "embedding dimension n*dim does not match vault dimension dim".
+func TestSubscribe_PoolsMultiPhraseContext(t *testing.T) {
+	const dim = 8
+	ts := New(nil, nil, nil, &phraseEmbedder{dim: dim})
+
+	sub := &Subscription{
+		ID:      "subscribe-pool-multi",
+		VaultID: 1,
+		Context: []string{"phrase one", "phrase two", "phrase three"},
+	}
+	if err := ts.Subscribe(sub); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if got := len(sub.embedding); got != dim {
+		t.Fatalf("expected pooled %d-dim subscription embedding, got %d", dim, got)
+	}
+
+	// The cache must hold the pooled vector too, or the next subscriber with
+	// the same context gets the unpooled one back.
+	if cached, ok := ts.embedCache.Get(sub.Context); !ok {
+		t.Fatal("expected embedding cached for context")
+	} else if got := len(cached); got != dim {
+		t.Fatalf("expected pooled %d-dim cached embedding, got %d", dim, got)
+	}
+
+	// Single-phrase context stays untouched (no spurious pooling).
+	single := &Subscription{
+		ID:      "subscribe-pool-single",
+		VaultID: 1,
+		Context: []string{"only phrase"},
+	}
+	if err := ts.Subscribe(single); err != nil {
+		t.Fatalf("Subscribe single: %v", err)
+	}
+	if got := len(single.embedding); got != dim {
+		t.Fatalf("expected %d-dim single-phrase embedding, got %d", dim, got)
+	}
+}

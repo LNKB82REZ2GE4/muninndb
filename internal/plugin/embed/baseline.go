@@ -53,6 +53,21 @@ package embed
 //     the recourse for a vault that needs a different point on that curve.
 var noiseBaselineRegistry = map[string]float64{
 	"bge-small-en-v1.5": 0.520,
+
+	// bge-m3 (BAAI/bge-m3, fp16, served via an OpenAI-compatible endpoint):
+	// measured 2026-08-11 with the §2b protocol on a live production corpus —
+	// 18 out-of-domain nonsense queries × 24 real memory passages = 432 pairs:
+	// μ=0.303, σ=0.046, p95=0.384, max=0.424 → b = μ+1.3σ = 0.363.
+	// True query→passage pairs on the same corpus: μ=0.521 (min 0.428), a
+	// 4.7σ separation from noise. Sem-only survival bar at b=0.363 sits at
+	// cos ≈ 0.427: every measured noise pair abstains (max 0.424) and the
+	// weakest measured genuine pair (0.428) survives — the same thin-margin
+	// trade the bge-small-en-v1.5 calibration accepts, with the per-vault
+	// SemanticFloor plasticity override as the recourse. Note bge-m3 is far
+	// less anisotropic than bge-small (noise μ 0.30 vs 0.45): borrowing the
+	// bge-small baseline would false-abstain most genuine bge-m3 matches.
+	// Re-derive, don't hand-edit (see the design doc §2b for the protocol).
+	"bge-m3": 0.363,
 }
 
 // NoiseBaseline looks up the measured anisotropy noise baseline b for the
