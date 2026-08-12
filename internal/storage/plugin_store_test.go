@@ -148,6 +148,64 @@ func TestCountEngramsWithFlag_ExcludesOrphanedFlags(t *testing.T) {
 	}
 }
 
+// TestCountLiveEngrams_ExcludesSoftDeleted pins the fix for the mirror-image
+// bug of the orphaned-flags one above: engine.engramCount (backing Stat's
+// EngramCount) only decrements on a HARD delete, never on soft delete or
+// archive, while CountEngramsWithFlag excludes both. Comparing EmbeddedCount
+// against Stat's EngramCount would therefore let EmbeddedCount sit
+// permanently below the total for a vault holding embedded-then-soft-deleted
+// engrams. CountLiveEngrams must apply the identical live-state filter
+// CountEngramsWithFlag does, so the two are comparable.
+func TestCountLiveEngrams_ExcludesSoftDeleted(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ws := store.VaultPrefix("count-live-engrams-vault")
+
+	var ids []ULID
+	for i := 0; i < 3; i++ {
+		id, err := store.WriteEngram(ctx, ws, &Engram{
+			Concept: "concept",
+			Content: "content",
+		})
+		if err != nil {
+			t.Fatalf("WriteEngram[%d]: %v", i, err)
+		}
+		ids = append(ids, id)
+	}
+
+	const flag = uint8(0x02) // DigestEmbed
+	for _, id := range ids {
+		if err := store.SetDigestFlag(ctx, id, flag); err != nil {
+			t.Fatalf("SetDigestFlag: %v", err)
+		}
+	}
+
+	// Soft-delete one embedded engram. Its digest flags are untouched (the
+	// engram record just gets a new State), so it still has DigestEmbed set.
+	if err := store.SoftDelete(ctx, ws, ids[0]); err != nil {
+		t.Fatalf("SoftDelete: %v", err)
+	}
+
+	embedded, err := store.CountEngramsWithFlag(ctx, flag)
+	if err != nil {
+		t.Fatalf("CountEngramsWithFlag: %v", err)
+	}
+	if embedded != 2 {
+		t.Fatalf("CountEngramsWithFlag: got %d, want 2 (excludes the soft-deleted engram) — test assumption broken", embedded)
+	}
+
+	total, err := store.CountLiveEngrams(ctx)
+	if err != nil {
+		t.Fatalf("CountLiveEngrams: %v", err)
+	}
+	if total != 2 {
+		t.Errorf("CountLiveEngrams: got %d, want 2 (must exclude the soft-deleted engram, same filter as CountEngramsWithFlag)", total)
+	}
+	if embedded != total {
+		t.Errorf("CountEngramsWithFlag (%d) and CountLiveEngrams (%d) must agree when every live engram is embedded", embedded, total)
+	}
+}
+
 // TestFindVaultPrefix writes an engram in a known vault, then calls
 // FindVaultPrefix with the engram's ULID and verifies the correct ws is returned.
 func TestFindVaultPrefix(t *testing.T) {

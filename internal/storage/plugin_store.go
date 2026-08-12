@@ -142,6 +142,51 @@ func (ps *PebbleStore) CountEngramsWithFlag(ctx context.Context, flag uint8) (in
 	return count, iter.Error()
 }
 
+// CountLiveEngrams returns the number of LIVE engrams (excluding soft-deleted
+// and archived) across all vaults — the same live-state filter
+// CountEngramsWithFlag applies, with no flag check. It exists so a caller
+// comparing "how many are embedded" against "how many total" can compute both
+// sides over the identical filter.
+//
+// Do not use engine's engramCount (backing Stat's EngramCount) for that
+// comparison instead: it only decrements on a HARD delete, never on soft
+// delete or archive, so it still counts engrams CountEngramsWithFlag
+// deliberately excludes. A vault with embedded-then-soft-deleted engrams
+// would read EmbeddedCount permanently below that counter with nothing left
+// to do, making the embed-status API's "indexing" bool report true forever.
+func (ps *PebbleStore) CountLiveEngrams(ctx context.Context) (int64, error) {
+	lowerBound := []byte{prefix.Engram}
+	upperBound := []byte{prefix.Meta}
+
+	iter, err := ps.db.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+
+	var count int64
+	for valid := iter.First(); valid; valid = iter.Next() {
+		k := iter.Key()
+		if len(k) < 25 {
+			continue
+		}
+
+		val := make([]byte, len(iter.Value()))
+		copy(val, iter.Value())
+		if erfEng, decErr := erf.Decode(val); decErr == nil {
+			eng := fromERFEngram(erfEng)
+			if eng.State == StateSoftDeleted || eng.State == StateArchived {
+				continue
+			}
+		}
+		count++
+	}
+	return count, iter.Error()
+}
+
 // ScanWithoutFlag returns a forward-only iterator over all engrams that are
 // missing the given digest flag bit. Engrams that have any skipFlags bit set
 // are skipped during iteration.

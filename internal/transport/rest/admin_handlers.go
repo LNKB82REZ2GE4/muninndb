@@ -680,12 +680,14 @@ type EmbedStatusResponse struct {
 
 // handleEmbedStatus returns the current embedder configuration and indexing state.
 func (s *Server) handleEmbedStatus(w http.ResponseWriter, r *http.Request) {
-	statResp, err := s.engine.Stat(r.Context(), &StatRequest{})
-	totalCount := int64(-1)
-	if err == nil {
-		totalCount = int64(statResp.EngramCount)
-	}
-
+	// TotalCount must come from CountEmbeddableTotal, NOT Stat's EngramCount:
+	// the latter only decrements on a hard delete, never on soft delete or
+	// archive, while EmbeddedCount (CountEmbedded) excludes both. Comparing
+	// the two would let EmbeddedCount sit permanently below EngramCount for a
+	// vault holding embedded-then-soft-deleted engrams, reporting `indexing`
+	// true forever with nothing left to embed. Both counts here are computed
+	// over the identical live-state filter so the comparison is meaningful.
+	totalCount := s.engine.CountEmbeddableTotal(r.Context())
 	embeddedCount := s.engine.CountEmbedded(r.Context())
 	indexing := embeddedCount >= 0 && totalCount >= 0 && embeddedCount < totalCount
 

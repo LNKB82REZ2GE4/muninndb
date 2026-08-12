@@ -263,6 +263,10 @@ func (w *RESTEngineWrapper) CountEmbedded(ctx context.Context) int64 {
 	return w.engine.CountEmbedded(ctx)
 }
 
+func (w *RESTEngineWrapper) CountEmbeddableTotal(ctx context.Context) int64 {
+	return w.engine.CountEmbeddableTotal(ctx)
+}
+
 func (w *RESTEngineWrapper) RecordAccess(ctx context.Context, vault, id string) error {
 	return w.engine.RecordAccess(ctx, vault, id)
 }

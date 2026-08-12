@@ -116,6 +116,11 @@ type EngineAPI interface {
 	StartReembedVault(ctx context.Context, vaultName, modelName string) (*vaultjob.Job, error)
 	// CountEmbedded returns the number of engrams with the DigestEmbed flag set.
 	CountEmbedded(ctx context.Context) int64
+	// CountEmbeddableTotal returns the number of live engrams (excluding
+	// soft-deleted/archived) eligible for embedding — the denominator to
+	// compare CountEmbedded against. Must use the same live-state filter as
+	// CountEmbedded or the comparison is meaningless (see CountEmbedded's doc).
+	CountEmbeddableTotal(ctx context.Context) int64
 	// Observability returns the full system observability snapshot.
 	Observability(ctx context.Context, version string, uptimeSeconds int64) (*engine.ObservabilitySnapshot, error)
 	// GetProcessorStats returns stats for all retroactive processors.

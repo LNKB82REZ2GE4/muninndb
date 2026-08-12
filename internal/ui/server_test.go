@@ -184,6 +184,10 @@ func (m *mockEngine) CountEmbedded(ctx context.Context) int64 {
 	return 0
 }
 
+func (m *mockEngine) CountEmbeddableTotal(ctx context.Context) int64 {
+	return 0
+}
+
 func (m *mockEngine) Observability(ctx context.Context, version string, uptimeSeconds int64) (*engine.ObservabilitySnapshot, error) {
 	return &engine.ObservabilitySnapshot{}, nil
 }

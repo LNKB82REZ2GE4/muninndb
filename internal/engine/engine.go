@@ -1088,6 +1088,25 @@ func (e *Engine) CountEmbedded(ctx context.Context) int64 {
 	return count
 }
 
+// CountEmbeddableTotal returns the count of LIVE engrams (excluding
+// soft-deleted and archived) across all vaults — the same live-state filter
+// CountEmbedded applies via CountEngramsWithFlag. Returns -1 on error.
+//
+// The embed-status API must compare EmbeddedCount against THIS, not Stat's
+// EngramCount: that counter (e.engramCount) only decrements on a hard
+// delete, never on soft delete or archive, so it still counts engrams
+// CountEmbedded deliberately excludes. Comparing the two would let
+// EmbeddedCount sit permanently below EngramCount for a vault holding
+// embedded-then-soft-deleted engrams, with the `indexing` bool reporting
+// true forever even though there is nothing left to embed.
+func (e *Engine) CountEmbeddableTotal(ctx context.Context) int64 {
+	count, err := e.store.CountLiveEngrams(ctx)
+	if err != nil {
+		return -1
+	}
+	return count
+}
+
 // ActivityTracker returns the vault-level activity tracker.
 func (e *Engine) ActivityTracker() *cognitive.ActivityTracker {
 	return e.activity

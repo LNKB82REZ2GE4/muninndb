@@ -37,7 +37,7 @@ var appendInfra = map[string]bool{
 // appendReadOnly: read/query methods, safe for append.
 var appendReadOnly = map[string]bool{
 	"Activate": true, "ActivateMulti": true, "ActivateWithStructuredFilter": true, "ActivityCounts": true,
-	"CheckIdempotency": true, "CountChildren": true, "CountEmbedded": true, "EmbedStats": true,
+	"CheckIdempotency": true, "CountChildren": true, "CountEmbedded": true, "CountEmbeddableTotal": true, "EmbedStats": true,
 	"Explain": true, "ExportGraph": true, "ExportVault": true, "FindByEntity": true,
 	"FindSimilarEntities": true, "GetAnnotations": true, "GetAssociations": true,
 	"GetAssociationsBatch": true, "GetContradictions": true, "GetContradictionReport": true,
