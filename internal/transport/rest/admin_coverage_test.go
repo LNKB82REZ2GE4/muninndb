@@ -819,7 +819,7 @@ func TestPersistClusterDisabled_WithDataDir(t *testing.T) {
 
 func TestCountingWriter(t *testing.T) {
 	w := httptest.NewRecorder()
-	cw := &countingWriter{ResponseWriter: w}
+	cw := newCountingWriter(w)
 
 	n, err := cw.Write([]byte("hello"))
 	if err != nil {

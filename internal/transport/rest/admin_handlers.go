@@ -23,16 +23,67 @@ import (
 
 // These handlers are mounted at /api/admin/ and require admin session auth.
 
+// exportWriteDeadlineWindow is how far forward each Write on a
+// deadlineExtendingWriter pushes the connection's write deadline. Large
+// enough that a big, slow-but-progressing vault export is never killed by it;
+// short enough that a genuinely stalled connection (client stopped reading,
+// handler hung) is still reclaimed instead of hanging forever.
+const exportWriteDeadlineWindow = 60 * time.Second
+
+// deadlineExtendingWriter wraps an http.ResponseWriter so every Write pushes
+// the connection's write deadline forward, keeping a large streamed response
+// (vault export, markdown export) from being truncated by the REST server's
+// blanket 15s WriteTimeout (server.go) once it runs past that ceiling — the
+// timeout only fires against a genuine stall (no bytes written for a whole
+// window), never against a stream that's still making progress. Without
+// this, a large-but-healthy export was silently cut off mid-stream: the
+// client sees a truncated, unrecoverable gzip file with no error indicating
+// why.
+//
+// Mirrors the technique handleSubscribe already uses for long-lived SSE
+// streams (see statusRecorder.Unwrap's doc comment).
+type deadlineExtendingWriter struct {
+	http.ResponseWriter
+	rc *http.ResponseController // nil if the writer doesn't support write deadlines
+}
+
+func newDeadlineExtendingWriter(w http.ResponseWriter) *deadlineExtendingWriter {
+	dw := &deadlineExtendingWriter{ResponseWriter: w}
+	rc := http.NewResponseController(w)
+	if err := rc.SetWriteDeadline(time.Now().Add(exportWriteDeadlineWindow)); err == nil {
+		dw.rc = rc
+	} else {
+		// Loud, not silent: without deadline support the old fixed-WriteTimeout
+		// truncation risk is still present for this response.
+		slog.Warn("rest: response writer does not support write deadlines — large exports may be truncated by the server's fixed WriteTimeout", "error", err)
+	}
+	return dw
+}
+
+func (dw *deadlineExtendingWriter) Write(p []byte) (int, error) {
+	n, err := dw.ResponseWriter.Write(p)
+	if dw.rc != nil {
+		_ = dw.rc.SetWriteDeadline(time.Now().Add(exportWriteDeadlineWindow))
+	}
+	return n, err
+}
+
 // countingWriter wraps http.ResponseWriter and tracks how many bytes have been written.
 // It is used by the export handler to detect whether streaming has begun before
-// deciding how to handle an error from ExportVault.
+// deciding how to handle an error from ExportVault. It also extends the write
+// deadline on every write (see deadlineExtendingWriter) so a large export is
+// not truncated by the server's fixed WriteTimeout.
 type countingWriter struct {
-	http.ResponseWriter
+	*deadlineExtendingWriter
 	n int64
 }
 
+func newCountingWriter(w http.ResponseWriter) *countingWriter {
+	return &countingWriter{deadlineExtendingWriter: newDeadlineExtendingWriter(w)}
+}
+
 func (cw *countingWriter) Write(p []byte) (int, error) {
-	n, err := cw.ResponseWriter.Write(p)
+	n, err := cw.deadlineExtendingWriter.Write(p)
 	cw.n += int64(n)
 	return n, err
 }
@@ -1103,7 +1154,7 @@ func (s *Server) handleExportVault(w http.ResponseWriter, r *http.Request) {
 	// Wrap the response writer to track how many bytes have been streamed.
 	// This lets us distinguish between a pre-stream error (safe to send HTTP 500)
 	// and a mid-stream error (headers already committed; must abort the connection).
-	cw := &countingWriter{ResponseWriter: w}
+	cw := newCountingWriter(w)
 
 	_, err := s.engine.ExportVault(r.Context(), name, s.embedModel, 0, resetMeta, cw)
 	if err != nil {
@@ -1282,7 +1333,7 @@ func (s *Server) handleExportVaultMarkdown(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+filename+"\"")
 
-	if err := writeVaultMarkdownExport(r.Context(), s.engine, name, w); err != nil {
+	if err := writeVaultMarkdownExport(r.Context(), s.engine, name, newDeadlineExtendingWriter(w)); err != nil {
 		slog.Error("rest: markdown export failed", "vault", name, "err", err)
 		// Headers already committed; nothing to do but log.
 	}
