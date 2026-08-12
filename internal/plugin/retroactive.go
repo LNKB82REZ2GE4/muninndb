@@ -690,15 +690,36 @@ func (rp *RetroactiveProcessor) embedBisect(
 }
 
 // isContentSpecificEmbedError reports whether err is unambiguously about the
-// request's own content (e.g. context length exceeded, payload too large) as
-// opposed to the provider's health. Only providers that construct a
-// *ProviderError (currently the OpenAI-compatible provider; see
-// internal/plugin/embed/provider_error.go) can be classified this way — a
+// request's own content (context length exceeded, payload too large,
+// unprocessable content) as opposed to the provider's health. Only providers
+// that construct a *ProviderError (currently the OpenAI-compatible provider;
+// see internal/plugin/embed/provider_error.go) can be classified this way — a
 // plain error from another provider is treated as ambiguous, never as
 // content-specific, which is the safe default: it means those providers never
 // auto-blacklist an engram, at the cost of retrying more before giving up.
+//
+// Deliberately NOT the same status set as the shared
+// IsPermanentContentProviderError (internal/plugin/provider_error.go), which
+// includes 404 for the enrich path ("unknown model/deployment"). For embed,
+// 404 is exactly the failure a self-hosted OpenAI-compatible endpoint returns
+// on a wrong/misconfigured model name — a systemic, vault-wide
+// misconfiguration, not something specific to whichever engram happened to
+// be first in the batch. Classifying it as content-specific would bisect
+// every batch down to the floor and permanently stamp DigestEmbedFailed on
+// every engram in the vault: strictly worse than the wholesale-blacklisting
+// bug this bisection was built to fix. See isEmbedderDownError, which routes
+// 404 there instead.
 func isContentSpecificEmbedError(err error) bool {
-	return IsPermanentContentProviderError(err)
+	var provErr *ProviderError
+	if !errors.As(err, &provErr) || provErr.Retryable {
+		return false
+	}
+	switch provErr.StatusCode {
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+		return true
+	default:
+		return false
+	}
 }
 
 // isEmbedderDownError reports whether err indicates the embed provider itself
@@ -710,8 +731,10 @@ func isContentSpecificEmbedError(err error) bool {
 //   - any net.Error (dial/timeout/DNS/connection-refused; http.Client wraps
 //     transport failures in *url.Error, which implements net.Error, so this
 //     also catches providers that don't construct a *ProviderError)
-//   - a *ProviderError marked Retryable (429/5xx) or carrying a 401/403 (an
-//     auth/config problem, not this engram's fault)
+//   - a *ProviderError marked Retryable (429/5xx), carrying 401/403 (an
+//     auth/config problem), or 404 (unknown model/deployment — the failure
+//     mode of a self-hosted endpoint pointed at the wrong model name; see
+//     isContentSpecificEmbedError for why this must not be content-specific)
 func isEmbedderDownError(err error) bool {
 	if err == nil {
 		return false
@@ -728,7 +751,8 @@ func isEmbedderDownError(err error) bool {
 		if provErr.Retryable {
 			return true
 		}
-		if provErr.StatusCode == http.StatusUnauthorized || provErr.StatusCode == http.StatusForbidden {
+		switch provErr.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
 			return true
 		}
 	}

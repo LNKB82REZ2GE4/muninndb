@@ -1189,6 +1189,49 @@ func TestRetroactiveProcessor_EmbedderDownLeavesBatchPending(t *testing.T) {
 	}
 }
 
+// TestRetroactiveProcessor_Embed404IsEmbedderDownNotContentSpecific pins the
+// fix for a review-caught regression: a 404 from a self-hosted OpenAI-
+// compatible endpoint means "unknown model/deployment" — a systemic,
+// vault-wide misconfiguration — not "this specific engram's content is bad".
+// Classifying it as content-specific would bisect the whole batch down to the
+// floor and permanently stamp DigestEmbedFailed on every engram in the vault,
+// which is strictly worse than the wholesale-blacklisting bug embedBisect
+// exists to fix. A 404 must behave exactly like the embedder-down case: left
+// completely unstamped, no bisection.
+func TestRetroactiveProcessor_Embed404IsEmbedderDownNotContentSpecific(t *testing.T) {
+	engrams := []*Engram{
+		{ID: ULID{1}, Concept: "a", Content: "a"},
+		{ID: ULID{2}, Concept: "b", Content: "b"},
+		{ID: ULID{3}, Concept: "c", Content: "c"},
+	}
+	store := newFlagAwareStore(engrams...)
+
+	embedPlugin := &embedMockForRetro{
+		mockPlugin: mockPlugin{name: "bisect-404", tier: TierEmbed},
+		embedFunc: func(texts []string) ([]float32, error) {
+			return nil, &ProviderError{Provider: "openai", StatusCode: http.StatusNotFound, Retryable: false}
+		},
+	}
+
+	rp := NewRetroactiveProcessor(store, embedPlugin, DigestEmbed)
+	if ok := rp.processBatch(context.Background()); !ok {
+		t.Fatal("processBatch returned false")
+	}
+
+	for _, id := range []ULID{{1}, {2}, {3}} {
+		flags := mustGetFlags(t, store, id)
+		if flags != 0 {
+			t.Errorf("engram %v must be left completely unstamped on a 404 (misconfigured model, not bad content), flags=%08b", id, flags)
+		}
+	}
+	if store.setFlagCalls != 0 {
+		t.Errorf("no SetDigestFlag call should happen on a 404, got %d", store.setFlagCalls)
+	}
+	if got := len(embedPlugin.calls); got != 1 {
+		t.Errorf("a 404 must not trigger bisection (expected exactly 1 Embed call), got %d calls: %v", got, embedPlugin.calls)
+	}
+}
+
 // TestRetroactiveProcessor_EmbedAmbiguousErrorLeavesEngramPending verifies
 // that an error we cannot positively classify as either "provider down" or
 // "this engram's content is bad" leaves the engram pending rather than
