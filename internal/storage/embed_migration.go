@@ -137,6 +137,24 @@ func (ps *PebbleStore) ClearEmbedFlagsForVault(ctx context.Context, ws [8]byte) 
 // wsPrefix is only used to compute each engram's embedding key (0x18, which
 // is vault-scoped); the digest flags themselves are global by ULID. Returns
 // the number of engrams whose flags were actually changed.
+//
+// Race (tolerable, not closed here): this does an unlocked read-modify-write
+// of the digest-flags byte per engram, the same shape SetDigestFlag itself
+// has always had — no call site in this codebase takes casLocks for a
+// digest-flags write. If RetroactiveProcessor.flushMicroBatch's SetDigestFlag
+// for one of these IDs interleaves between this function's read and its
+// batch commit, whichever writer commits last wins and can clobber the
+// other's bit — e.g. an operator's clear reading a stale DigestEmbedFailed
+// and overwriting a DigestEmbed the processor just set concurrently. This
+// cannot corrupt or lose data: the affected engram is at worst re-scanned
+// and re-embedded on the next pass (ScanWithoutFlag re-derives from the
+// current on-disk flags every time), so the failure mode is one wasted embed
+// call, not a stuck or silently-wrong state. Closing it properly would mean
+// bringing SetDigestFlag itself under ps.casLocks (the striped mutex
+// CompareAndSet/SoftDelete/Restore already use for per-engram
+// read-modify-write) — out of scope here since that function is on the hot
+// path for every embed/enrich completion in the codebase, not something to
+// change as a side effect of this admin-recovery addition.
 func (ps *PebbleStore) ClearEmbedFlagsForEngrams(ctx context.Context, wsPrefix [8]byte, ids []ULID) (int64, error) {
 	const DigestEmbed uint8 = 0x02
 	const DigestEmbedFailed uint8 = 0x80
