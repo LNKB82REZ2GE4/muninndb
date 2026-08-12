@@ -112,6 +112,15 @@ Provider comparison:
 
 `MUNINN_OPENAI_URL` can optionally override the OpenAI base URL for compatible endpoints (for example LocalAI or an internal gateway). If set to an invalid value, MuninnDB skips OpenAI initialization instead of falling back to `api.openai.com`. This override also applies to the Enrich plugin when `MUNINN_ENRICH_URL` is set to an `openai://` provider — see [Tier 3](#4-tier-3-enrich-plugin) below.
 
+`MUNINN_OPENAI_EMBED_TIMEOUT` and `MUNINN_OPENAI_EMBED_MAX_BATCH` override the OpenAI-compatible provider's cloud-tuned HTTP timeout (default `10s`) and max batch size (default `2048`) — needed for a self-hosted endpoint that can't answer a large batch within the cloud default, e.g. a local GPU embedder. An explicit-but-invalid value (unparseable, zero, or negative) disables the OpenAI embedder rather than silently falling back to the default.
+
+```bash
+# Self-hosted OpenAI-compatible endpoint that needs longer than the 10s cloud default
+export MUNINN_OPENAI_URL="http://localhost:11436/v1"
+export MUNINN_OPENAI_EMBED_TIMEOUT="120s"
+export MUNINN_OPENAI_EMBED_MAX_BATCH="1000"
+```
+
 ### Language Coverage
 
 The bundled local model is `bge-small-en-v1.5` — the `en` is a language tag.
