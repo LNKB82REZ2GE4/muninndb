@@ -41,6 +41,14 @@ type mockPluginStore struct {
 	linkCalls         int
 	upsertRelCalls    int
 	coOccurCalls      int
+
+	// gotWS records the ws argument of each ws-scoped call, in call order —
+	// used to verify callers pass the engram's actual vault prefix (e.g. from
+	// EngramIterator.CurrentWS()) instead of a zero value.
+	checkDimWS    [][8]byte
+	updateEmbedWS [][8]byte
+	hnswInsertWS  [][8]byte
+	autoLinkWS    [][8]byte
 }
 
 func (m *mockPluginStore) CountWithoutFlag(_ context.Context, _, _ uint8) (int64, error) {
@@ -61,8 +69,9 @@ func (m *mockPluginStore) GetDigestFlags(_ context.Context, _ ULID) (uint8, erro
 	return m.getFlagsResult, m.getFlagsErr
 }
 
-func (m *mockPluginStore) UpdateEmbedding(_ context.Context, _ ULID, _ []float32) error {
+func (m *mockPluginStore) UpdateEmbedding(_ context.Context, ws [8]byte, _ ULID, _ []float32) error {
 	m.updateEmbedCalls++
+	m.updateEmbedWS = append(m.updateEmbedWS, ws)
 	return m.updateEmbedErr
 }
 
@@ -85,18 +94,21 @@ func (m *mockPluginStore) UpsertRelationship(_ context.Context, _ ULID, _ Extrac
 	return m.upsertRelErr
 }
 
-func (m *mockPluginStore) HNSWInsert(_ context.Context, _ ULID, _ []float32) error {
+func (m *mockPluginStore) HNSWInsert(_ context.Context, ws [8]byte, _ ULID, _ []float32) error {
 	m.hnswInsertCalls++
+	m.hnswInsertWS = append(m.hnswInsertWS, ws)
 	return m.hnswInsertErr
 }
 
-func (m *mockPluginStore) CheckEmbedDim(_ context.Context, _ ULID, _ int) error {
+func (m *mockPluginStore) CheckEmbedDim(_ context.Context, ws [8]byte, _ ULID, _ int) error {
 	m.checkDimCalls++
+	m.checkDimWS = append(m.checkDimWS, ws)
 	return m.checkDimErr
 }
 
-func (m *mockPluginStore) AutoLinkByEmbedding(_ context.Context, _ ULID, _ []float32) error {
+func (m *mockPluginStore) AutoLinkByEmbedding(_ context.Context, ws [8]byte, _ ULID, _ []float32) error {
 	m.autoLinkCalls++
+	m.autoLinkWS = append(m.autoLinkWS, ws)
 	return m.autoLinkErr
 }
 
@@ -111,8 +123,13 @@ func (m *mockPluginStore) IncrementEntityCoOccurrence(_ context.Context, _ ULID,
 
 type mockIterator struct {
 	engrams []*Engram
-	index   int
-	closed  bool
+	// wsList is optional per-engram vault workspace prefixes, parallel to
+	// engrams. If shorter than engrams (or nil), CurrentWS returns the zero
+	// value for indices past the end — fine for tests that don't care which
+	// vault an engram belongs to.
+	wsList [][8]byte
+	index  int
+	closed bool
 }
 
 func (m *mockIterator) Next() bool {
@@ -128,6 +145,13 @@ func (m *mockIterator) Engram() *Engram {
 		return nil
 	}
 	return m.engrams[m.index-1]
+}
+
+func (m *mockIterator) CurrentWS() [8]byte {
+	if m.index == 0 || m.index > len(m.wsList) {
+		return [8]byte{}
+	}
+	return m.wsList[m.index-1]
 }
 
 func (m *mockIterator) Close() error {

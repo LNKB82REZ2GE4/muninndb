@@ -300,12 +300,16 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 	}
 	microEngrams := make([]*Engram, 0, microBatchSize)
 	microTexts := make([]string, 0, microBatchSize)
+	microWS := make([][8]byte, 0, microBatchSize)
 
 	// storeEmbedded persists one successfully-embedded engram's vector. Split
 	// out of flushMicroBatch so it can be driven by embedBisect's per-engram
-	// success callback instead of only a single whole-batch success path.
-	storeEmbedded := func(eng *Engram, vec []float32) {
-		if storeErr := rp.store.UpdateEmbedding(ctx, eng.ID, vec); storeErr != nil {
+	// success callback instead of only a single whole-batch success path. ws
+	// is the engram's vault workspace prefix, known from the scan iterator
+	// that yielded it — passed through rather than re-derived (see
+	// PluginStore.UpdateEmbedding's doc for why).
+	storeEmbedded := func(eng *Engram, ws [8]byte, vec []float32) {
+		if storeErr := rp.store.UpdateEmbedding(ctx, ws, eng.ID, vec); storeErr != nil {
 			var dimErr *hnswpkg.DimMismatchError
 			if errors.As(storeErr, &dimErr) {
 				// Vault-level condition (#582), not an engram failure: leave
@@ -327,7 +331,7 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 			rp.statsMu.Unlock()
 			return
 		}
-		if storeErr := rp.store.HNSWInsert(ctx, eng.ID, vec); storeErr != nil {
+		if storeErr := rp.store.HNSWInsert(ctx, ws, eng.ID, vec); storeErr != nil {
 			var dimErr *hnswpkg.DimMismatchError
 			if errors.As(storeErr, &dimErr) {
 				// Refused by the registry's atomic guard (#582) — e.g. a
@@ -351,7 +355,7 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 			// the batch result and the callback hands it to an async consumer.
 			rp.onEmbed(eng, append([]float32(nil), vec...))
 		}
-		if storeErr := rp.store.AutoLinkByEmbedding(ctx, eng.ID, vec); storeErr != nil {
+		if storeErr := rp.store.AutoLinkByEmbedding(ctx, ws, eng.ID, vec); storeErr != nil {
 			slog.Warn("retroactive processor: AutoLinkByEmbedding failed",
 				"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "error", storeErr)
 		}
@@ -395,9 +399,10 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 		// every engram in it, forever, with no retry path short of a full vault
 		// re-embed). Engrams caught in an outage are left completely unstamped
 		// so the next pass retries them.
-		rp.embedBisect(ctx, embedPlugin, microEngrams, microTexts, storeEmbedded, markBadContent)
+		rp.embedBisect(ctx, embedPlugin, microEngrams, microTexts, microWS, storeEmbedded, markBadContent)
 		microEngrams = microEngrams[:0]
 		microTexts = microTexts[:0]
+		microWS = microWS[:0]
 
 		// Rate/ETA fires after every micro-batch (not gated on %100 — always update).
 		// Use pass-local count (flushedProcessed - passStart) so rate reflects this
@@ -452,6 +457,13 @@ engramLoop:
 		}
 
 		if isEmbedPlugin {
+			// ws is known for free from the scan iterator that just yielded
+			// this engram — used for every ws-scoped store call below instead
+			// of re-deriving it via a per-call linear scan of the whole
+			// cross-vault engram keyspace (that used to make a full-backlog
+			// pass cost O(candidates × total engrams on the instance)).
+			ws := iter.CurrentWS()
+
 			// Skip engrams of a vault whose established dimension does not
 			// match the active embedder BEFORE paying for inference (#582).
 			// Deliberately no failure flag: the mismatch is a vault-level
@@ -460,7 +472,7 @@ engramLoop:
 			// Skips do not count toward the per-pass cap — one cheap check
 			// per engram per pass, no inference, no hot re-notify loop.
 			if dim := embedPlugin.Dimension(); dim > 0 {
-				if dimErr := rp.store.CheckEmbedDim(ctx, eng.ID, dim); dimErr != nil {
+				if dimErr := rp.store.CheckEmbedDim(ctx, ws, eng.ID, dim); dimErr != nil {
 					dimSkipped++
 					continue
 				}
@@ -468,6 +480,7 @@ engramLoop:
 			// Accumulate into micro-batch; flush when full.
 			microEngrams = append(microEngrams, eng)
 			microTexts = append(microTexts, eng.Concept+" "+eng.Content)
+			microWS = append(microWS, ws)
 			batchCount++
 			if len(microEngrams) >= microBatchSize {
 				flushMicroBatch()
@@ -639,7 +652,8 @@ func (rp *RetroactiveProcessor) embedBisect(
 	embedPlugin EmbedPlugin,
 	engrams []*Engram,
 	texts []string,
-	onSuccess func(eng *Engram, vec []float32),
+	wsList [][8]byte,
+	onSuccess func(eng *Engram, ws [8]byte, vec []float32),
 	onBadContent func(eng *Engram, err error),
 ) {
 	if len(engrams) == 0 {
@@ -658,7 +672,7 @@ func (rp *RetroactiveProcessor) embedBisect(
 			return
 		}
 		for i, eng := range engrams {
-			onSuccess(eng, vecs[i*dim:(i+1)*dim])
+			onSuccess(eng, wsList[i], vecs[i*dim:(i+1)*dim])
 		}
 		return
 	}
@@ -685,8 +699,8 @@ func (rp *RetroactiveProcessor) embedBisect(
 	slog.Debug("retroactive processor: embed batch failed, bisecting to isolate cause",
 		"plugin", rp.plugin.Name(), "batch_size", len(engrams), "error", err)
 	mid := len(engrams) / 2
-	rp.embedBisect(ctx, embedPlugin, engrams[:mid], texts[:mid], onSuccess, onBadContent)
-	rp.embedBisect(ctx, embedPlugin, engrams[mid:], texts[mid:], onSuccess, onBadContent)
+	rp.embedBisect(ctx, embedPlugin, engrams[:mid], texts[:mid], wsList[:mid], onSuccess, onBadContent)
+	rp.embedBisect(ctx, embedPlugin, engrams[mid:], texts[mid:], wsList[mid:], onSuccess, onBadContent)
 }
 
 // isContentSpecificEmbedError reports whether err is unambiguously about the

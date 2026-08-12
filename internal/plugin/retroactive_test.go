@@ -466,6 +466,63 @@ func TestRetroactiveProcessor_ProcessBatchEmbed(t *testing.T) {
 	}
 }
 
+// TestRetroactiveProcessor_EmbedPathUsesIteratorWS pins the fix for a
+// production stall (COG-embed-vault-scan): CheckEmbedDim/UpdateEmbedding/
+// HNSWInsert/AutoLinkByEmbedding used to derive an engram's vault by calling
+// FindVaultPrefix internally — a full linear scan of the cross-vault engram
+// keyspace with no index. RetroactiveProcessor called that once per
+// candidate/processed engram, so a full-backlog pass cost O(candidates ×
+// total engrams across every vault on the instance) — on a shared instance
+// with ~185k engrams this made backlog passes so slow that only
+// Notify()-triggered mini-passes for freshly-written engrams ever completed
+// in practice, silently starving the actual backlog with no errors logged.
+//
+// The fix threads ws from EngramIterator.CurrentWS() through every ws-scoped
+// PluginStore call instead of re-deriving it. This test seeds two engrams in
+// two DIFFERENT vaults within the same micro-batch and asserts every call
+// receives the correct per-engram ws — proving both correctness (no vault
+// mix-up) and that ws is now supplied by the caller, not looked up.
+func TestRetroactiveProcessor_EmbedPathUsesIteratorWS(t *testing.T) {
+	wsA := [8]byte{1, 1, 1, 1, 1, 1, 1, 1}
+	wsB := [8]byte{2, 2, 2, 2, 2, 2, 2, 2}
+	engA := &Engram{ID: ULID{1}, Concept: "a", Content: "vault-a content"}
+	engB := &Engram{ID: ULID{2}, Concept: "b", Content: "vault-b content"}
+
+	iter := &mockIterator{
+		engrams: []*Engram{engA, engB},
+		wsList:  [][8]byte{wsA, wsB},
+	}
+	store := &mockPluginStore{countResult: 2, scanResult: iter}
+	embedPlugin := &mockEmbedPlugin{
+		mockPlugin: mockPlugin{name: "embed-ws", tier: TierEmbed},
+	}
+	rp := NewRetroactiveProcessor(store, embedPlugin, DigestEmbed)
+
+	if ok := rp.processBatch(context.Background()); !ok {
+		t.Fatal("processBatch should return true")
+	}
+
+	wantWS := [][8]byte{wsA, wsB}
+	for _, tc := range []struct {
+		name string
+		got  [][8]byte
+	}{
+		{"CheckEmbedDim", store.checkDimWS},
+		{"UpdateEmbedding", store.updateEmbedWS},
+		{"HNSWInsert", store.hnswInsertWS},
+		{"AutoLinkByEmbedding", store.autoLinkWS},
+	} {
+		if len(tc.got) != len(wantWS) {
+			t.Fatalf("%s: got %d ws args %v, want %d (%v)", tc.name, len(tc.got), tc.got, len(wantWS), wantWS)
+		}
+		for i, want := range wantWS {
+			if tc.got[i] != want {
+				t.Errorf("%s call %d: ws = %v, want %v (engram's actual vault)", tc.name, i, tc.got[i], want)
+			}
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // processBatch — embed path with UpdateEmbedding error
 // ---------------------------------------------------------------------------

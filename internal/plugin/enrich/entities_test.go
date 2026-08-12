@@ -61,15 +61,19 @@ func (m *mockPluginStore) CountWithoutFlag(context.Context, uint8, uint8) (int64
 func (m *mockPluginStore) ScanWithoutFlag(context.Context, uint8, uint8) plugin.EngramIterator {
 	return nil
 }
-func (m *mockPluginStore) SetDigestFlag(context.Context, plugin.ULID, uint8) error       { return nil }
-func (m *mockPluginStore) GetDigestFlags(context.Context, plugin.ULID) (uint8, error)    { return 0, nil }
-func (m *mockPluginStore) UpdateEmbedding(context.Context, plugin.ULID, []float32) error { return nil }
+func (m *mockPluginStore) SetDigestFlag(context.Context, plugin.ULID, uint8) error    { return nil }
+func (m *mockPluginStore) GetDigestFlags(context.Context, plugin.ULID) (uint8, error) { return 0, nil }
+func (m *mockPluginStore) UpdateEmbedding(context.Context, [8]byte, plugin.ULID, []float32) error {
+	return nil
+}
 func (m *mockPluginStore) UpdateDigest(context.Context, plugin.ULID, *plugin.EnrichmentResult) error {
 	return nil
 }
-func (m *mockPluginStore) HNSWInsert(context.Context, plugin.ULID, []float32) error { return nil }
-func (m *mockPluginStore) CheckEmbedDim(context.Context, plugin.ULID, int) error    { return nil }
-func (m *mockPluginStore) AutoLinkByEmbedding(context.Context, plugin.ULID, []float32) error {
+func (m *mockPluginStore) HNSWInsert(context.Context, [8]byte, plugin.ULID, []float32) error {
+	return nil
+}
+func (m *mockPluginStore) CheckEmbedDim(context.Context, [8]byte, plugin.ULID, int) error { return nil }
+func (m *mockPluginStore) AutoLinkByEmbedding(context.Context, [8]byte, plugin.ULID, []float32) error {
 	return nil
 }
 func (m *mockPluginStore) IncrementEntityCoOccurrence(context.Context, plugin.ULID, string, string) error {

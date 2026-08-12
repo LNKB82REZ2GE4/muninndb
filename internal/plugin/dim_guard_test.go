@@ -51,15 +51,15 @@ func TestStoreAdapter_UpdateEmbeddingDimGuard(t *testing.T) {
 	}
 
 	// Establish the vault dimension at 384 through the normal embed sequence.
-	if err := adapter.UpdateEmbedding(ctx, ULID(id1), guardTestVec(384)); err != nil {
+	if err := adapter.UpdateEmbedding(ctx, ws, ULID(id1), guardTestVec(384)); err != nil {
 		t.Fatalf("UpdateEmbedding (first, establishes dim): %v", err)
 	}
-	if err := adapter.HNSWInsert(ctx, ULID(id1), guardTestVec(384)); err != nil {
+	if err := adapter.HNSWInsert(ctx, ws, ULID(id1), guardTestVec(384)); err != nil {
 		t.Fatalf("HNSWInsert: %v", err)
 	}
 
 	// A 768-dim embedding must now be refused with the typed error.
-	err = adapter.UpdateEmbedding(ctx, ULID(id2), guardTestVec(768))
+	err = adapter.UpdateEmbedding(ctx, ws, ULID(id2), guardTestVec(768))
 	var dimErr *hnswpkg.DimMismatchError
 	if !errors.As(err, &dimErr) {
 		t.Fatalf("expected *DimMismatchError from UpdateEmbedding, got %v", err)
@@ -74,13 +74,13 @@ func TestStoreAdapter_UpdateEmbeddingDimGuard(t *testing.T) {
 	}
 
 	// The HNSW backstop refuses the same vector as well.
-	err = adapter.HNSWInsert(ctx, ULID(id2), guardTestVec(768))
+	err = adapter.HNSWInsert(ctx, ws, ULID(id2), guardTestVec(768))
 	if !errors.As(err, &dimErr) {
 		t.Fatalf("expected *DimMismatchError from HNSWInsert, got %v", err)
 	}
 
 	// A matching embedding still goes through.
-	if err := adapter.UpdateEmbedding(ctx, ULID(id2), guardTestVec(384)); err != nil {
+	if err := adapter.UpdateEmbedding(ctx, ws, ULID(id2), guardTestVec(384)); err != nil {
 		t.Fatalf("matching-dimension UpdateEmbedding: %v", err)
 	}
 
@@ -88,7 +88,7 @@ func TestStoreAdapter_UpdateEmbeddingDimGuard(t *testing.T) {
 	// a fresh registry (cold cache) falls back to the on-disk dimension —
 	// one Pebble seek — without loading the graph.
 	coldAdapter := NewStoreAdapter(store, hnswpkg.NewRegistry(storeDB))
-	err = coldAdapter.UpdateEmbedding(ctx, ULID(id2), guardTestVec(768))
+	err = coldAdapter.UpdateEmbedding(ctx, ws, ULID(id2), guardTestVec(768))
 	if !errors.As(err, &dimErr) {
 		t.Fatalf("expected *DimMismatchError from cold-cache UpdateEmbedding, got %v", err)
 	}

@@ -16,6 +16,18 @@ import (
 // CountWithoutFlag returns the number of engrams across all vaults that are
 // missing the given digest flag bit. Engrams that have any skipFlags bit set
 // are excluded from the count (e.g. permanently-failed engrams).
+//
+// Cost note: this and ScanWithoutFlag both do a full linear scan of the
+// cross-vault engram keyspace on every call (called once per
+// RetroactiveProcessor pass) — there is no secondary index of "pending"
+// engrams, so the scan cost is O(total engrams on the instance) regardless
+// of how few are actually pending. This is a known, currently-accepted cost
+// (unlike the O(candidates × total engrams) FindVaultPrefix-per-call bug
+// that PluginStore.UpdateEmbedding's doc describes and that RetroactiveProcessor
+// no longer pays) — see TestRetroactiveProcessor_EmbedPass_ManyVaults_ScalesWithBacklogNotCorpus
+// in internal/plugin for a measured example. Worth revisiting with a proper
+// pending-engram index if per-pass latency becomes a problem again at larger
+// scale.
 func (ps *PebbleStore) CountWithoutFlag(ctx context.Context, flag, skipFlags uint8) (int64, error) {
 	lowerBound := []byte{prefix.Engram}
 	upperBound := []byte{prefix.Meta}

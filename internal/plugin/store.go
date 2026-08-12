@@ -26,8 +26,15 @@ type PluginStore interface {
 	GetDigestFlags(ctx context.Context, id ULID) (uint8, error)
 
 	// UpdateEmbedding stores an embedding vector for an engram.
-	// Also updates the EmbedDim field in ERF metadata.
-	UpdateEmbedding(ctx context.Context, id ULID, vec []float32) error
+	// Also updates the EmbedDim field in ERF metadata. ws is the engram's
+	// vault workspace prefix — pass EngramIterator.CurrentWS() for an engram
+	// yielded by ScanWithoutFlag rather than re-deriving it: the underlying
+	// FindVaultPrefix lookup is a full linear scan of the cross-vault engram
+	// keyspace with no index, and RetroactiveProcessor calls these ws-scoped
+	// methods once per candidate/processed engram — re-deriving ws per call
+	// made a full backlog pass cost O(candidates × total engrams across every
+	// vault on the instance) instead of O(candidates).
+	UpdateEmbedding(ctx context.Context, ws [8]byte, id ULID, vec []float32) error
 
 	// UpdateDigest updates digest fields (summary, key_points, memory_type,
 	// type_label/topic classification) on an existing engram. Called by enrich.
@@ -49,8 +56,10 @@ type PluginStore interface {
 	// Maps to the standard 0x03/0x04 forward/reverse association keys.
 	UpsertRelationship(ctx context.Context, engramID ULID, rel ExtractedRelation) error
 
-	// HNSWInsert inserts a vector into the HNSW index.
-	HNSWInsert(ctx context.Context, id ULID, vec []float32) error
+	// HNSWInsert inserts a vector into the HNSW index. ws is the engram's
+	// vault workspace prefix — see UpdateEmbedding's doc for why callers must
+	// pass a known ws rather than let the store re-derive it.
+	HNSWInsert(ctx context.Context, ws [8]byte, id ULID, vec []float32) error
 
 	// CheckEmbedDim reports whether an embedding of the given dimension would
 	// be accepted for the vault that contains the engram (issue #582). Returns
@@ -58,13 +67,17 @@ type PluginStore interface {
 	// retroactive processor to skip engrams of a mismatched vault BEFORE
 	// paying for inference — the mismatch is a vault-level configuration
 	// condition, so the engrams stay pending (not failure-flagged) and embed
-	// normally once the configuration or the vault is fixed.
-	CheckEmbedDim(ctx context.Context, id ULID, dim int) error
+	// normally once the configuration or the vault is fixed. ws is the
+	// engram's vault workspace prefix — see UpdateEmbedding's doc for why
+	// callers must pass a known ws rather than let the store re-derive it.
+	CheckEmbedDim(ctx context.Context, ws [8]byte, id ULID, dim int) error
 
 	// AutoLinkByEmbedding finds the top-K nearest neighbors by embedding and
 	// creates RELATES_TO associations with weight = similarity * 0.8.
-	// K = 5 (hardcoded, matching the design doc).
-	AutoLinkByEmbedding(ctx context.Context, id ULID, vec []float32) error
+	// K = 5 (hardcoded, matching the design doc). ws is the engram's vault
+	// workspace prefix — see UpdateEmbedding's doc for why callers must pass
+	// a known ws rather than let the store re-derive it.
+	AutoLinkByEmbedding(ctx context.Context, ws [8]byte, id ULID, vec []float32) error
 }
 
 // EngramIterator is a forward-only iterator over engrams.
@@ -74,6 +87,12 @@ type EngramIterator interface {
 
 	// Engram returns the current engram. Only valid after Next() returns true.
 	Engram() *Engram
+
+	// CurrentWS returns the vault workspace prefix of the current engram
+	// (only valid after Next() returns true) — the iterator already knows
+	// this for free from the key it just read, so callers should use it
+	// instead of re-deriving the vault via a separate lookup.
+	CurrentWS() [8]byte
 
 	// Close releases the underlying Pebble iterator.
 	Close() error

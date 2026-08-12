@@ -32,7 +32,7 @@ func (m *mockPluginStore) SetDigestFlag(_ context.Context, _ plugin.ULID, _ uint
 func (m *mockPluginStore) GetDigestFlags(_ context.Context, _ plugin.ULID) (uint8, error) {
 	return 0, nil
 }
-func (m *mockPluginStore) UpdateEmbedding(_ context.Context, _ plugin.ULID, _ []float32) error {
+func (m *mockPluginStore) UpdateEmbedding(_ context.Context, _ [8]byte, _ plugin.ULID, _ []float32) error {
 	return nil
 }
 func (m *mockPluginStore) UpdateDigest(_ context.Context, _ plugin.ULID, _ *plugin.EnrichmentResult) error {
@@ -55,13 +55,13 @@ func (m *mockPluginStore) UpsertRelationship(_ context.Context, _ plugin.ULID, _
 	m.upsertRelationshipCalls++
 	return nil
 }
-func (m *mockPluginStore) HNSWInsert(_ context.Context, _ plugin.ULID, _ []float32) error {
+func (m *mockPluginStore) HNSWInsert(_ context.Context, _ [8]byte, _ plugin.ULID, _ []float32) error {
 	return nil
 }
-func (m *mockPluginStore) CheckEmbedDim(_ context.Context, _ plugin.ULID, _ int) error {
+func (m *mockPluginStore) CheckEmbedDim(_ context.Context, _ [8]byte, _ plugin.ULID, _ int) error {
 	return nil
 }
-func (m *mockPluginStore) AutoLinkByEmbedding(_ context.Context, _ plugin.ULID, _ []float32) error {
+func (m *mockPluginStore) AutoLinkByEmbedding(_ context.Context, _ [8]byte, _ plugin.ULID, _ []float32) error {
 	return nil
 }
 

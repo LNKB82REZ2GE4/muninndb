@@ -42,11 +42,7 @@ func (a *pluginStoreAdapter) GetDigestFlags(ctx context.Context, id ULID) (uint8
 	return a.store.GetDigestFlags(ctx, storage.ULID(id))
 }
 
-func (a *pluginStoreAdapter) UpdateEmbedding(ctx context.Context, id ULID, vec []float32) error {
-	ws, ok := a.store.FindVaultPrefix(storage.ULID(id))
-	if !ok {
-		return fmt.Errorf("UpdateEmbedding: engram %s not found", id.String())
-	}
+func (a *pluginStoreAdapter) UpdateEmbedding(ctx context.Context, ws [8]byte, id ULID, vec []float32) error {
 	// Refuse an embedding whose dimension differs from the vault's established
 	// dimension (issue #582) — checked before the embedding is persisted, so a
 	// mismatched vector is never stranded in storage. HNSWInsert has the same
@@ -58,11 +54,7 @@ func (a *pluginStoreAdapter) UpdateEmbedding(ctx context.Context, id ULID, vec [
 }
 
 // CheckEmbedDim implements PluginStore (issue #582).
-func (a *pluginStoreAdapter) CheckEmbedDim(_ context.Context, id ULID, dim int) error {
-	ws, ok := a.store.FindVaultPrefix(storage.ULID(id))
-	if !ok {
-		return fmt.Errorf("CheckEmbedDim: engram %s not found", id.String())
-	}
+func (a *pluginStoreAdapter) CheckEmbedDim(_ context.Context, ws [8]byte, id ULID, dim int) error {
 	return a.checkVaultDim(ws, dim)
 }
 
@@ -127,19 +119,11 @@ func (a *pluginStoreAdapter) UpsertRelationship(ctx context.Context, engramID UL
 	return a.store.UpsertRelationshipRecord(ctx, ws, storage.ULID(engramID), record)
 }
 
-func (a *pluginStoreAdapter) HNSWInsert(ctx context.Context, id ULID, vec []float32) error {
-	ws, ok := a.store.FindVaultPrefix(storage.ULID(id))
-	if !ok {
-		return fmt.Errorf("HNSWInsert: engram %s not found", id.String())
-	}
+func (a *pluginStoreAdapter) HNSWInsert(ctx context.Context, ws [8]byte, id ULID, vec []float32) error {
 	return a.hnsw.Insert(ctx, ws, [16]byte(id), vec)
 }
 
-func (a *pluginStoreAdapter) AutoLinkByEmbedding(ctx context.Context, id ULID, vec []float32) error {
-	ws, ok := a.store.FindVaultPrefix(storage.ULID(id))
-	if !ok {
-		return nil // not a fatal error
-	}
+func (a *pluginStoreAdapter) AutoLinkByEmbedding(ctx context.Context, ws [8]byte, id ULID, vec []float32) error {
 	results, err := a.hnsw.Search(ctx, ws, vec, 5)
 	if err != nil || len(results) == 0 {
 		return nil
