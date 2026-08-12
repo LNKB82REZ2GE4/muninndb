@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# muninn-dream-nightly — nightly offline dream (consolidation) sweep.
+#
+# `muninn dream` requires exclusive access to the Pebble store, so this script
+# stops muninndb.service, runs a scoped dream per included vault, and restarts
+# the server. Every exit path logs loudly (a silent watcher is indistinguishable
+# from a hung one). Expected outage: ~5-6 min (dominated by agent-memory).
+#
+# Exclusions (deliberate, see docs/MUNINN_V0.10_UPGRADE_BRIEF.md in Pi-RAG and
+# the 2026-08-12 dream audit):
+#   phd-research  — Pi-RAG's paper-knowledge vault: papers that agree are the
+#                   product, not duplicates. Dream must never consolidate it.
+#   pi            — frozen archive: must not be mutated at all.
+#   default       — dead legacy vault (4 engrams).
+#   proj-pi-rag-1e88cef4, proj-x-ray-ct-2c9a1f3e — stale ghost twins awaiting
+#                   retirement (already merged into their live vaults).
+#   proj-smoketest-00000000 — test artifact.
+#
+# Dream itself uses NO LLM (phases 0-2: orient, replay, embedding-cosine dedup;
+# duplicates are soft-archived, recoverable). Idempotent as of fork commit
+# 426dd8a — re-runs skip already-archived members.
+
+set -u -o pipefail
+
+MUNINN_BIN="${MUNINN_BIN:-$HOME/.local/bin/muninn}"
+DATA_DIR="${MUNINN_DATA_DIR:-$HOME/.muninn/data}"
+REST="http://127.0.0.1:8475"
+HOOK_CONF="$HOME/.config/muninn-hook.json"
+LOG_DIR="$HOME/.local/share/muninn-dream"
+LOG="$LOG_DIR/dream.log"
+PER_VAULT_TIMEOUT=1800   # 30 min hard cap per vault
+EXCLUDE_RE='^(phd-research|pi|default|proj-pi-rag-1e88cef4|proj-x-ray-ct-2c9a1f3e|proj-smoketest-00000000)$'
+
+mkdir -p "$LOG_DIR"
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+fail() {
+    log "ERROR: $*"
+    log "RUN FAILED"
+    exit 1
+}
+
+log "=== nightly dream starting ==="
+
+# 1. Enumerate vaults while the server is still up (REST needs it). Abort
+#    before touching the service if enumeration fails.
+KEY=$(python3 -c "import json;print(json.load(open('$HOOK_CONF'))['agents']['claude']['key'])") \
+    || fail "could not read API key from $HOOK_CONF"
+VAULTS=$(curl -sf --max-time 30 "$REST/api/vaults" -H "Authorization: Bearer $KEY" \
+    | python3 -c "import json,sys;[print(x['name'] if isinstance(x,dict) else x) for x in json.load(sys.stdin)]" \
+    | grep -Ev "$EXCLUDE_RE" | sort) \
+    || fail "vault enumeration failed (server down? key revoked?) — aborting BEFORE stopping the service"
+[ -n "$VAULTS" ] || fail "vault list came back empty — refusing to proceed"
+log "include list: $(echo "$VAULTS" | wc -l) vaults"
+
+# 2. Stop the server; guarantee restart on every exit path from here on.
+WAS_ACTIVE=0
+systemctl --user is-active --quiet muninndb.service && WAS_ACTIVE=1
+restart_server() {
+    if [ "$WAS_ACTIVE" -eq 1 ]; then
+        if systemctl --user start muninndb.service; then
+            log "muninndb.service restarted"
+        else
+            log "ERROR: FAILED TO RESTART muninndb.service — MEMORY SERVER IS DOWN"
+        fi
+    else
+        log "server was not active before the run; leaving it stopped"
+    fi
+}
+trap restart_server EXIT
+
+if [ "$WAS_ACTIVE" -eq 1 ]; then
+    systemctl --user stop muninndb.service || fail "could not stop muninndb.service"
+    log "muninndb.service stopped for offline dream"
+else
+    log "WARN: muninndb.service was not running at start"
+fi
+
+# 3. Scoped dream per vault. A vault failure is logged and the sweep continues.
+ok=0; failed=0; started=$(date +%s)
+while IFS= read -r v; do
+    line=$(timeout "$PER_VAULT_TIMEOUT" "$MUNINN_BIN" dream --scope "$v" --data-dir "$DATA_DIR" 2>&1 \
+        | grep -E 'scanned|Error' | head -1)
+    rc=$?
+    if [ $rc -eq 0 ] && [ -n "$line" ]; then
+        log "  $line"
+        ok=$((ok+1))
+    else
+        log "  ERROR vault=$v rc=$rc ${line:-<no output>}"
+        failed=$((failed+1))
+    fi
+done <<< "$VAULTS"
+
+log "sweep done: $ok ok, $failed failed, $(( $(date +%s) - started ))s"
+# trap restarts the server here.
+if [ "$failed" -gt 0 ]; then
+    log "RUN COMPLETED WITH ERRORS"
+    exit 1
+fi
+log "RUN OK"
