@@ -269,9 +269,18 @@ func scanAllEngramIDs(ctx context.Context, store *storage.PebbleStore, wsPrefix 
 		}
 
 		for _, eng := range engrams {
-			if eng != nil {
-				allIDs = append(allIDs, eng.ID)
+			if eng == nil {
+				continue
 			}
+			// Skip members a previous pass archived (and soft-deleted engrams):
+			// re-clustering them makes dedup non-idempotent — every pass would
+			// re-count the same merges, re-absorb their frequency signal into
+			// the representative's AccessCount, and permanently spend the
+			// MaxDedup budget on clusters that are already consolidated.
+			if eng.State == storage.StateArchived || eng.State == storage.StateSoftDeleted {
+				continue
+			}
+			allIDs = append(allIDs, eng.ID)
 		}
 
 		if len(engrams) < pageSize {

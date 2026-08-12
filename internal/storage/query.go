@@ -230,6 +230,11 @@ func (ps *PebbleStore) EngramsByCreatedSince(ctx context.Context, wsPrefix [8]by
 			ID:        id,
 			Concept:   concept,
 			CreatedAt: meta.CreatedAt,
+			// State is patched in-place on the 0x01 record by UpdateMetadata,
+			// so the decoded meta always carries the current lifecycle state.
+			// Callers (e.g. consolidation dedup) filter on it — leaving it
+			// zero-valued would masquerade every engram as StatePlanning.
+			State: LifecycleState(meta.State),
 		})
 
 		if len(engrams) >= limit {

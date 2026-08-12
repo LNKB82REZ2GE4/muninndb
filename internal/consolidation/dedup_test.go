@@ -818,3 +818,61 @@ func TestDedup_V2Embeddings_MergesCluster(t *testing.T) {
 		t.Errorf("duplicate engram state = %v, want archived", archived.State)
 	}
 }
+
+// TestDedup_Idempotent_SkipsAlreadyArchived verifies a second dedup pass over
+// the same vault is a no-op: members archived by a previous pass must not be
+// re-clustered, re-counted as merges, or have their frequency signal absorbed
+// into the representative a second time. Without the lifecycle filter in
+// scanAllEngramIDs, every nightly dream re-reports the same merges and the
+// MaxDedup budget is permanently consumed by already-archived clusters, so new
+// duplicates behind them are never processed.
+func TestDedup_Idempotent_SkipsAlreadyArchived(t *testing.T) {
+	store, db, cleanup := testStoreWithDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	vault := "dedup_idempotent"
+	wsPrefix := store.ResolveVaultPrefix(vault)
+
+	embed := []float32{1, 0, 0, 0}
+	repID := writeEngramWithEmbedding(t, ctx, store, db, wsPrefix, &storage.Engram{
+		Concept: "rep", Content: "rep content", Confidence: 0.9, Relevance: 0.9,
+		Stability: 30, Embedding: embed, AccessCount: 5,
+	})
+	for i := 0; i < 2; i++ {
+		writeEngramWithEmbedding(t, ctx, store, db, wsPrefix, &storage.Engram{
+			Concept: fmt.Sprintf("dup-%c", 'a'+i), Content: "rep content",
+			Confidence: 0.5, Relevance: 0.5,
+			Stability: 30, Embedding: embed, AccessCount: 0,
+		})
+	}
+
+	mock := &mockEngineInterface{store: store}
+	w := &Worker{Engine: mock, MaxDedup: 100, MaxTransitive: 100}
+
+	first := &ConsolidationReport{}
+	if err := w.runPhase2Dedup(ctx, store, wsPrefix, first, vault); err != nil {
+		t.Fatal(err)
+	}
+	if first.MergedEngrams != 2 {
+		t.Fatalf("first pass MergedEngrams = %d, want 2", first.MergedEngrams)
+	}
+
+	second := &ConsolidationReport{}
+	if err := w.runPhase2Dedup(ctx, store, wsPrefix, second, vault); err != nil {
+		t.Fatal(err)
+	}
+	if second.MergedEngrams != 0 {
+		t.Errorf("second pass MergedEngrams = %d, want 0 (already-archived members re-merged)", second.MergedEngrams)
+	}
+
+	rep, err := store.GetEngram(ctx, wsPrefix, repID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantAccess uint32 = 5 + 2
+	if rep.AccessCount != wantAccess {
+		t.Errorf("representative AccessCount = %d, want %d (frequency signal must not be absorbed twice)",
+			rep.AccessCount, wantAccess)
+	}
+}
