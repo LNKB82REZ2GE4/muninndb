@@ -2,7 +2,9 @@ package consolidation
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/scrypster/muninndb/internal/storage"
 )
@@ -130,5 +132,70 @@ func TestDreamOnce_EmptyVault(t *testing.T) {
 	}
 	if report.Reports[0].Orient == nil {
 		t.Error("expected orient summary even for empty vault")
+	}
+}
+
+// TestDreamOnce_RunsSchemaPromotionAndTransitive pins phases 3 and 5 into the
+// dream pass: a hub engram (>=10 out-edges, relevance >=0.8) must be promoted,
+// and a strong A→B→C triangle must gain an inferred A→C edge. (Upstream only
+// wired these into the background scheduler, which the server never starts;
+// the fork runs them in the nightly offline dream instead. Phase 4 decay
+// acceleration is deliberately NOT wired — hardcoded constants.)
+func TestDreamOnce_RunsSchemaPromotionAndTransitive(t *testing.T) {
+	store, cleanup := testStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	vault := "dream_phases35"
+	wsPrefix := store.ResolveVaultPrefix(vault)
+
+	// Phase 5 seed: strong triangle A→B→C, no A→C.
+	a := &storage.Engram{Concept: "a", Content: "content a", Confidence: 1.0, Relevance: 0.8, Stability: 30}
+	b := &storage.Engram{Concept: "b", Content: "content b", Confidence: 1.0, Relevance: 0.8, Stability: 30}
+	c := &storage.Engram{Concept: "c", Content: "content c", Confidence: 1.0, Relevance: 0.8, Stability: 30}
+	idA, _ := store.WriteEngram(ctx, wsPrefix, a)
+	idB, _ := store.WriteEngram(ctx, wsPrefix, b)
+	idC, _ := store.WriteEngram(ctx, wsPrefix, c)
+	store.WriteAssociation(ctx, wsPrefix, idA, idB, &storage.Association{
+		TargetID: idB, Weight: 0.8, Confidence: 1.0, RelType: storage.RelSupports, CreatedAt: time.Now(),
+	})
+	store.WriteAssociation(ctx, wsPrefix, idB, idC, &storage.Association{
+		TargetID: idC, Weight: 0.9, Confidence: 1.0, RelType: storage.RelSupports, CreatedAt: time.Now(),
+	})
+
+	// Phase 3 seed: hub with 10 out-edges and high relevance.
+	hub := &storage.Engram{Concept: "hub", Content: "hub content", Confidence: 1.0, Relevance: 0.9, Stability: 30}
+	idHub, _ := store.WriteEngram(ctx, wsPrefix, hub)
+	for i := 0; i < 10; i++ {
+		spoke := &storage.Engram{
+			Concept: fmt.Sprintf("spoke-%d", i), Content: fmt.Sprintf("spoke content %d", i),
+			Confidence: 1.0, Relevance: 0.5, Stability: 30,
+		}
+		idS, _ := store.WriteEngram(ctx, wsPrefix, spoke)
+		store.WriteAssociation(ctx, wsPrefix, idHub, idS, &storage.Association{
+			TargetID: idS, Weight: 0.5, Confidence: 1.0, RelType: storage.RelSupports, CreatedAt: time.Now(),
+		})
+	}
+
+	w := NewWorker(&mockEngineInterface{store: store})
+	report, err := w.DreamOnce(ctx, DreamOpts{Scope: vault})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Reports) != 1 {
+		t.Fatalf("expected 1 vault report, got %d", len(report.Reports))
+	}
+	r := report.Reports[0]
+
+	if r.InferredEdges < 1 {
+		t.Errorf("phase 5 not run in dream: InferredEdges = %d, want >= 1", r.InferredEdges)
+	}
+	if r.PromotedNodes < 1 {
+		t.Errorf("phase 3 not run in dream: PromotedNodes = %d, want >= 1", r.PromotedNodes)
+	}
+
+	// Phase 4 must NOT run in dream (deliberately unwired).
+	if r.DecayedEngrams != 0 {
+		t.Errorf("phase 4 must not run in dream: DecayedEngrams = %d, want 0", r.DecayedEngrams)
 	}
 }

@@ -134,9 +134,26 @@ func (w *Worker) DreamOnce(ctx context.Context, opts DreamOpts) (*DreamReport, e
 		}
 
 		// Phase 2b: LLM Consolidation (future PR)
-		// Phase 3: Schema Promotion (future PR)
-		// Phase 4: Bidirectional Stability (future PR)
-		// Phase 5: Transitive Inference (future PR)
+
+		// Phase 3: Schema Promotion — boost hub engrams (>=10 out-edges,
+		// relevance >=0.8) so load-bearing concepts resist fading. Wired into
+		// the dream pass by the fork (upstream only ran it in the background
+		// scheduler, which the server never starts).
+		if err := dw.runPhase3SchemaPromotion(ctx, store, wsPrefix, report); err != nil {
+			slog.Warn("dream: phase 3 (schema promotion) failed", "vault", vault, "error", err)
+			report.Errors = append(report.Errors, "phase3_schema: "+err.Error())
+		}
+
+		// Phase 4: Decay Acceleration — deliberately NOT wired: its 30d/0.3/0.5
+		// constants are hardcoded, which violates the per-vault calibration
+		// principle; revisit only with per-vault knobs.
+
+		// Phase 5: Transitive Inference — infer A→C where A→B and B→C are both
+		// strong and no direct edge exists. Same fork-wiring rationale as phase 3.
+		if err := dw.runPhase5TransitiveInference(ctx, store, wsPrefix, report); err != nil {
+			slog.Warn("dream: phase 5 (transitive inference) failed", "vault", vault, "error", err)
+			report.Errors = append(report.Errors, "phase5_transitive: "+err.Error())
+		}
 
 		report.Duration = time.Since(report.StartedAt)
 		dreport.Reports = append(dreport.Reports, report)

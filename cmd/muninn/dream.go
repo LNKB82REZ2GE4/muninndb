@@ -98,6 +98,9 @@ func printDreamReport(report *muninn.DreamReport, dryRun bool) {
 		if r.MergedEngrams > 0 {
 			changes = append(changes, fmt.Sprintf("merged %d", r.MergedEngrams))
 		}
+		if r.PromotedNodes > 0 {
+			changes = append(changes, fmt.Sprintf("promoted %d", r.PromotedNodes))
+		}
 		if r.InferredEdges > 0 {
 			changes = append(changes, fmt.Sprintf("inferred %d edges", r.InferredEdges))
 		}
