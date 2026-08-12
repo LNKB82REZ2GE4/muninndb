@@ -128,6 +128,7 @@ func TestAll_ConstSliceComplete(t *testing.T) {
 		{"APIKeyVaultIdx", APIKeyVaultIdx},
 		{"VaultConfig", VaultConfig},
 		{"APIKeyGlobIdx", APIKeyGlobIdx},
+		{"DeclaredContradictionMark", DeclaredContradictionMark},
 	}
 
 	// Build a set of bytes that appear in All() for the forward direction.

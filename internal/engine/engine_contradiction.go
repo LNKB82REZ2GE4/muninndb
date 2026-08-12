@@ -111,7 +111,7 @@ func (ce contradictionEdge) other(id storage.ULID) storage.ULID {
 
 // vaultMayHaveContradictions is COG-29's fast-path gate. The phase must be
 // free on the overwhelming majority of vaults, which have no contradictions at
-// all. Three probes, cheapest first:
+// all. Four probes, cheapest first:
 //
 //  1. The in-process per-vault flag. It covers the window between an explicit
 //     muninn_link(contradicts) in THIS process and the batch worker writing the
@@ -119,35 +119,56 @@ func (ce contradictionEdge) other(id storage.ULID) storage.ULID {
 //     deployment — the default, and the evaluators' case — honors a declaration
 //     on the very next query.
 //
-//  2. A bounded 0x0A seek, answered by one iterator First(). This is the steady
-//     state, and it is the only probe that sees an edge declared by ANOTHER
-//     process, so it must keep running on every query.
+//  2. The durable per-vault 0x2F marker: ONE point lookup. `none` is the only
+//     answer that lets this gate return false, and it is only ever written off
+//     a scan that ran to completion (migration v6, or probe 4 below). `yes` is
+//     written in the same batch as the contradicts edge itself, so it is also
+//     the probe that sees a declaration made by ANOTHER process.
 //
-//  3. Once per vault per process, a bounded scan for declared-but-unflagged
-//     contradicts edges. This exists because probes 1 and 2 TOGETHER have a
-//     permanent hole: the in-process flag lives only in memory and the 0x0A
-//     marker is written only when the batch worker flushes, so a process that
-//     restarts between muninn_link(contradicts) and that flush loses the flag
-//     while the marker was never written — and nothing else ever re-probes.
-//     Recall would then silently stop honoring a durable, correctly-declared
-//     contradiction FOREVER. The scan's result is cached per vault, so a
-//     contradiction-free vault pays it exactly once, not once per recall.
+//  3. A bounded 0x0A seek, answered by one iterator First(). Kept for the
+//     batch detector's marker, which is written outside WriteAssociation.
 //
-// Named residual: the once-per-process scan is capped
-// (storage.DefaultDeclaredContradictionScanCap). On a vault whose forward
-// associations exceed that cap the scan is incomplete, and this gate then
-// degrades toward DOING the work rather than toward silence — the phase is
-// read-only and bounded, so the cost of being wrong that way is I/O, while the
-// cost of being wrong the other way is a disputed fact presented as the answer.
+//  4. Once per vault per process, a bounded scan for declared-but-unflagged
+//     contradicts edges — the ONLY way an unknown vault becomes known. It
+//     exists because probes 1 and 3 together have a permanent hole: the
+//     in-process flag lives only in memory and the 0x0A marker is written only
+//     when the batch worker flushes, so a process that restarts between
+//     muninn_link(contradicts) and that flush loses the flag while the marker
+//     was never written. Recall would then silently stop honoring a durable,
+//     correctly-declared contradiction FOREVER. A COMPLETE clean scan is now
+//     persisted to 0x2F, so a contradiction-free vault pays it exactly once
+//     per DATABASE rather than once per process.
+//
+// Named residual, unchanged in kind but no longer permanent: the once-per-
+// process scan is capped (storage.DefaultDeclaredContradictionScanCap). On a
+// vault whose forward associations exceed that cap the scan is incomplete, it
+// proves nothing, NOTHING is persisted, and this gate degrades toward DOING
+// the work rather than toward silence — the phase is read-only and bounded, so
+// the cost of being wrong that way is I/O, while the cost of being wrong the
+// other way is a disputed fact presented as the answer. Migration v6 scans
+// uncapped and settles those vaults durably.
 func (e *Engine) vaultMayHaveContradictions(ctx context.Context, ws [8]byte) bool {
 	if _, declared := e.contradictionsDeclared.Load(ws); declared {
 		return true
 	}
+	mark, known, err := e.store.DeclaredContradictionMark(ctx, ws)
+	switch {
+	case err != nil:
+		// Degrade toward DOING the work: a read error must not silently turn
+		// contradiction honesty off.
+		slog.Warn("recall: declared-contradiction marker read failed, running the phase anyway", "err", err)
+		return true
+	case known && mark == storage.DeclaredContradictionYes:
+		// Sticky: skip the per-query 0x0A seek from here on.
+		e.contradictionsDeclared.Store(ws, struct{}{})
+		return true
+	case known && mark == storage.DeclaredContradictionNone:
+		// The one O(1) answer that skips the phase. Proven by a complete scan.
+		return false
+	}
+	// UNKNOWN — never read as clean.
 	has, err := e.store.HasContradictionMarkers(ctx, ws)
 	if err != nil {
-		// Degrade toward DOING the work: a read error must not silently turn
-		// contradiction honesty off. The phase itself is read-only, so the
-		// worst case is wasted I/O on one query.
 		slog.Warn("recall: contradiction marker probe failed, running the phase anyway", "err", err)
 		return true
 	}
@@ -172,15 +193,29 @@ func (e *Engine) declaredContradictionsProbe(ctx context.Context, ws [8]byte) bo
 		// Promote to the sticky flag: the vault demonstrably has a declared
 		// contradiction, so never pay this scan again.
 		e.contradictionsDeclared.Store(ws, struct{}{})
+		// Durable too: this is a proven Yes, and the 0x2F marker is what
+		// spares the NEXT process the scan.
+		if err := e.store.SetDeclaredContradictionMark(ctx, ws, storage.DeclaredContradictionYes); err != nil {
+			slog.Warn("recall: failed to persist declared-contradiction marker", "err", err)
+		}
 		return true
 	}
 	if !res.Complete {
+		// The scan proved NOTHING — it ran out of budget. Persist nothing: a
+		// marker written here would either lie about a clean vault or make an
+		// unproven Yes permanent. The vault stays UNKNOWN and keeps paying the
+		// read-only phase until migration v6's uncapped scan settles it.
 		slog.Warn("recall: contradiction declared-edge probe hit its scan cap; running COG-29 on every query for this vault",
 			"scanned", res.Scanned)
 		e.contradictionsDeclared.Store(ws, struct{}{})
 		return true
 	}
 	e.contradictionProbeClean.Store(ws, struct{}{})
+	// A COMPLETE scan found nothing: this is the one place recall may prove a
+	// vault clean, so record it durably and stop re-scanning on every restart.
+	if err := e.store.SetDeclaredContradictionMark(ctx, ws, storage.DeclaredContradictionNone); err != nil {
+		slog.Warn("recall: failed to persist clean declared-contradiction marker", "err", err)
+	}
 	return false
 }
 

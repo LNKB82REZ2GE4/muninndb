@@ -126,6 +126,8 @@ func (g *Graph) WriteAssociation(ws [8]byte, src [16]byte, assoc *storage.Associ
 
 	batch.Set(fwdKey, val, nil)
 	batch.Set(revKey, val, nil)
+	// Same batch as the edge — see storage.MarkDeclaredContradictionInBatch.
+	storage.MarkDeclaredContradictionInBatch(batch, ws, assoc.RelType)
 
 	return batch.Commit(pebble.NoSync)
 }

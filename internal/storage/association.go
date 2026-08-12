@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -123,6 +124,8 @@ func (ps *PebbleStore) WriteAssociation(ctx context.Context, wsPrefix [8]byte, s
 	var weightBuf [4]byte
 	binary.BigEndian.PutUint32(weightBuf[:], math.Float32bits(assoc.Weight))
 	batch.Set(keys.AssocWeightIndexKey(wsPrefix, [16]byte(src), [16]byte(dst)), weightBuf[:], nil)
+
+	MarkDeclaredContradictionInBatch(batch, wsPrefix, assoc.RelType)
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
@@ -1152,6 +1155,108 @@ func (ps *PebbleStore) GetContradictionRecords(ctx context.Context, wsPrefix [8]
 		return nil, fmt.Errorf("GetContradictionRecords scan: %w", err)
 	}
 	return recs, nil
+}
+
+// Values of the per-vault declared-contradiction marker (0x2F). The key being
+// ABSENT is a third state — UNKNOWN — and is deliberately not a constant here:
+// there is no byte that means it, so no caller can accidentally treat it as
+// DeclaredContradictionNone.
+const (
+	// DeclaredContradictionNone means a COMPLETE scan of this vault's forward
+	// associations found no `contradicts` edge. Only ever written off a scan
+	// that ran to completion — a capped, truncated scan proves nothing.
+	DeclaredContradictionNone byte = 0x00
+	// DeclaredContradictionYes means this vault has had a declared
+	// `contradicts` edge written to it. Sticky.
+	DeclaredContradictionYes byte = 0x01
+)
+
+// AssocValueRelType decodes just the relation type out of a raw 0x03/0x04
+// association value. It exists so a bulk scanner (migrate.BackfillDeclared-
+// ContradictionMark) can classify millions of edges without paying for the
+// timestamps and float fields decodeAssocValue also produces, and without
+// duplicating the value layout outside this file.
+func AssocValueRelType(val []byte) RelType {
+	relType, _, _, _, _, _, _ := decodeAssocValue(val)
+	return relType
+}
+
+// MarkDeclaredContradictionInBatch flips the vault's O(1) COG-29 marker to
+// `yes` when relType is RelContradicts, IN THE CALLER'S BATCH. It is a no-op
+// for every other relation type.
+//
+// Same-batch is the requirement, not an optimisation. If a `contradicts` edge
+// could commit without its marker, a crash in between would leave a durable
+// declared contradiction sitting behind a marker that says "clean", and recall
+// would then present a disputed memory as the answer — silently, forever, the
+// exact failure class COG-29 exists to prevent. Batching means the only two
+// reachable states are "neither" and "both".
+//
+// EVERY path that can create a 0x03 `contradicts` key must call this. It is
+// idempotent (same key, same one-byte value) and monotone: nothing here ever
+// writes `none` — see SetDeclaredContradictionMark for why an edge going away
+// does not clear the marker.
+func MarkDeclaredContradictionInBatch(batch *pebble.Batch, wsPrefix [8]byte, relType RelType) {
+	if relType != RelContradicts {
+		return
+	}
+	_ = batch.Set(keys.DeclaredContradictionMarkKey(wsPrefix), []byte{DeclaredContradictionYes}, nil)
+}
+
+// DeclaredContradictionMark reports the vault's O(1) declared-contradiction
+// marker. known=false means the key is ABSENT — the vault has never been
+// proven either way — and the caller MUST treat that as "may have
+// contradictions", never as clean.
+func (ps *PebbleStore) DeclaredContradictionMark(ctx context.Context, wsPrefix [8]byte) (mark byte, known bool, err error) {
+	val, closer, gErr := ps.db.Get(keys.DeclaredContradictionMarkKey(wsPrefix))
+	if gErr != nil {
+		if errors.Is(gErr, pebble.ErrNotFound) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("DeclaredContradictionMark: %w", gErr)
+	}
+	defer closer.Close()
+	if len(val) == 0 {
+		return 0, false, nil
+	}
+	return val[0], true, nil
+}
+
+// SetDeclaredContradictionMark writes the vault's declared-contradiction
+// marker.
+//
+// MONOTONE: a DeclaredContradictionNone write is refused once the marker says
+// Yes. Clearing the marker would have to prove that no declared `contradicts`
+// edge remains anywhere in the vault, which is the vault-wide scan this marker
+// exists to avoid — and getting it wrong turns contradiction honesty off
+// silently, the failure class COG-29 exists to prevent. The accepted residual
+// is the cheap direction: a vault whose conflicts were all resolved keeps
+// running a read-only, bounded phase that returns no conflict block.
+func (ps *PebbleStore) SetDeclaredContradictionMark(ctx context.Context, wsPrefix [8]byte, mark byte) error {
+	if mark == DeclaredContradictionNone {
+		if cur, known, err := ps.DeclaredContradictionMark(ctx, wsPrefix); err == nil && known && cur == DeclaredContradictionYes {
+			return nil
+		}
+	}
+	if err := ps.db.Set(keys.DeclaredContradictionMarkKey(wsPrefix), []byte{mark}, pebble.NoSync); err != nil {
+		return fmt.Errorf("SetDeclaredContradictionMark: %w", err)
+	}
+	return nil
+}
+
+// DeleteDeclaredContradictionMark returns the vault to the UNKNOWN state.
+//
+// The only legitimate callers are vault teardown (ClearVault, so a reused vault
+// name does not inherit a stranger's marker) and tests that need to exercise
+// the unknown path. It is NOT a way to say "this vault is clean now" — that is
+// what SetDeclaredContradictionMark's monotonicity refuses, and deleting is
+// the safe direction only because UNKNOWN makes the recall gate do MORE work,
+// not less.
+func (ps *PebbleStore) DeleteDeclaredContradictionMark(ctx context.Context, wsPrefix [8]byte) error {
+	if err := ps.db.Delete(keys.DeclaredContradictionMarkKey(wsPrefix), pebble.NoSync); err != nil {
+		return fmt.Errorf("DeleteDeclaredContradictionMark: %w", err)
+	}
+	return nil
 }
 
 // DeclaredContradictionScan is the result of looking for explicit "contradicts"

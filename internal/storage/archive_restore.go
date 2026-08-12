@@ -135,6 +135,13 @@ func (ps *PebbleStore) RestoreArchivedEdges(ctx context.Context, ws [8]byte, src
 		binary.BigEndian.PutUint32(wBuf[:], math.Float32bits(restoreW))
 		_ = batch.Set(wKey, wBuf[:], nil)
 
+		// Restoring an archived `contradicts` edge makes it live again, so the
+		// vault's COG-29 marker has to come back with it — the marker is not
+		// cleared on archival, but a vault whose only contradicts edges were
+		// archived before this marker existed would be marked clean by the v6
+		// backfill (which scans live 0x03 keys only).
+		MarkDeclaredContradictionInBatch(batch, ws, c.relType)
+
 		// Delete from 0x25 archive.
 		archKey := keys.ArchiveAssocKey(ws, srcID, c.dst)
 		_ = batch.Delete(archKey, nil)

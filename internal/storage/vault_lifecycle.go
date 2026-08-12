@@ -37,6 +37,11 @@ var clearVaultDataPrefixes = []byte{
 	// costs one no-op scan on the next boot and keeps a reused vault name from
 	// inheriting a stranger's "already repaired" claim.
 	prefix.AssocWeightRepairMark,
+	// A cleared vault has no declared contradictions left, but the marker is
+	// sticky and would keep COG-29 running forever on a reused vault name.
+	// Dropping it returns the vault to UNKNOWN, which the recall gate resolves
+	// by probing — the fail-safe direction, at the cost of one bounded scan.
+	prefix.DeclaredContradictionMark,
 }
 
 // ClearVault deletes all data keys for a vault using Pebble range tombstones.

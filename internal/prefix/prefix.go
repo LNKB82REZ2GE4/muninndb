@@ -79,6 +79,13 @@ const (
 	// one-shot watermark is sound because the fixed encoder cannot create new
 	// damage of this kind.
 	AssocWeightRepairMark byte = 0x2E
+	// DeclaredContradictionMark (0x2F) — per-vault O(1) answer to "does this
+	// vault contain ANY declared `contradicts` association?", the fast-path
+	// gate for COG-29 contradiction honesty. Key: 0x2F | ws(8) = 9 bytes.
+	// Value: 1 byte — 0x01 declared (sticky), 0x00 proven clean. ABSENT means
+	// UNKNOWN and must never be read as clean; see keys.DeclaredContradictionMarkKey
+	// and docs/internals/keyspace-registry.md.
+	DeclaredContradictionMark byte = 0x2F
 	// Capability (0x40/0x41 — clean since #612)
 	Capability         byte = 0x40
 	CapabilityVaultIdx byte = 0x41
@@ -164,6 +171,7 @@ var registry = []Entry{
 	{RawTagRange, "storage", "RawTagRange", "vault-scoped-data"},
 	{ProspectiveIntent, "storage", "ProspectiveIntent", "vault-scoped-data"},
 	{AssocWeightRepairMark, "storage", "AssocWeightRepairMark", "vault-scoped-data"},
+	{DeclaredContradictionMark, "storage", "DeclaredContradictionMark", "vault-scoped-data"},
 	{Capability, "capability", "Capability", "capability"},
 	{CapabilityVaultIdx, "capability", "CapabilityVaultIdx", "capability"},
 	{AdminUser, "auth", "AdminUser", "auth"},

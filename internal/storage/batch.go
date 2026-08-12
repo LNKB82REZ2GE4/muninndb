@@ -143,6 +143,7 @@ func (b *pebbleStoreBatch) WriteEngramOpDetails(ctx context.Context, wsPrefix [8
 		var wiBuf [4]byte
 		binary.BigEndian.PutUint32(wiBuf[:], math.Float32bits(assoc.Weight))
 		b.batch.Set(keys.AssocWeightIndexKey(wsPrefix, id16, [16]byte(assoc.TargetID)), wiBuf[:], nil)
+		MarkDeclaredContradictionInBatch(b.batch, wsPrefix, assoc.RelType)
 	}
 
 	// 0x0B: state index
@@ -189,6 +190,7 @@ func (b *pebbleStoreBatch) WriteAssociation(ctx context.Context, ws [8]byte, src
 	var weightBuf [4]byte
 	binary.BigEndian.PutUint32(weightBuf[:], math.Float32bits(assoc.Weight))
 	b.batch.Set(keys.AssocWeightIndexKey(ws, [16]byte(src), [16]byte(dst)), weightBuf[:], nil)
+	MarkDeclaredContradictionInBatch(b.batch, ws, assoc.RelType)
 	return nil
 }
 

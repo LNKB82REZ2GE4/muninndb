@@ -1000,3 +1000,18 @@ func AssocWeightRepairMarkKey(ws [8]byte) []byte {
 	copy(key[1:9], ws[:])
 	return key
 }
+
+// DeclaredContradictionMarkKey constructs the per-vault declared-contradiction
+// marker key (0x2F). Value: one byte — DeclaredContradictionYes (0x01) or
+// DeclaredContradictionNone (0x00). Key: 0x2F | wsPrefix(8) = 9 bytes.
+//
+// The three-state read (yes / none / ABSENT-means-unknown) is the whole point:
+// it is what lets recall answer "may this vault have contradictions?" with one
+// point lookup instead of a keyspace scan, WITHOUT ever turning contradiction
+// honesty off on a vault it has not actually proven clean.
+func DeclaredContradictionMarkKey(ws [8]byte) []byte {
+	key := make([]byte, 1+8)
+	key[0] = prefix.DeclaredContradictionMark
+	copy(key[1:9], ws[:])
+	return key
+}
