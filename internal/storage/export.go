@@ -282,6 +282,11 @@ func (ps *PebbleStore) ImportVaultData(
 		batchCount  int
 		h           interface{ Sum([]byte) []byte } // sha256 hash
 		committed   bool
+		// copiedAssoc records whether any association key landed in the target.
+		// An import writes raw 0x03/0x04 bytes without going through
+		// WriteAssociation, so nothing stages the 0x2F declared-contradiction
+		// marker for them and the target's marker must be reconciled.
+		copiedAssoc bool
 	}
 	var kv *kvState
 
@@ -329,6 +334,7 @@ func (ps *PebbleStore) ImportVaultData(
 
 			var engramCount int64
 			var totalKeys int64
+			copiedAssoc := false
 
 			// skipIDs tracks engram IDs that already exist in the target vault.
 			// All keys associated with a skipped engram ID are omitted from the import.
@@ -457,6 +463,9 @@ func (ps *PebbleStore) ImportVaultData(
 				if strippedKey[0] == prefix.Engram {
 					engramCount++
 				}
+				if strippedKey[0] == prefix.AssocFwd || strippedKey[0] == prefix.AssocRev {
+					copiedAssoc = true
+				}
 				totalKeys++
 				batchCount++
 
@@ -479,6 +488,7 @@ func (ps *PebbleStore) ImportVaultData(
 				batch:       batch,
 				batchCount:  batchCount,
 				h:           h,
+				copiedAssoc: copiedAssoc,
 			}
 
 		case "checksum.txt":
@@ -509,6 +519,14 @@ func (ps *PebbleStore) ImportVaultData(
 			kv.batch.Close()
 			kv.committed = true
 
+			// The import wrote raw association bytes; return the target's 0x2F
+			// marker to UNKNOWN so a pre-import `none` cannot stand over an
+			// imported declared contradiction. There is no source marker to
+			// adopt — 0x2F is not exported.
+			if err := ps.ReconcileDeclaredContradictionMarkAfterBulkCopy(ctx, wsTarget, kv.copiedAssoc, false); err != nil {
+				return nil, fmt.Errorf("import: reconcile contradiction marker: %w", err)
+			}
+
 			// Seed the in-memory vault counter.
 			vc := ps.getOrInitCounter(ctx, wsTarget)
 			vc.count.Store(kv.engramCount)
@@ -527,6 +545,11 @@ func (ps *PebbleStore) ImportVaultData(
 			}
 		}
 		kv.batch.Close()
+
+		// See above: imported association bytes invalidate any prior verdict.
+		if err := ps.ReconcileDeclaredContradictionMarkAfterBulkCopy(ctx, wsTarget, kv.copiedAssoc, false); err != nil {
+			return nil, fmt.Errorf("import: reconcile contradiction marker: %w", err)
+		}
 
 		// Seed the in-memory vault counter.
 		vc := ps.getOrInitCounter(ctx, wsTarget)

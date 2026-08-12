@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -125,9 +126,12 @@ func (ps *PebbleStore) WriteAssociation(ctx context.Context, wsPrefix [8]byte, s
 	binary.BigEndian.PutUint32(weightBuf[:], math.Float32bits(assoc.Weight))
 	batch.Set(keys.AssocWeightIndexKey(wsPrefix, [16]byte(src), [16]byte(dst)), weightBuf[:], nil)
 
-	MarkDeclaredContradictionInBatch(batch, wsPrefix, assoc.RelType)
+	release := ps.holdDeclaredContradictionMark(wsPrefix,
+		MarkDeclaredContradictionInBatch(batch, wsPrefix, assoc.RelType))
 
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	err := batch.Commit(pebble.NoSync)
+	release()
+	if err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
 	ps.replicateBatch(batch)
@@ -1196,11 +1200,74 @@ func AssocValueRelType(val []byte) RelType {
 // idempotent (same key, same one-byte value) and monotone: nothing here ever
 // writes `none` — see SetDeclaredContradictionMark for why an edge going away
 // does not clear the marker.
-func MarkDeclaredContradictionInBatch(batch *pebble.Batch, wsPrefix [8]byte, relType RelType) {
+//
+// It reports whether it staged anything. A caller that gets true MUST commit
+// the batch inside PebbleStore.holdDeclaredContradictionMark — staging the
+// marker atomically is not sufficient on its own, because a concurrent `none`
+// write is a check-then-set that could otherwise land between this batch's
+// commit and its own Set. See holdDeclaredContradictionMark.
+func MarkDeclaredContradictionInBatch(batch *pebble.Batch, wsPrefix [8]byte, relType RelType) bool {
 	if relType != RelContradicts {
-		return
+		return false
 	}
 	_ = batch.Set(keys.DeclaredContradictionMarkKey(wsPrefix), []byte{DeclaredContradictionYes}, nil)
+	return true
+}
+
+// holdDeclaredContradictionMark takes the vault's marker READ lock when the
+// caller's batch staged a `yes` marker, returning the release func. When it did
+// not, it is a no-op returning a no-op releaser, so the ~100% of writes that
+// touch no contradicts edge pay nothing beyond the branch.
+//
+// The lock exists to close one interleaving, and only one:
+//
+//	clean probe: Get -> sees not-yes
+//	edge writer:            commits {edge, mark=yes} atomically
+//	clean probe:                                      Set(mark=none)   ← stale clean
+//
+// and a stale clean marker turns COG-29 off for that vault silently and
+// permanently. The read side is held across the COMMIT (not merely the Set into
+// the batch) because the `none` writer's Get can only see a value that has
+// actually committed. With the write lock held across its Get+Set, every
+// contradicts commit is forced to be either fully visible to that Get — which
+// then refuses to demote — or ordered entirely after the Set, which leaves the
+// marker at `yes`. Edge writers never exclude each other: they all write the
+// identical byte.
+//
+// Callers must release AFTER the commit returns, not after Set.
+func (ps *PebbleStore) holdDeclaredContradictionMark(wsPrefix [8]byte, staged bool) (release func()) {
+	if !staged {
+		return func() {}
+	}
+	mu := ps.declaredContradictionLocks.For(wsPrefix[:])
+	mu.RLock()
+	return mu.RUnlock
+}
+
+// holdDeclaredContradictionMarks is holdDeclaredContradictionMark for a batch
+// that staged markers for more than one vault (the multi-engram write path).
+// Each vault is locked at most once — a second RLock on the same stripe while
+// a `none` writer is queued on it would deadlock against itself.
+func (ps *PebbleStore) holdDeclaredContradictionMarks(marked map[[8]byte]struct{}) (release func()) {
+	if len(marked) == 0 {
+		return func() {}
+	}
+	seen := make(map[*sync.RWMutex]struct{}, len(marked))
+	held := make([]*sync.RWMutex, 0, len(marked))
+	for ws := range marked {
+		mu := ps.declaredContradictionLocks.For(ws[:])
+		if _, dup := seen[mu]; dup {
+			continue // same stripe, already held
+		}
+		seen[mu] = struct{}{}
+		mu.RLock()
+		held = append(held, mu)
+	}
+	return func() {
+		for _, mu := range held {
+			mu.RUnlock()
+		}
+	}
 }
 
 // DeclaredContradictionMark reports the vault's O(1) declared-contradiction
@@ -1234,6 +1301,14 @@ func (ps *PebbleStore) DeclaredContradictionMark(ctx context.Context, wsPrefix [
 // running a read-only, bounded phase that returns no conflict block.
 func (ps *PebbleStore) SetDeclaredContradictionMark(ctx context.Context, wsPrefix [8]byte, mark byte) error {
 	if mark == DeclaredContradictionNone {
+		// Check-then-set, under the vault's EXCLUSIVE marker lock: without it
+		// an edge writer can commit {edge, yes} between this Get and the Set
+		// below, and the Set would then silently demote a vault that durably
+		// contains a declared contradiction. See holdDeclaredContradictionMark
+		// for the interleaving and for the read side of this protocol.
+		mu := ps.declaredContradictionLocks.For(wsPrefix[:])
+		mu.Lock()
+		defer mu.Unlock()
 		if cur, known, err := ps.DeclaredContradictionMark(ctx, wsPrefix); err == nil && known && cur == DeclaredContradictionYes {
 			return nil
 		}
@@ -1242,6 +1317,43 @@ func (ps *PebbleStore) SetDeclaredContradictionMark(ctx context.Context, wsPrefi
 		return fmt.Errorf("SetDeclaredContradictionMark: %w", err)
 	}
 	return nil
+}
+
+// ReconcileDeclaredContradictionMarkAfterBulkCopy fixes up the TARGET vault's
+// marker after a bulk key copy (vault merge, clone, or archive import) moved
+// association keys into it.
+//
+// Bulk copies move raw 0x03/0x04 bytes; they never call WriteAssociation, so
+// nothing stages the 0x2F marker. Without this, merging a source that contains
+// a declared `contradicts` edge into a target previously proven clean leaves
+// the target's `none` marker standing over a durable contradiction — and COG-29
+// is then skipped on that vault forever, silently. That is the failure class
+// the whole marker exists to prevent, arriving through the back door.
+//
+// The rule is deliberately blunt, because a bulk copy is rare and being wrong
+// here is unrecoverable-by-observation:
+//
+//   - copiedAssociations == false → nothing changed; leave the target alone.
+//   - sourceDeclared → set the target to `yes`.
+//   - otherwise → DELETE the target's marker, returning it to UNKNOWN.
+//
+// The last case is the important one and is why this is not "copy the source's
+// marker". A source marked `none`, or carrying no marker at all, is not
+// evidence about the TARGET's post-merge contents: the source may itself be
+// UNKNOWN (never scanned, or scanned past the cap), and its edges are now the
+// target's edges. UNKNOWN makes the recall gate do MORE work — it probes, and
+// persists its own verdict — which is the only safe direction. It is the same
+// fail-safe ClearVault uses.
+func (ps *PebbleStore) ReconcileDeclaredContradictionMarkAfterBulkCopy(
+	ctx context.Context, wsTarget [8]byte, copiedAssociations, sourceDeclared bool,
+) error {
+	if !copiedAssociations {
+		return nil
+	}
+	if sourceDeclared {
+		return ps.SetDeclaredContradictionMark(ctx, wsTarget, DeclaredContradictionYes)
+	}
+	return ps.DeleteDeclaredContradictionMark(ctx, wsTarget)
 }
 
 // DeleteDeclaredContradictionMark returns the vault to the UNKNOWN state.

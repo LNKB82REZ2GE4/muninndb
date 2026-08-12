@@ -34,6 +34,22 @@ type pebbleStoreBatch struct {
 	// stateUpdatedIDs tracks engrams whose state was changed by UpdateEngramState.
 	// Their cache entries are invalidated in Commit after the batch flushes to Pebble.
 	stateUpdatedIDs []stateUpdate
+	// markedContradictionWS holds the vaults for which this batch staged a 0x2F
+	// `yes` marker. Unlike the immediate-commit paths, this batch's Set and its
+	// Commit are separated in time, so the marker read lock can only be taken
+	// at Commit — see PebbleStore.holdDeclaredContradictionMarks.
+	markedContradictionWS map[[8]byte]struct{}
+}
+
+// noteContradictionMarked records that the batch staged a marker for ws.
+func (b *pebbleStoreBatch) noteContradictionMarked(ws [8]byte, staged bool) {
+	if !staged {
+		return
+	}
+	if b.markedContradictionWS == nil {
+		b.markedContradictionWS = make(map[[8]byte]struct{}, 1)
+	}
+	b.markedContradictionWS[ws] = struct{}{}
 }
 
 // batchPendingItem holds the data required for post-commit vault counter and
@@ -143,7 +159,7 @@ func (b *pebbleStoreBatch) WriteEngramOpDetails(ctx context.Context, wsPrefix [8
 		var wiBuf [4]byte
 		binary.BigEndian.PutUint32(wiBuf[:], math.Float32bits(assoc.Weight))
 		b.batch.Set(keys.AssocWeightIndexKey(wsPrefix, id16, [16]byte(assoc.TargetID)), wiBuf[:], nil)
-		MarkDeclaredContradictionInBatch(b.batch, wsPrefix, assoc.RelType)
+		b.noteContradictionMarked(wsPrefix, MarkDeclaredContradictionInBatch(b.batch, wsPrefix, assoc.RelType))
 	}
 
 	// 0x0B: state index
@@ -190,7 +206,7 @@ func (b *pebbleStoreBatch) WriteAssociation(ctx context.Context, ws [8]byte, src
 	var weightBuf [4]byte
 	binary.BigEndian.PutUint32(weightBuf[:], math.Float32bits(assoc.Weight))
 	b.batch.Set(keys.AssocWeightIndexKey(ws, [16]byte(src), [16]byte(dst)), weightBuf[:], nil)
-	MarkDeclaredContradictionInBatch(b.batch, ws, assoc.RelType)
+	b.noteContradictionMarked(ws, MarkDeclaredContradictionInBatch(b.batch, ws, assoc.RelType))
 	return nil
 }
 
@@ -330,8 +346,11 @@ func (b *pebbleStoreBatch) Commit() error {
 	if b.ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
-	if err := b.batch.Commit(syncOption); err != nil {
-		return fmt.Errorf("batch commit: %w", err)
+	releaseMarks := b.ps.holdDeclaredContradictionMarks(b.markedContradictionWS)
+	commitErr := b.batch.Commit(syncOption)
+	releaseMarks()
+	if commitErr != nil {
+		return fmt.Errorf("batch commit: %w", commitErr)
 	}
 
 	// Invalidate L1 cache entries for all engrams whose state was updated.

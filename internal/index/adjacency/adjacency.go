@@ -127,6 +127,14 @@ func (g *Graph) WriteAssociation(ws [8]byte, src [16]byte, assoc *storage.Associ
 	batch.Set(fwdKey, val, nil)
 	batch.Set(revKey, val, nil)
 	// Same batch as the edge — see storage.MarkDeclaredContradictionInBatch.
+	//
+	// This writer does NOT take the marker read lock that the storage-package
+	// writers hold across their commits, because the lock lives on PebbleStore
+	// and this package holds only a raw *pebble.DB. That is sound ONLY because
+	// nothing in the binary constructs an adjacency.Graph — the package is
+	// reachable from its own tests alone. If it is ever wired into a live write
+	// path it must route through storage.PebbleStore instead, or a concurrent
+	// clean-probe can demote the marker it just set.
 	storage.MarkDeclaredContradictionInBatch(batch, ws, assoc.RelType)
 
 	return batch.Commit(pebble.NoSync)

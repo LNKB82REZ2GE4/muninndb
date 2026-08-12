@@ -114,6 +114,7 @@ func (ps *PebbleStore) RestoreArchivedEdges(ctx context.Context, ws [8]byte, src
 	defer batch.Close()
 
 	var restoredDsts [][16]byte
+	markedContradiction := false
 	for _, c := range candidates {
 		restoreW := c.restoreWeight
 
@@ -140,7 +141,9 @@ func (ps *PebbleStore) RestoreArchivedEdges(ctx context.Context, ws [8]byte, src
 		// cleared on archival, but a vault whose only contradicts edges were
 		// archived before this marker existed would be marked clean by the v6
 		// backfill (which scans live 0x03 keys only).
-		MarkDeclaredContradictionInBatch(batch, ws, c.relType)
+		if MarkDeclaredContradictionInBatch(batch, ws, c.relType) {
+			markedContradiction = true
+		}
 
 		// Delete from 0x25 archive.
 		archKey := keys.ArchiveAssocKey(ws, srcID, c.dst)
@@ -149,8 +152,11 @@ func (ps *PebbleStore) RestoreArchivedEdges(ctx context.Context, ws [8]byte, src
 		restoredDsts = append(restoredDsts, c.dst)
 	}
 
-	if err := batch.Commit(pebble.NoSync); err != nil {
-		return nil, err
+	releaseMark := ps.holdDeclaredContradictionMark(ws, markedContradiction)
+	commitErr := batch.Commit(pebble.NoSync)
+	releaseMark()
+	if commitErr != nil {
+		return nil, commitErr
 	}
 	ps.replicateBatch(batch)
 

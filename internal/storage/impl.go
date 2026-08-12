@@ -86,6 +86,13 @@ type PebbleStore struct {
 	// casLocks serialises the read-compare-write of CompareAndSet per engram,
 	// closing the lifecycle-state TOCTOU and backing the ownership lease.
 	casLocks stripedMutex
+	// declaredContradictionLocks serialises the ONE read-modify-write on the
+	// 0x2F declared-contradiction marker (SetDeclaredContradictionMark's `none`
+	// path, which is check-then-set) against the edge writers that set `yes`.
+	// Edge writers take the READ side around their batch commit — they never
+	// conflict with each other — so the hot path pays an uncontended RLock and
+	// only the rare `none` write excludes.
+	declaredContradictionLocks stripedRWMutex
 	// archiveBloom is an in-memory Bloom filter over src engram IDs that have
 	// archived associations in the 0x25 namespace. Gates the 0x25 prefix scan
 	// during BFS traversal: if the filter says "no," skip the scan entirely.
@@ -316,6 +323,7 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	}
 
 	// 0x03/0x04/weight-index: association keys
+	markedContradiction := false
 	for _, assoc := range eng.Associations {
 		// Seed PeakWeight from Weight if not set (legacy or newly created associations).
 		peak := assoc.PeakWeight
@@ -328,7 +336,9 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 		var wiBuf [4]byte
 		binary.BigEndian.PutUint32(wiBuf[:], math.Float32bits(assoc.Weight))
 		batch.Set(keys.AssocWeightIndexKey(wsPrefix, [16]byte(eng.ID), [16]byte(assoc.TargetID)), wiBuf[:], nil)
-		MarkDeclaredContradictionInBatch(batch, wsPrefix, assoc.RelType)
+		if MarkDeclaredContradictionInBatch(batch, wsPrefix, assoc.RelType) {
+			markedContradiction = true
+		}
 	}
 
 	// 0x0B: state index
@@ -366,8 +376,11 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	if ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
-	if err := batch.Commit(syncOption); err != nil {
-		return ULID{}, fmt.Errorf("commit batch: %w", err)
+	releaseMark := ps.holdDeclaredContradictionMark(wsPrefix, markedContradiction)
+	commitErr := batch.Commit(syncOption)
+	releaseMark()
+	if commitErr != nil {
+		return ULID{}, fmt.Errorf("commit batch: %w", commitErr)
 	}
 
 	ps.replicateBatch(batch)
@@ -439,6 +452,10 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 
 	batch := ps.db.NewBatch()
 	defer batch.Close()
+
+	// Vaults for which this batch staged a declared-contradiction marker; each
+	// must be read-locked across the commit (see holdDeclaredContradictionMarks).
+	var markedContradictionWS map[[8]byte]struct{}
 
 	for i := range items {
 		eng := items[i].Engram
@@ -528,7 +545,12 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 			var wiBuf [4]byte
 			binary.BigEndian.PutUint32(wiBuf[:], math.Float32bits(assoc.Weight))
 			batch.Set(keys.AssocWeightIndexKey(ws, id16, [16]byte(assoc.TargetID)), wiBuf[:], nil)
-			MarkDeclaredContradictionInBatch(batch, ws, assoc.RelType)
+			if MarkDeclaredContradictionInBatch(batch, ws, assoc.RelType) {
+				if markedContradictionWS == nil {
+					markedContradictionWS = make(map[[8]byte]struct{}, 1)
+				}
+				markedContradictionWS[ws] = struct{}{}
+			}
 		}
 
 		batch.Set(keys.StateIndexKey(ws, uint8(eng.State), id16), []byte{}, nil)
@@ -564,7 +586,10 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 	if ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
-	if commitErr := batch.Commit(syncOption); commitErr != nil {
+	releaseMarks := ps.holdDeclaredContradictionMarks(markedContradictionWS)
+	commitErr := batch.Commit(syncOption)
+	releaseMarks()
+	if commitErr != nil {
 		for i := range errs {
 			if errs[i] == nil {
 				errs[i] = fmt.Errorf("commit batch: %w", commitErr)

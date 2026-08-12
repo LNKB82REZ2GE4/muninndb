@@ -82,6 +82,9 @@ func (ps *PebbleStore) CloneVaultData(
 	}
 
 	var copiedEngrams int64
+	// Whether phase 2 moved any association key into the target — the trigger
+	// for reconciling the target's declared-contradiction marker (0x2F).
+	copiedAssociations := false
 
 	// ---- Phase 1: Copy engrams (0x01) with ERF decode → reset → re-encode ----
 	{
@@ -216,6 +219,9 @@ func (ps *PebbleStore) CloneVaultData(
 			copy(rawVal, iter.Value())
 
 			batch.Set(newKey, rawVal, nil)
+			if p == prefix.AssocFwd || p == prefix.AssocRev {
+				copiedAssociations = true
+			}
 			batchCount++
 
 			if batchCount >= cloneBatchSize {
@@ -261,6 +267,20 @@ func (ps *PebbleStore) CloneVaultData(
 		return copiedEngrams, fmt.Errorf("clone: reset coherence: %w", err)
 	}
 
+	// ---- Phase 6: Reconcile the target's declared-contradiction marker ----
+	// The copy moved raw association bytes; nothing staged the 0x2F marker for
+	// them. If the source is known to hold a declared contradiction the target
+	// now does too; otherwise the target goes UNKNOWN and the recall gate
+	// re-derives it. Never leave a `none` marker standing over imported edges.
+	srcMark, srcKnown, markErr := ps.DeclaredContradictionMark(ctx, wsSource)
+	if markErr != nil {
+		return copiedEngrams, fmt.Errorf("clone: read source contradiction marker: %w", markErr)
+	}
+	if err := ps.ReconcileDeclaredContradictionMarkAfterBulkCopy(ctx, wsTarget,
+		copiedAssociations, srcKnown && srcMark == DeclaredContradictionYes); err != nil {
+		return copiedEngrams, fmt.Errorf("clone: reconcile contradiction marker: %w", err)
+	}
+
 	return copiedEngrams, nil
 }
 
@@ -288,6 +308,9 @@ func (ps *PebbleStore) MergeVaultData(
 	}
 
 	var mergedEngrams int64
+	// See CloneVaultData: a bulk copy moves raw 0x03/0x04 bytes and never calls
+	// WriteAssociation, so the target's 0x2F marker has to be reconciled by hand.
+	copiedAssociations := false
 
 	// ---- Phase 1: Merge engrams (0x01) with collision detection ----
 	{
@@ -468,6 +491,9 @@ func (ps *PebbleStore) MergeVaultData(
 			copy(rawVal, iter.Value())
 
 			batch.Set(newKey, rawVal, nil)
+			if p == prefix.AssocFwd || p == prefix.AssocRev {
+				copiedAssociations = true
+			}
 			batchCount++
 
 			if batchCount >= cloneBatchSize {
@@ -522,6 +548,20 @@ func (ps *PebbleStore) MergeVaultData(
 	// Update in-memory counter.
 	vc := ps.getOrInitCounter(ctx, wsTarget)
 	vc.count.Store(newTotal)
+
+	// ---- Phase 5: Reconcile the target's declared-contradiction marker ----
+	// UNION-copying 0x03/0x04 can hand the target a declared `contradicts` edge
+	// while its marker still says `none` from before the merge, which turns
+	// COG-29 off on a vault that durably contains a contradiction. See
+	// ReconcileDeclaredContradictionMarkAfterBulkCopy.
+	srcMark, srcKnown, markErr := ps.DeclaredContradictionMark(ctx, wsSource)
+	if markErr != nil {
+		return mergedEngrams, fmt.Errorf("merge: read source contradiction marker: %w", markErr)
+	}
+	if err := ps.ReconcileDeclaredContradictionMarkAfterBulkCopy(ctx, wsTarget,
+		copiedAssociations, srcKnown && srcMark == DeclaredContradictionYes); err != nil {
+		return mergedEngrams, fmt.Errorf("merge: reconcile contradiction marker: %w", err)
+	}
 
 	return mergedEngrams, nil
 }
