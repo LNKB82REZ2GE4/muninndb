@@ -14,11 +14,22 @@ import (
 	"github.com/scrypster/muninndb/internal/plugin"
 )
 
+// Cloud-tuned defaults, used whenever ProviderHTTPConfig leaves Timeout/
+// MaxBatchSize at zero. A self-hosted OpenAI-compatible endpoint (e.g. a local
+// GPU embedder) can override both via MUNINN_OPENAI_EMBED_TIMEOUT and
+// MUNINN_OPENAI_EMBED_MAX_BATCH (see cmd/muninn/server.go buildEmbedder).
+const (
+	defaultOpenAITimeout      = 10 * time.Second
+	defaultOpenAIMaxBatchSize = 2048
+)
+
 type OpenAIProvider struct {
-	client  *http.Client
-	baseURL string
-	model   string
-	apiKey  string
+	client       *http.Client
+	baseURL      string
+	model        string
+	apiKey       string
+	timeout      time.Duration
+	maxBatchSize int
 }
 
 type openAIEmbedRequest struct {
@@ -48,7 +59,20 @@ func (p *OpenAIProvider) Init(ctx context.Context, cfg ProviderHTTPConfig) (int,
 		return 0, fmt.Errorf("API authentication failed — check MUNINNDB_EMBED_API_KEY")
 	}
 
-	// Create HTTP client with 10s timeout (cloud)
+	p.timeout = cfg.HTTPTimeout
+	if p.timeout <= 0 {
+		p.timeout = defaultOpenAITimeout
+	}
+	p.maxBatchSize = cfg.MaxBatchSize
+	if p.maxBatchSize <= 0 {
+		p.maxBatchSize = defaultOpenAIMaxBatchSize
+	}
+	slog.Info("openai embed provider HTTP config resolved",
+		"base_url", p.baseURL, "timeout", p.timeout, "max_batch_size", p.maxBatchSize)
+
+	// Create HTTP client. Timeout defaults to the cloud-tuned 10s but is
+	// overridable (MUNINN_OPENAI_EMBED_TIMEOUT) for self-hosted endpoints that
+	// need longer, e.g. a GPU embedder processing a large batch.
 	transport := &http.Transport{
 		MaxIdleConns:        10,
 		MaxIdleConnsPerHost: 10,
@@ -56,12 +80,12 @@ func (p *OpenAIProvider) Init(ctx context.Context, cfg ProviderHTTPConfig) (int,
 		TLSHandshakeTimeout: 10 * time.Second,
 	}
 	p.client = &http.Client{
-		Timeout:   10 * time.Second,
+		Timeout:   p.timeout,
 		Transport: plugin.WrapTransport(transport),
 	}
 
 	// Embed probe text to detect dimension
-	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, p.timeout)
 	defer cancel()
 
 	reqBody, _ := json.Marshal(openAIEmbedRequest{
@@ -124,13 +148,12 @@ func (p *OpenAIProvider) EmbedBatch(ctx context.Context, texts []string) ([]floa
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("openai embed: %w", err)
+		return nil, providerTransportError("openai", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("OpenAI returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		return nil, providerHTTPError("openai", resp)
 	}
 
 	var openaiResp openAIEmbedResponse
@@ -151,8 +174,10 @@ func (p *OpenAIProvider) EmbedBatch(ctx context.Context, texts []string) ([]floa
 }
 
 func (p *OpenAIProvider) MaxBatchSize() int {
-	// OpenAI supports batch embedding
-	return 2048
+	if p.maxBatchSize > 0 {
+		return p.maxBatchSize
+	}
+	return defaultOpenAIMaxBatchSize
 }
 
 func (p *OpenAIProvider) Close() error {

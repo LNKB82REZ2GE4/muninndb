@@ -44,6 +44,15 @@ type ProviderHTTPConfig struct {
 	LocalTokenizerPath string // path to its HuggingFace tokenizer.json
 	LocalPooling       string // "cls" (default) or "mean"
 	LocalMaxTokens     int    // max sequence length; 0 = provider default
+
+	// HTTPTimeout and MaxBatchSize override an HTTP provider's cloud-tuned
+	// defaults (currently honored by OpenAIProvider only) for self-hosted
+	// OpenAI-compatible endpoints — e.g. a local GPU embedder that answers a
+	// 1000-text batch in ~110s, far past the 10s cloud default. Zero means
+	// "use the provider's built-in default"; a provider must never silently
+	// substitute a different value for one the operator explicitly set.
+	HTTPTimeout  time.Duration
+	MaxBatchSize int
 }
 
 // EmbedService implements plugin.EmbedPlugin.
@@ -140,6 +149,8 @@ func (s *EmbedService) Init(ctx context.Context, cfg plugin.PluginConfig) error 
 		LocalTokenizerPath: cfg.LocalTokenizerPath,
 		LocalPooling:       cfg.LocalPooling,
 		LocalMaxTokens:     cfg.LocalMaxTokens,
+		HTTPTimeout:        cfg.HTTPTimeout,
+		MaxBatchSize:       cfg.MaxBatchSize,
 	}
 
 	slog.Info("initializing embed provider",

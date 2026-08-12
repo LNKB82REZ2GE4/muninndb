@@ -34,7 +34,9 @@ func buildEnvFileContent(embedProvider, enrichURL string) string {
 	allEmbed := []embedEntry{
 		{"ollama", "MUNINN_OLLAMA_URL", "ollama://localhost:11434/nomic-embed-text"},
 		{"openai", "MUNINN_OPENAI_KEY", "sk-..."},
-		{"openai", "MUNINN_OPENAI_URL", ""}, // optional, always commented
+		{"openai", "MUNINN_OPENAI_URL", ""},                 // optional, always commented
+		{"openai", "MUNINN_OPENAI_EMBED_TIMEOUT", "120s"},   // optional, self-hosted endpoints only, always commented
+		{"openai", "MUNINN_OPENAI_EMBED_MAX_BATCH", "1000"}, // optional, self-hosted endpoints only, always commented
 		{"voyage", "MUNINN_VOYAGE_KEY", "pa-..."},
 		{"cohere", "MUNINN_COHERE_KEY", "..."},
 		{"google", "MUNINN_GOOGLE_KEY", "..."},
@@ -45,7 +47,8 @@ func buildEnvFileContent(embedProvider, enrichURL string) string {
 	for _, e := range allEmbed {
 		active := embedProvider == e.provider
 		// These vars are always written commented regardless of selection.
-		if e.varName == "MUNINN_OPENAI_URL" || e.varName == "MUNINN_LOCAL_EMBED" {
+		if e.varName == "MUNINN_OPENAI_URL" || e.varName == "MUNINN_LOCAL_EMBED" ||
+			e.varName == "MUNINN_OPENAI_EMBED_TIMEOUT" || e.varName == "MUNINN_OPENAI_EMBED_MAX_BATCH" {
 			active = false
 		}
 		val := embedderDefaultValue[e.provider]

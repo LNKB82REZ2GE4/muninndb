@@ -255,6 +255,44 @@ func resolveOpenAIEmbedProviderURL(raw string) (string, error) {
 	return providerURL, nil
 }
 
+// openAIEmbedHTTPConfig carries the resolved (possibly overridden) HTTP
+// tuning for the OpenAI-compatible embed provider.
+type openAIEmbedHTTPConfig struct {
+	Timeout      time.Duration
+	MaxBatchSize int
+}
+
+// resolveOpenAIEmbedHTTPConfig reads MUNINN_OPENAI_EMBED_TIMEOUT (a
+// time.ParseDuration string, e.g. "120s") and MUNINN_OPENAI_EMBED_MAX_BATCH
+// (a positive integer) so a self-hosted OpenAI-compatible endpoint can raise
+// the cloud-tuned 10s / 2048 defaults. Unset vars leave the corresponding
+// field zero (provider default). A set-but-unparseable-or-non-positive value
+// is reported as invalid so the caller can refuse to start the OpenAI
+// embedder rather than silently keep the cloud default the operator meant to
+// override — an explicit config must be honored or fail loudly, never
+// silently substituted.
+func resolveOpenAIEmbedHTTPConfig(timeoutVar, maxBatchVar string) (cfg openAIEmbedHTTPConfig, invalid bool) {
+	if s := strings.TrimSpace(os.Getenv(timeoutVar)); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil || d <= 0 {
+			slog.Error("invalid embed HTTP timeout override, OpenAI embedder disabled",
+				"env_var", timeoutVar, "value", s, "error", err)
+			return openAIEmbedHTTPConfig{}, true
+		}
+		cfg.Timeout = d
+	}
+	if s := strings.TrimSpace(os.Getenv(maxBatchVar)); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n <= 0 {
+			slog.Error("invalid embed max batch size override, OpenAI embedder disabled",
+				"env_var", maxBatchVar, "value", s, "error", err)
+			return openAIEmbedHTTPConfig{}, true
+		}
+		cfg.MaxBatchSize = n
+	}
+	return cfg, false
+}
+
 func sanitizeProviderURLForLog(providerURL string) string {
 	parsed, err := neturl.Parse(providerURL)
 	if err != nil {
@@ -338,6 +376,9 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 		jinaKey    = "MUNINN_JINA_KEY"
 		mistralKey = "MUNINN_MISTRAL_KEY"
 		localEmbed = "MUNINN_LOCAL_EMBED"
+
+		openaiEmbedTimeout  = "MUNINN_OPENAI_EMBED_TIMEOUT"
+		openaiEmbedMaxBatch = "MUNINN_OPENAI_EMBED_MAX_BATCH"
 	)
 
 	openAIEnvOverride := strings.TrimSpace(os.Getenv(openaiURL))
@@ -348,6 +389,14 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 			slog.Warn("invalid OpenAI URL override detected, OpenAI embedder disabled", "env_var", openaiURL, "error", err)
 		}
 	}
+
+	// MUNINN_OPENAI_EMBED_TIMEOUT / MUNINN_OPENAI_EMBED_MAX_BATCH override the
+	// OpenAI-compatible provider's cloud-tuned 10s / 2048 defaults — needed for
+	// a self-hosted endpoint (e.g. a local GPU embedder) that can't answer a
+	// large batch inside 10s. Explicit-but-invalid values disable the OpenAI
+	// embedder outright (never silently fall back to the cloud default): a
+	// misconfigured timeout must not quietly change the deployment's behavior.
+	openAIHTTPCfg, openAIHTTPCfgInvalid := resolveOpenAIEmbedHTTPConfig(openaiEmbedTimeout, openaiEmbedMaxBatch)
 
 	// User-supplied local ONNX model configuration (issue #583), validated up
 	// front: an explicit misconfiguration fails startup rather than being
@@ -409,13 +458,14 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 
 	// 1. Env var: OpenAI
 	if key := os.Getenv(openaiKey); key != "" {
-		if !openAIEnvOverrideInvalid {
+		if !openAIEnvOverrideInvalid && !openAIHTTPCfgInvalid {
 			openaiProviderURL, err := resolveOpenAIEmbedProviderURL(openAIEnvOverride)
 			if err != nil {
 				slog.Warn("failed to resolve OpenAI provider URL, skipping OpenAI embedder", "error", err)
 			} else {
 				slog.Info("initializing OpenAI embedder", openAIEmbedLogAttrs(openaiProviderURL)...)
-				if svc := tryEmbedService(openaiProviderURL, plugin.PluginConfig{APIKey: key}); svc != nil {
+				pcfg := plugin.PluginConfig{APIKey: key, HTTPTimeout: openAIHTTPCfg.Timeout, MaxBatchSize: openAIHTTPCfg.MaxBatchSize}
+				if svc := tryEmbedService(openaiProviderURL, pcfg); svc != nil {
 					return embedpkg.NewEmbedServiceAdapter(svc), svc, nil
 				}
 			}
@@ -530,6 +580,11 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 				slog.Warn("invalid OpenAI URL override is set, skipping OpenAI embedder from saved config", "env_var", openaiURL)
 				break
 			}
+			if openAIHTTPCfgInvalid {
+				slog.Warn("invalid OpenAI embed HTTP config is set, skipping OpenAI embedder from saved config",
+					"timeout_env_var", openaiEmbedTimeout, "max_batch_env_var", openaiEmbedMaxBatch)
+				break
+			}
 			openaiSource := cfg.EmbedURL
 			if openAIEnvOverride != "" {
 				openaiSource = openAIEnvOverride
@@ -544,7 +599,8 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 				break
 			}
 			slog.Info("initializing OpenAI embedder from saved config", openAIEmbedLogAttrs(openaiProviderURL)...)
-			if svc := tryEmbedService(openaiProviderURL, plugin.PluginConfig{APIKey: cfg.EmbedAPIKey}); svc != nil {
+			pcfg := plugin.PluginConfig{APIKey: cfg.EmbedAPIKey, HTTPTimeout: openAIHTTPCfg.Timeout, MaxBatchSize: openAIHTTPCfg.MaxBatchSize}
+			if svc := tryEmbedService(openaiProviderURL, pcfg); svc != nil {
 				return embedpkg.NewEmbedServiceAdapter(svc), svc, nil
 			}
 		case "voyage":
@@ -971,6 +1027,8 @@ func runServer() {
 		fmt.Fprintf(os.Stderr, "  MUNINN_OLLAMA_URL            Ollama embedder base URL (e.g. http://localhost:11434)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_OPENAI_KEY            OpenAI embedder API key\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_OPENAI_URL            Optional OpenAI base URL or provider URL override\n")
+		fmt.Fprintf(os.Stderr, "  MUNINN_OPENAI_EMBED_TIMEOUT  OpenAI-compatible embed HTTP timeout (e.g. 120s; default: 10s cloud default)\n")
+		fmt.Fprintf(os.Stderr, "  MUNINN_OPENAI_EMBED_MAX_BATCH  OpenAI-compatible embed max texts per batch (default: 2048 cloud default)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_VOYAGE_KEY            Voyage embedder API key\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_COHERE_KEY            Cohere embedder API key\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_GOOGLE_KEY            Google Gemini embedder API key\n")

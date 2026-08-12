@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"testing"
+	"time"
 
 	plugincfg "github.com/scrypster/muninndb/internal/config"
 )
@@ -453,6 +454,52 @@ func TestResolveOpenAIEmbedProviderURL(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestResolveOpenAIEmbedHTTPConfig(t *testing.T) {
+	const timeoutVar = "MUNINN_TEST_OPENAI_EMBED_TIMEOUT"
+	const maxBatchVar = "MUNINN_TEST_OPENAI_EMBED_MAX_BATCH"
+
+	tests := []struct {
+		name        string
+		timeout     string
+		maxBatch    string
+		wantTimeout time.Duration
+		wantBatch   int
+		wantInvalid bool
+	}{
+		{name: "both_unset_defaults_to_zero"},
+		{name: "valid_timeout", timeout: "120s", wantTimeout: 120 * time.Second},
+		{name: "valid_max_batch", maxBatch: "1000", wantBatch: 1000},
+		{name: "valid_both", timeout: "90s", maxBatch: "500", wantTimeout: 90 * time.Second, wantBatch: 500},
+		{name: "unparseable_timeout_rejected", timeout: "not-a-duration", wantInvalid: true},
+		{name: "zero_timeout_rejected", timeout: "0s", wantInvalid: true},
+		{name: "negative_timeout_rejected", timeout: "-5s", wantInvalid: true},
+		{name: "unparseable_max_batch_rejected", maxBatch: "not-a-number", wantInvalid: true},
+		{name: "zero_max_batch_rejected", maxBatch: "0", wantInvalid: true},
+		{name: "negative_max_batch_rejected", maxBatch: "-1", wantInvalid: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(timeoutVar, tc.timeout)
+			t.Setenv(maxBatchVar, tc.maxBatch)
+
+			cfg, invalid := resolveOpenAIEmbedHTTPConfig(timeoutVar, maxBatchVar)
+			if invalid != tc.wantInvalid {
+				t.Fatalf("invalid = %v, want %v (cfg=%+v)", invalid, tc.wantInvalid, cfg)
+			}
+			if tc.wantInvalid {
+				return
+			}
+			if cfg.Timeout != tc.wantTimeout {
+				t.Errorf("Timeout = %v, want %v", cfg.Timeout, tc.wantTimeout)
+			}
+			if cfg.MaxBatchSize != tc.wantBatch {
+				t.Errorf("MaxBatchSize = %d, want %d", cfg.MaxBatchSize, tc.wantBatch)
+			}
+		})
 	}
 }
 

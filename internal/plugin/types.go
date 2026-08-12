@@ -26,6 +26,13 @@ type PluginConfig struct {
 	LocalTokenizerPath string // path to its HuggingFace tokenizer.json
 	LocalPooling       string // "cls" (default) or "mean"
 	LocalMaxTokens     int    // max sequence length; 0 = provider default
+
+	// HTTPTimeout and MaxBatchSize override an HTTP embed provider's cloud-tuned
+	// defaults (currently honored by the OpenAI-compatible provider only) — see
+	// embed.ProviderHTTPConfig for why a self-hosted endpoint needs these. Zero
+	// means "use the provider's built-in default".
+	HTTPTimeout  time.Duration
+	MaxBatchSize int
 }
 
 // EnrichmentResult is what the enrich plugin returns for one engram.

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestOpenAIProvider_Init_Success(t *testing.T) {
@@ -105,6 +106,65 @@ func TestOpenAIProvider_MaxBatchSize(t *testing.T) {
 	provider := &OpenAIProvider{}
 	if provider.MaxBatchSize() != 2048 {
 		t.Errorf("expected batch size 2048, got %d", provider.MaxBatchSize())
+	}
+}
+
+func TestOpenAIProvider_MaxBatchSize_Override(t *testing.T) {
+	provider := &OpenAIProvider{}
+	cfg := ProviderHTTPConfig{
+		BaseURL:      "http://127.0.0.1:1", // reserved port, connection refused immediately
+		Model:        "m",
+		APIKey:       "test-key",
+		MaxBatchSize: 1000,
+	}
+	// Init will fail against an unreachable host, but MaxBatchSize is resolved
+	// before the probe request, so the override takes effect regardless.
+	_, _ = provider.Init(context.Background(), cfg)
+	if got := provider.MaxBatchSize(); got != 1000 {
+		t.Errorf("expected overridden batch size 1000, got %d", got)
+	}
+}
+
+// TestOpenAIProvider_Timeout_Override pins the fix for a self-hosted endpoint
+// (e.g. a local GPU embedder) that can't answer within the 10s cloud default:
+// a slow-but-successful response must fail with the default timeout and
+// succeed once MUNINN_OPENAI_EMBED_TIMEOUT-equivalent config raises it.
+func TestOpenAIProvider_Timeout_Override(t *testing.T) {
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // hold the response until the test lets it go
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": []map[string]interface{}{
+				{"embedding": []float32{0.1, 0.2, 0.3}},
+			},
+		})
+	}))
+	defer server.Close()
+	defer close(release)
+
+	provider := &OpenAIProvider{}
+	cfg := ProviderHTTPConfig{
+		BaseURL:     "http://" + server.Listener.Addr().String(),
+		Model:       "m",
+		APIKey:      "test-key",
+		HTTPTimeout: 50 * time.Millisecond,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := provider.Init(context.Background(), cfg)
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected Init to time out against a response held past the configured timeout")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Init did not respect the overridden timeout — it should have failed around 50ms")
 	}
 }
 
