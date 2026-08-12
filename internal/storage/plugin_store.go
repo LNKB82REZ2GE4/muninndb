@@ -57,9 +57,19 @@ func (ps *PebbleStore) CountWithoutFlag(ctx context.Context, flag, skipFlags uin
 	return count, nil
 }
 
-// CountWithFlag returns the number of engrams across all vaults that have the
-// given digest flag bit set. It scans the 0x11 DigestFlags key space directly
-// (a global key space — no vault scope needed).
+// CountWithFlag returns the number of DigestFlags records across the whole
+// store that have the given digest flag bit set. It scans the 0x11
+// DigestFlags key space directly (a global key space — no vault scope
+// needed).
+//
+// WARNING: 0x11 is keyed globally by ULID and is deliberately never cleaned
+// up on ClearVault or a hard delete (see ClearVault's doc comment: "digest
+// flags — globally keyed by ULID — orphans are acceptable"). That means this
+// count can include flags left behind by engrams that no longer exist, and
+// can therefore legitimately exceed a live engram total. Do not compare this
+// against a live-engram count (e.g. Stat's EngramCount) — use
+// CountEngramsWithFlag for that, which can never orphan-inflate because it
+// only counts flags on engrams it can still see in the live keyspace.
 func (ps *PebbleStore) CountWithFlag(ctx context.Context, flag uint8) (int64, error) {
 	lowerBound := []byte{prefix.DigestFlags}
 	upperBound := []byte{prefix.Coherence}
@@ -77,6 +87,55 @@ func (ps *PebbleStore) CountWithFlag(ctx context.Context, flag uint8) (int64, er
 	for valid := iter.First(); valid; valid = iter.Next() {
 		val := iter.Value()
 		if len(val) > 0 && val[0]&flag != 0 {
+			count++
+		}
+	}
+	return count, iter.Error()
+}
+
+// CountEngramsWithFlag returns the number of LIVE engrams (excluding
+// soft-deleted and archived) across all vaults that have the given digest
+// flag bit set. Unlike CountWithFlag, which scans the global 0x11 DigestFlags
+// keyspace directly and can therefore count flags orphaned by ClearVault or a
+// hard delete, this scans live engram records the same way CountWithoutFlag
+// does — so its result can never exceed a live-engram total computed the same
+// way (e.g. CountEngrams). This is what the embed-status API's EmbeddedCount
+// should use: without it, EmbeddedCount could exceed TotalCount and the
+// "indexing" bool would go permanently false while a real backlog was still
+// being processed (the flag comparison `embedded < total` never holds).
+func (ps *PebbleStore) CountEngramsWithFlag(ctx context.Context, flag uint8) (int64, error) {
+	lowerBound := []byte{prefix.Engram}
+	upperBound := []byte{prefix.Meta}
+
+	iter, err := ps.db.NewIter(&pebble.IterOptions{
+		LowerBound: lowerBound,
+		UpperBound: upperBound,
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+
+	var count int64
+	for valid := iter.First(); valid; valid = iter.Next() {
+		k := iter.Key()
+		if len(k) < 25 {
+			continue
+		}
+		var id [16]byte
+		copy(id[:], k[9:25])
+
+		val := make([]byte, len(iter.Value()))
+		copy(val, iter.Value())
+		if erfEng, decErr := erf.Decode(val); decErr == nil {
+			eng := fromERFEngram(erfEng)
+			if eng.State == StateSoftDeleted || eng.State == StateArchived {
+				continue
+			}
+		}
+
+		raw, err := ps.getDigestFlagsRaw(id)
+		if err == nil && raw&flag != 0 {
 			count++
 		}
 	}

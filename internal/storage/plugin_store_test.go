@@ -81,6 +81,73 @@ func TestCountWithFlag(t *testing.T) {
 	}
 }
 
+// TestCountEngramsWithFlag_ExcludesOrphanedFlags pins the fix for a
+// production bug: the embed-status API's EmbeddedCount (backed by
+// CountWithFlag) could exceed TotalCount because 0x11 DigestFlags entries are
+// deliberately never cleaned up when their engram is hard-deleted (see
+// PebbleStore.ClearVault's doc comment). CountEngramsWithFlag must scan the
+// live engram keyspace instead, so a flag orphaned by DeleteEngram is never
+// counted — its result can never exceed a live engram total.
+func TestCountEngramsWithFlag_ExcludesOrphanedFlags(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	ws := store.VaultPrefix("count-engrams-with-flag-vault")
+
+	var ids []ULID
+	for i := 0; i < 3; i++ {
+		id, err := store.WriteEngram(ctx, ws, &Engram{
+			Concept: "concept",
+			Content: "content",
+		})
+		if err != nil {
+			t.Fatalf("WriteEngram[%d]: %v", i, err)
+		}
+		ids = append(ids, id)
+	}
+
+	const flag = uint8(0x02) // DigestEmbed
+	for _, id := range ids {
+		if err := store.SetDigestFlag(ctx, id, flag); err != nil {
+			t.Fatalf("SetDigestFlag: %v", err)
+		}
+	}
+
+	// Hard-delete one flagged engram. Its 0x11 DigestFlags entry is
+	// deliberately left behind (orphans are acceptable per ClearVault) — but
+	// the engram itself is gone.
+	if err := store.DeleteEngram(ctx, ws, ids[0]); err != nil {
+		t.Fatalf("DeleteEngram: %v", err)
+	}
+
+	// CountWithFlag (the old EmbeddedCount source) still counts the orphan:
+	// this is the documented, deliberately-tolerated behavior of the global
+	// flags scan, and is exactly why EmbeddedCount must not use it directly.
+	orphanedCount, err := store.CountWithFlag(ctx, flag)
+	if err != nil {
+		t.Fatalf("CountWithFlag: %v", err)
+	}
+	if orphanedCount != 3 {
+		t.Fatalf("CountWithFlag: got %d, want 3 (includes the orphaned flag) — test assumption broken, re-check ClearVault/DeleteEngram behavior", orphanedCount)
+	}
+
+	// CountEngramsWithFlag must not count the deleted engram's orphaned flag.
+	liveCount, err := store.CountEngramsWithFlag(ctx, flag)
+	if err != nil {
+		t.Fatalf("CountEngramsWithFlag: %v", err)
+	}
+	if liveCount != 2 {
+		t.Errorf("CountEngramsWithFlag: got %d, want 2 (must exclude the orphaned flag)", liveCount)
+	}
+
+	total, err := store.CountEngrams(ctx)
+	if err != nil {
+		t.Fatalf("CountEngrams: %v", err)
+	}
+	if liveCount > total {
+		t.Errorf("CountEngramsWithFlag (%d) must never exceed the live engram total (%d)", liveCount, total)
+	}
+}
+
 // TestFindVaultPrefix writes an engram in a known vault, then calls
 // FindVaultPrefix with the engram's ULID and verifies the correct ws is returned.
 func TestFindVaultPrefix(t *testing.T) {

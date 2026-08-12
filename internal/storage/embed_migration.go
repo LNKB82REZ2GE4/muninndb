@@ -125,6 +125,55 @@ func (ps *PebbleStore) ClearEmbedFlagsForVault(ctx context.Context, ws [8]byte) 
 	return cleared, nil
 }
 
+// ClearEmbedFlagsForEngrams clears the DigestEmbed (0x02) and DigestEmbedFailed
+// (0x80) flags, and deletes any stale 0x18 embedding key, for a specific,
+// caller-supplied list of engram ULIDs. It is the surgical counterpart to
+// ClearEmbedFlagsForVault: when a small, known set of engrams was wrongly
+// stranded with DigestEmbedFailed (e.g. by a batch that got blacklisted
+// wholesale on a single transient failure — see embedBisect in
+// internal/plugin/retroactive.go, added to prevent that from recurring),
+// there is no need to pay for a full vault re-embed to recover them.
+//
+// wsPrefix is only used to compute each engram's embedding key (0x18, which
+// is vault-scoped); the digest flags themselves are global by ULID. Returns
+// the number of engrams whose flags were actually changed.
+func (ps *PebbleStore) ClearEmbedFlagsForEngrams(ctx context.Context, wsPrefix [8]byte, ids []ULID) (int64, error) {
+	const DigestEmbed uint8 = 0x02
+	const DigestEmbedFailed uint8 = 0x80
+	const embedMask uint8 = DigestEmbed | DigestEmbedFailed
+
+	var cleared int64
+	batch := ps.db.NewBatch()
+	defer batch.Close()
+
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return cleared, ctx.Err()
+		}
+
+		raw, err := ps.getDigestFlagsRaw([16]byte(id))
+		noRecord := errors.Is(err, pebble.ErrNotFound)
+		if err != nil && !noRecord {
+			return cleared, fmt.Errorf("clear embed flags: get digest %s: %w", id, err)
+		}
+		if !noRecord && raw&embedMask == 0 {
+			continue // nothing to clear for this engram
+		}
+		raw &^= embedMask
+
+		if err := batch.Set(keys.DigestFlagsKey([16]byte(id)), []byte{raw}, nil); err != nil {
+			return cleared, fmt.Errorf("clear embed flags: batch set %s: %w", id, err)
+		}
+		batch.Delete(keys.EmbeddingKey(wsPrefix, [16]byte(id)), nil)
+		cleared++
+	}
+
+	if err := batch.Commit(pebble.Sync); err != nil {
+		return cleared, fmt.Errorf("clear embed flags: commit: %w", err)
+	}
+	return cleared, nil
+}
+
 // ClearHNSWForVault range-deletes all 0x07 (HNSW node) keys for the given vault.
 func (ps *PebbleStore) ClearHNSWForVault(ws [8]byte) error {
 	wsPlus, err := keys.IncrementWSPrefix(ws)

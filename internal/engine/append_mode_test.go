@@ -142,6 +142,7 @@ func guardedOps(eng *Engine, ap context.Context) map[string]func() error {
 		"StartClone":           func() error { _, e := eng.StartClone(ap, v, "n"); return e },
 		"StartImport":          func() error { _, e := eng.StartImport(ap, v, "", 0, false, nil); return e },
 		"StartReembedVault":    func() error { _, e := eng.StartReembedVault(ap, v, "m"); return e },
+		"RetryEmbedFailed":     func() error { _, e := eng.RetryEmbedFailed(ap, v, []string{id}); return e },
 		"ReindexFTSVault":      func() error { _, e := eng.ReindexFTSVault(ap, v); return e },
 	}
 }

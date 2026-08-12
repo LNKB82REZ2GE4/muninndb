@@ -1067,11 +1067,21 @@ func (e *Engine) WriteIdempotency(ctx context.Context, opID, engramID string) er
 	return e.store.WriteIdempotency(ctx, opID, engramID)
 }
 
-// CountEmbedded returns the count of engrams that have had embeddings generated
-// (i.e. the DigestEmbed flag is set). Returns -1 on error.
+// CountEmbedded returns the count of LIVE engrams that have had embeddings
+// generated (i.e. the DigestEmbed flag is set). Returns -1 on error.
+//
+// Uses CountEngramsWithFlag, not CountWithFlag: the latter scans the global
+// 0x11 DigestFlags keyspace directly, which is never cleaned up on ClearVault
+// or a hard delete (see PebbleStore.ClearVault's doc comment) and can
+// therefore count flags orphaned by engrams that no longer exist. That let
+// EmbeddedCount exceed Stat's live EngramCount in production, which made the
+// embed-status API's `indexing` bool (embedded < total) compute false even
+// with a real, actively-processing backlog. CountEngramsWithFlag scans the
+// live engram keyspace instead, so its result can never exceed a live total
+// computed the same way.
 func (e *Engine) CountEmbedded(ctx context.Context) int64 {
 	const DigestEmbed uint8 = 0x02
-	count, err := e.store.CountWithFlag(ctx, DigestEmbed)
+	count, err := e.store.CountEngramsWithFlag(ctx, DigestEmbed)
 	if err != nil {
 		return -1
 	}

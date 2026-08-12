@@ -74,6 +74,62 @@ func (e *Engine) StartReembedVault(ctx context.Context, vaultName, modelName str
 	return job, nil
 }
 
+// RetryEmbedFailed clears DigestEmbed/DigestEmbedFailed for a caller-supplied
+// set of engram IDs in the named vault and wakes the RetroactiveProcessor so
+// it picks them up on its next pass. Unlike StartReembedVault this is
+// synchronous — the caller-supplied ID list is expected to be small (a
+// targeted recovery, not a whole-vault re-embed), so there is no need for the
+// 202/job pattern.
+func (e *Engine) RetryEmbedFailed(ctx context.Context, vaultName string, ids []string) (int64, error) {
+	if err := e.refuseAppend(ctx); err != nil {
+		return 0, err
+	}
+	if !e.beginVaultOp() {
+		return 0, fmt.Errorf("engine is shutting down")
+	}
+	defer e.endVaultOp()
+
+	names, err := e.store.ListVaultNames()
+	if err != nil {
+		return 0, fmt.Errorf("retry embed failed: list vault names: %w", err)
+	}
+	found := false
+	for _, n := range names {
+		if n == vaultName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return 0, fmt.Errorf("vault %q: %w", vaultName, ErrVaultNotFound)
+	}
+
+	ws := e.store.ResolveVaultPrefix(vaultName)
+
+	parsed := make([]storage.ULID, 0, len(ids))
+	for _, raw := range ids {
+		id, err := storage.ParseULID(raw)
+		if err != nil {
+			return 0, fmt.Errorf("retry embed failed: invalid engram id %q: %w", raw, err)
+		}
+		parsed = append(parsed, id)
+	}
+
+	cleared, err := e.store.ClearEmbedFlagsForEngrams(ctx, ws, parsed)
+	if err != nil {
+		return cleared, fmt.Errorf("retry embed failed: clear flags: %w", err)
+	}
+
+	if fn, ok := e.onWrite.Load().(func()); ok && fn != nil {
+		fn()
+	}
+
+	slog.Info("retry embed failed: flags cleared, RetroactiveProcessor will re-embed in background",
+		"vault", vaultName, "requested", len(ids), "flags_cleared", cleared)
+
+	return cleared, nil
+}
+
 func (e *Engine) runReembed(job *vaultjob.Job, ws [8]byte, vaultName string) {
 	ctx := e.stopCtx
 
