@@ -1,9 +1,11 @@
 package fts
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -454,12 +456,58 @@ func (idx *Index) Search(ctx context.Context, ws [8]byte, query string, topK int
 	for id, n := range numer {
 		results = append(results, ScoredID{ID: id, Score: n / denom})
 	}
-	sortScoredIDs(results)
+	return topKScoredIDs(results, topK), nil
+}
 
-	if topK > 0 && len(results) > topK {
-		results = results[:topK]
+// topKScoredIDs returns the topK highest-scoring entries in descending order,
+// leaving s otherwise unspecified. It exists because the candidate set — one
+// entry per doc matching ANY query term — is a corpus-scale quantity while
+// topK is a handful, so the full O(n log n) sort is itself waste on a large
+// vault: a two-term query over common words on a 137k-engram production vault
+// matches ~10^5 docs to return 30.
+//
+// Selection is a bounded min-heap over the candidates (O(n log k)), so cost
+// scales with how many docs matched, not with how expensive it would be to
+// rank all of them. The returned prefix is fully ordered by the SAME total
+// order sortScoredIDs applies — score descending, ID ascending on a tie — so
+// the result is byte-identical to sorting everything and truncating.
+func topKScoredIDs(s []ScoredID, topK int) []ScoredID {
+	if topK <= 0 || len(s) <= topK {
+		sortScoredIDs(s)
+		return s
 	}
-	return results, nil
+	// heap[0] is the WEAKEST of the topK kept so far under `less` — the one a
+	// better candidate displaces.
+	h := s[:topK]
+	for i := topK/2 - 1; i >= 0; i-- {
+		siftDownScoredIDs(h, i)
+	}
+	for i := topK; i < len(s); i++ {
+		if scoredIDLess(h[0], s[i]) {
+			h[0] = s[i]
+			siftDownScoredIDs(h, 0)
+		}
+	}
+	sortScoredIDs(h)
+	return h
+}
+
+// siftDownScoredIDs restores the min-heap property (weakest at the root) at i.
+func siftDownScoredIDs(h []ScoredID, i int) {
+	for {
+		l, r, weakest := 2*i+1, 2*i+2, i
+		if l < len(h) && scoredIDLess(h[l], h[weakest]) {
+			weakest = l
+		}
+		if r < len(h) && scoredIDLess(h[r], h[weakest]) {
+			weakest = r
+		}
+		if weakest == i {
+			return
+		}
+		h[i], h[weakest] = h[weakest], h[i]
+		i = weakest
+	}
 }
 
 // searchTokenCoverage performs a prefix scan for a single token and
@@ -532,13 +580,33 @@ func (idx *Index) searchTokenCoverage(ws [8]byte, term string, numer map[[16]byt
 	return nil
 }
 
-// sortScoredIDs sorts in descending order by score.
-func sortScoredIDs(s []ScoredID) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j].Score > s[j-1].Score; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
+// scoredIDLess reports whether a ranks BELOW b: lower score first, and on an
+// exact score tie the larger ID.
+//
+// The tie-break is not cosmetic. Candidates are drained from a Go map, whose
+// iteration order is randomised per run, so without it two engrams with
+// identical coverage swapped places between identical queries — a
+// nondeterminism that reached the caller whenever a tie straddled the topK
+// cut. Ranking by ID on a tie is arbitrary but STABLE, which is the property
+// recall's downstream phases (and their tests) need.
+func scoredIDLess(a, b ScoredID) bool {
+	if a.Score != b.Score {
+		return a.Score < b.Score
 	}
+	return bytes.Compare(a.ID[:], b.ID[:]) > 0
+}
+
+// sortScoredIDs sorts strongest-first under scoredIDLess.
+//
+// This was an insertion sort until it was measured as THE cost of recall on a
+// large vault: it is O(n²) in the number of matched docs, and the caller sorts
+// the whole candidate set before truncating to topK. On a 137k-engram
+// production vault a 7-term query matched enough docs that this single call
+// took 20.0s of a 20.2s recall (99.5% of CPU samples) — while the Pebble
+// posting scans that produced the candidates took ~150ms. Prefer
+// topKScoredIDs, which avoids ranking the whole set at all.
+func sortScoredIDs(s []ScoredID) {
+	sort.Slice(s, func(i, j int) bool { return scoredIDLess(s[j], s[i]) })
 }
 
 // FTSStats holds global FTS statistics.
