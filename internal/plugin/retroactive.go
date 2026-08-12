@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"runtime"
 	"sync"
 	"time"
@@ -299,102 +301,101 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 	microEngrams := make([]*Engram, 0, microBatchSize)
 	microTexts := make([]string, 0, microBatchSize)
 
+	// storeEmbedded persists one successfully-embedded engram's vector. Split
+	// out of flushMicroBatch so it can be driven by embedBisect's per-engram
+	// success callback instead of only a single whole-batch success path.
+	storeEmbedded := func(eng *Engram, vec []float32) {
+		if storeErr := rp.store.UpdateEmbedding(ctx, eng.ID, vec); storeErr != nil {
+			var dimErr *hnswpkg.DimMismatchError
+			if errors.As(storeErr, &dimErr) {
+				// Vault-level condition (#582), not an engram failure: leave
+				// the engram pending — deliberately NO DigestEmbedFailed — so
+				// it embeds normally once the vault is re-embedded or the
+				// configuration is fixed. (DigestEmbedFailed shares bit 0x80
+				// with DigestEnrichFailed; stamping it here would also stop
+				// enrichment.) The pre-scan CheckEmbedDim makes this branch a
+				// rare race, not the steady state.
+				slog.Warn("retroactive processor: embedding dimension mismatch — engram left pending until the vault is re-embedded (`muninn vault reembed`)",
+					"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(),
+					"embedder_dim", dimErr.Got, "vault_dim", dimErr.Want)
+			} else {
+				slog.Warn("retroactive processor: UpdateEmbedding failed",
+					"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "error", storeErr)
+			}
+			rp.statsMu.Lock()
+			rp.stats.Errors++
+			rp.statsMu.Unlock()
+			return
+		}
+		if storeErr := rp.store.HNSWInsert(ctx, eng.ID, vec); storeErr != nil {
+			var dimErr *hnswpkg.DimMismatchError
+			if errors.As(storeErr, &dimErr) {
+				// Refused by the registry's atomic guard (#582) — e.g. a
+				// concurrent first insert established a different dimension
+				// after the UpdateEmbedding pre-check passed. Leave the
+				// engram pending (no processed flag, no push notification):
+				// the next pass re-evaluates it against the settled vault.
+				slog.Warn("retroactive processor: HNSW refused embedding dimension — engram left pending",
+					"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(),
+					"embedder_dim", dimErr.Got, "vault_dim", dimErr.Want)
+				rp.statsMu.Lock()
+				rp.stats.Errors++
+				rp.statsMu.Unlock()
+				return
+			}
+			slog.Warn("retroactive processor: HNSWInsert failed",
+				"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "error", storeErr)
+		} else if rp.onEmbed != nil {
+			// The vector is now searchable — let the engine re-evaluate push
+			// subscriptions with it (#512). Copy first: vec is a sub-slice of
+			// the batch result and the callback hands it to an async consumer.
+			rp.onEmbed(eng, append([]float32(nil), vec...))
+		}
+		if storeErr := rp.store.AutoLinkByEmbedding(ctx, eng.ID, vec); storeErr != nil {
+			slog.Warn("retroactive processor: AutoLinkByEmbedding failed",
+				"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "error", storeErr)
+		}
+		if storeErr := rp.store.SetDigestFlag(ctx, eng.ID, rp.flagBit); storeErr != nil {
+			slog.Warn("retroactive processor: failed to set digest flag",
+				"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "error", storeErr)
+			rp.statsMu.Lock()
+			rp.stats.Errors++
+			rp.statsMu.Unlock()
+			return
+		}
+		rp.statsMu.Lock()
+		rp.stats.Processed++
+		rp.statsMu.Unlock()
+	}
+
+	// markBadContent latches DigestEmbedFailed on an engram whose content —
+	// not the provider's health — caused the embed call to fail, isolated by
+	// embedBisect down to this single engram. This is the only path that
+	// permanently strands an engram from automated embedding.
+	markBadContent := func(eng *Engram, cause error) {
+		slog.Warn("retroactive processor: engram content permanently rejected by embed provider, marking DigestEmbedFailed",
+			"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "error", cause)
+		if flagErr := rp.store.SetDigestFlag(ctx, eng.ID, DigestEmbedFailed); flagErr != nil {
+			slog.Warn("retroactive processor: failed to set DigestEmbedFailed",
+				"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "error", flagErr)
+		}
+		rp.statsMu.Lock()
+		rp.stats.Errors++
+		rp.statsMu.Unlock()
+	}
+
 	flushMicroBatch := func() {
 		if !isEmbedPlugin || len(microEngrams) == 0 {
 			return
 		}
-		vecs, embedErr := embedPlugin.Embed(ctx, microTexts)
-		if embedErr != nil {
-			ids := make([]string, len(microEngrams))
-			for i, e := range microEngrams {
-				ids[i] = e.ID.String()
-			}
-			slog.Warn("retroactive processor: embed batch failed",
-				"plugin", rp.plugin.Name(),
-				"batch_size", len(microEngrams),
-				"engram_ids", ids,
-				"error", embedErr)
-			// Mark each engram with DigestEmbedFailed so the processor does not
-			// retry them indefinitely. If the underlying provider recovers, an
-			// operator can clear the flag manually or via the admin API.
-			for _, e := range microEngrams {
-				if flagErr := rp.store.SetDigestFlag(ctx, e.ID, DigestEmbedFailed); flagErr != nil {
-					slog.Warn("retroactive processor: failed to set DigestEmbedFailed",
-						"plugin", rp.plugin.Name(), "engram_id", e.ID.String(), "error", flagErr)
-				}
-			}
-			rp.statsMu.Lock()
-			rp.stats.Errors += int64(len(microEngrams))
-			rp.statsMu.Unlock()
-			microEngrams = microEngrams[:0]
-			microTexts = microTexts[:0]
-			return
-		}
-		dim := len(vecs) / len(microEngrams)
-		for i, eng := range microEngrams {
-			vec := vecs[i*dim : (i+1)*dim]
-			if storeErr := rp.store.UpdateEmbedding(ctx, eng.ID, vec); storeErr != nil {
-				var dimErr *hnswpkg.DimMismatchError
-				if errors.As(storeErr, &dimErr) {
-					// Vault-level condition (#582), not an engram failure: leave
-					// the engram pending — deliberately NO DigestEmbedFailed — so
-					// it embeds normally once the vault is re-embedded or the
-					// configuration is fixed. (DigestEmbedFailed shares bit 0x80
-					// with DigestEnrichFailed; stamping it here would also stop
-					// enrichment.) The pre-scan CheckEmbedDim makes this branch a
-					// rare race, not the steady state.
-					slog.Warn("retroactive processor: embedding dimension mismatch — engram left pending until the vault is re-embedded (`muninn vault reembed`)",
-						"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(),
-						"embedder_dim", dimErr.Got, "vault_dim", dimErr.Want)
-				} else {
-					slog.Warn("retroactive processor: UpdateEmbedding failed",
-						"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "error", storeErr)
-				}
-				rp.statsMu.Lock()
-				rp.stats.Errors++
-				rp.statsMu.Unlock()
-				continue
-			}
-			if storeErr := rp.store.HNSWInsert(ctx, eng.ID, vec); storeErr != nil {
-				var dimErr *hnswpkg.DimMismatchError
-				if errors.As(storeErr, &dimErr) {
-					// Refused by the registry's atomic guard (#582) — e.g. a
-					// concurrent first insert established a different dimension
-					// after the UpdateEmbedding pre-check passed. Leave the
-					// engram pending (no processed flag, no push notification):
-					// the next pass re-evaluates it against the settled vault.
-					slog.Warn("retroactive processor: HNSW refused embedding dimension — engram left pending",
-						"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(),
-						"embedder_dim", dimErr.Got, "vault_dim", dimErr.Want)
-					rp.statsMu.Lock()
-					rp.stats.Errors++
-					rp.statsMu.Unlock()
-					continue
-				}
-				slog.Warn("retroactive processor: HNSWInsert failed",
-					"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "error", storeErr)
-			} else if rp.onEmbed != nil {
-				// The vector is now searchable — let the engine re-evaluate push
-				// subscriptions with it (#512). Copy first: vec is a sub-slice of
-				// the batch result and the callback hands it to an async consumer.
-				rp.onEmbed(eng, append([]float32(nil), vec...))
-			}
-			if storeErr := rp.store.AutoLinkByEmbedding(ctx, eng.ID, vec); storeErr != nil {
-				slog.Warn("retroactive processor: AutoLinkByEmbedding failed",
-					"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "error", storeErr)
-			}
-			if storeErr := rp.store.SetDigestFlag(ctx, eng.ID, rp.flagBit); storeErr != nil {
-				slog.Warn("retroactive processor: failed to set digest flag",
-					"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "error", storeErr)
-				rp.statsMu.Lock()
-				rp.stats.Errors++
-				rp.statsMu.Unlock()
-				continue
-			}
-			rp.statsMu.Lock()
-			rp.stats.Processed++
-			rp.statsMu.Unlock()
-		}
+		// embedBisect isolates genuinely bad content from a systemic/transient
+		// provider failure instead of blacklisting the whole micro-batch on any
+		// error (the bug behind a single 10s HTTP timeout permanently stranding
+		// 1,000 engrams: one slow batch call used to stamp DigestEmbedFailed on
+		// every engram in it, forever, with no retry path short of a full vault
+		// re-embed). Engrams caught in an outage are left completely unstamped
+		// so the next pass retries them.
+		rp.embedBisect(ctx, embedPlugin, microEngrams, microTexts, storeEmbedded, markBadContent)
 		microEngrams = microEngrams[:0]
 		microTexts = microTexts[:0]
 
@@ -608,6 +609,130 @@ engramLoop:
 	}
 
 	return true
+}
+
+// embedBisectFloor is the smallest sub-batch embedBisect will still attempt
+// before giving up on an ambiguous failure rather than recursing further.
+const embedBisectFloor = 1
+
+// embedBisect embeds engrams/texts (parallel slices), recursively bisecting
+// on failure to isolate genuinely bad content from a systemic or transient
+// provider outage. onSuccess fires for every engram that embeds successfully.
+// onBadContent fires ONLY for a single engram (bisected down to
+// embedBisectFloor) whose failure is unambiguously attributable to its own
+// content — never for a timeout, connection failure, 401/403/429/5xx, or any
+// error that can't be positively classified as content-specific. Everything
+// in that "can't tell" bucket, including a whole-batch systemic failure at
+// any level, is left completely untouched: no flag is stamped, so it retries
+// on the next pass.
+//
+// Total HTTP calls are bounded by the shape of the bisection: a
+// systemic/embedder-down failure at any level stops immediately without
+// recursing (isEmbedderDownError), so a hard outage costs exactly one call
+// for the whole micro-batch, not O(N). Only an ambiguous or content-specific
+// failure recurses, and a binary bisection tree over N engrams makes at most
+// 2N-1 calls total even in the worst case where every leaf is individually
+// bad — this is what keeps retrying from amplifying a dead embedder into a
+// flood of doomed calls.
+func (rp *RetroactiveProcessor) embedBisect(
+	ctx context.Context,
+	embedPlugin EmbedPlugin,
+	engrams []*Engram,
+	texts []string,
+	onSuccess func(eng *Engram, vec []float32),
+	onBadContent func(eng *Engram, err error),
+) {
+	if len(engrams) == 0 {
+		return
+	}
+
+	vecs, err := embedPlugin.Embed(ctx, texts)
+	if err == nil {
+		dim := len(vecs) / len(engrams)
+		if dim == 0 {
+			// A provider that reports success with no vectors is not
+			// distinguishable from a systemic failure — leave the sub-range
+			// pending rather than guess which engrams are actually bad.
+			slog.Warn("retroactive processor: embed call succeeded but returned no vectors, leaving batch pending",
+				"plugin", rp.plugin.Name(), "batch_size", len(engrams))
+			return
+		}
+		for i, eng := range engrams {
+			onSuccess(eng, vecs[i*dim:(i+1)*dim])
+		}
+		return
+	}
+
+	if isEmbedderDownError(err) {
+		slog.Warn("retroactive processor: embed provider looks down, leaving batch pending for retry",
+			"plugin", rp.plugin.Name(), "batch_size", len(engrams), "error", err)
+		return
+	}
+
+	if len(engrams) <= embedBisectFloor {
+		if isContentSpecificEmbedError(err) {
+			onBadContent(engrams[0], err)
+			return
+		}
+		// Ambiguous failure on a single engram: still not positively
+		// attributable to its content, so err on the side of NOT stranding it
+		// permanently. Left pending, it retries next pass.
+		slog.Warn("retroactive processor: embed failed for a single engram with an unclassified error, leaving pending rather than guessing",
+			"plugin", rp.plugin.Name(), "engram_id", engrams[0].ID.String(), "error", err)
+		return
+	}
+
+	slog.Debug("retroactive processor: embed batch failed, bisecting to isolate cause",
+		"plugin", rp.plugin.Name(), "batch_size", len(engrams), "error", err)
+	mid := len(engrams) / 2
+	rp.embedBisect(ctx, embedPlugin, engrams[:mid], texts[:mid], onSuccess, onBadContent)
+	rp.embedBisect(ctx, embedPlugin, engrams[mid:], texts[mid:], onSuccess, onBadContent)
+}
+
+// isContentSpecificEmbedError reports whether err is unambiguously about the
+// request's own content (e.g. context length exceeded, payload too large) as
+// opposed to the provider's health. Only providers that construct a
+// *ProviderError (currently the OpenAI-compatible provider; see
+// internal/plugin/embed/provider_error.go) can be classified this way — a
+// plain error from another provider is treated as ambiguous, never as
+// content-specific, which is the safe default: it means those providers never
+// auto-blacklist an engram, at the cost of retrying more before giving up.
+func isContentSpecificEmbedError(err error) bool {
+	return IsPermanentContentProviderError(err)
+}
+
+// isEmbedderDownError reports whether err indicates the embed provider itself
+// is unreachable, overloaded, or misconfigured — a systemic condition that
+// says nothing about any particular engram's content. This covers:
+//   - context cancellation/deadline (the client gave up waiting, e.g. the
+//     10s cloud-tuned HTTP timeout hitting a slow self-hosted endpoint — the
+//     exact failure mode that used to blacklist 1,000 engrams on one call)
+//   - any net.Error (dial/timeout/DNS/connection-refused; http.Client wraps
+//     transport failures in *url.Error, which implements net.Error, so this
+//     also catches providers that don't construct a *ProviderError)
+//   - a *ProviderError marked Retryable (429/5xx) or carrying a 401/403 (an
+//     auth/config problem, not this engram's fault)
+func isEmbedderDownError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var provErr *ProviderError
+	if errors.As(err, &provErr) {
+		if provErr.Retryable {
+			return true
+		}
+		if provErr.StatusCode == http.StatusUnauthorized || provErr.StatusCode == http.StatusForbidden {
+			return true
+		}
+	}
+	return false
 }
 
 func (rp *RetroactiveProcessor) processEnrichEngram(ctx context.Context, eng *Engram) error {

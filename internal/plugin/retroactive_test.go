@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -176,6 +178,15 @@ func (s *flagAwareStore) SetDigestFlag(_ context.Context, id ULID, flag uint8) e
 
 func (s *flagAwareStore) GetDigestFlags(_ context.Context, id ULID) (uint8, error) {
 	return s.flags[id], nil
+}
+
+func mustGetFlags(t *testing.T, s *flagAwareStore, id ULID) uint8 {
+	t.Helper()
+	flags, err := s.GetDigestFlags(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetDigestFlags(%v): %v", id, err)
+	}
+	return flags
 }
 
 // TestRetroactiveProcessor_ContentFourxxLatchesAndFollowersDrain pins the #587
@@ -1058,5 +1069,154 @@ func TestRetroactiveProcessor_SkipFlags_Enrich(t *testing.T) {
 
 	if got := rp.skipFlags(); got != DigestEnrichFailed {
 		t.Errorf("enrich processor skipFlags() = %d, want DigestEnrichFailed (%d)", got, DigestEnrichFailed)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Bisect-retry tests (COG-embed-blacklist): a whole-micro-batch embed failure
+// must never blanket-stamp DigestEmbedFailed on every engram in it — only an
+// engram individually and unambiguously bad may be stamped; a systemic outage
+// must leave everything pending for the next pass.
+// ---------------------------------------------------------------------------
+
+// embedMockForRetro is a mock EmbedPlugin whose Embed behavior is driven by a
+// caller-supplied function, so tests can simulate partial/whole batch failure.
+type embedMockForRetro struct {
+	mockPlugin
+	embedFunc func(texts []string) ([]float32, error)
+	maxBatch  int
+	calls     [][]string
+}
+
+func (m *embedMockForRetro) Embed(ctx context.Context, texts []string) ([]float32, error) {
+	m.calls = append(m.calls, append([]string(nil), texts...))
+	return m.embedFunc(texts)
+}
+func (m *embedMockForRetro) Dimension() int { return 3 }
+func (m *embedMockForRetro) MaxBatchSize() int {
+	if m.maxBatch > 0 {
+		return m.maxBatch
+	}
+	return 32
+}
+
+// TestRetroactiveProcessor_EmbedBatchBisectsOnlyStampsBadContent verifies
+// that a batch failure containing exactly one engram with genuinely bad
+// content (a permanent 400) results in: that one engram stamped
+// DigestEmbedFailed, every other engram in the batch successfully embedded,
+// and none of them wrongly blacklisted just because they shared an HTTP call
+// with the bad one.
+func TestRetroactiveProcessor_EmbedBatchBisectsOnlyStampsBadContent(t *testing.T) {
+	badContent := "too-large-oversized-content"
+	engrams := []*Engram{
+		{ID: ULID{1}, Concept: "ok-1", Content: "fine"},
+		{ID: ULID{2}, Concept: "ok-2", Content: "fine"},
+		{ID: ULID{3}, Concept: "bad", Content: badContent},
+		{ID: ULID{4}, Concept: "ok-3", Content: "fine"},
+	}
+	store := newFlagAwareStore(engrams...)
+
+	embedPlugin := &embedMockForRetro{
+		mockPlugin: mockPlugin{name: "bisect-content", tier: TierEmbed},
+		embedFunc: func(texts []string) ([]float32, error) {
+			for _, txt := range texts {
+				if strings.Contains(txt, badContent) {
+					return nil, &ProviderError{Provider: "openai", StatusCode: http.StatusBadRequest, Retryable: false}
+				}
+			}
+			return make([]float32, len(texts)*3), nil
+		},
+	}
+
+	rp := NewRetroactiveProcessor(store, embedPlugin, DigestEmbed)
+	if ok := rp.processBatch(context.Background()); !ok {
+		t.Fatal("processBatch returned false")
+	}
+
+	if mustGetFlags(t, store, ULID{3})&DigestEmbedFailed == 0 {
+		t.Errorf("bad-content engram should be stamped DigestEmbedFailed, flags=%08b", mustGetFlags(t, store, ULID{3}))
+	}
+	for _, id := range []ULID{{1}, {2}, {4}} {
+		flags := mustGetFlags(t, store, id)
+		if flags&DigestEmbedFailed != 0 {
+			t.Errorf("engram %v must not be stamped DigestEmbedFailed, flags=%08b", id, flags)
+		}
+		if flags&DigestEmbed == 0 {
+			t.Errorf("engram %v should have embedded successfully, flags=%08b", id, flags)
+		}
+	}
+	if got := store.updateEmbedCalls; got != 3 {
+		t.Errorf("expected 3 successful embeddings stored, got %d", got)
+	}
+}
+
+// TestRetroactiveProcessor_EmbedderDownLeavesBatchPending verifies that a
+// systemic failure (context deadline exceeded — the exact failure mode that
+// used to blacklist 1,000 engrams from a single slow HTTP call) leaves every
+// engram in the batch completely unstamped, so the whole batch retries on the
+// next pass, and does not bisect into it (only one Embed call is made).
+func TestRetroactiveProcessor_EmbedderDownLeavesBatchPending(t *testing.T) {
+	engrams := []*Engram{
+		{ID: ULID{1}, Concept: "a", Content: "a"},
+		{ID: ULID{2}, Concept: "b", Content: "b"},
+		{ID: ULID{3}, Concept: "c", Content: "c"},
+	}
+	store := newFlagAwareStore(engrams...)
+
+	embedPlugin := &embedMockForRetro{
+		mockPlugin: mockPlugin{name: "bisect-down", tier: TierEmbed},
+		embedFunc: func(texts []string) ([]float32, error) {
+			return nil, fmt.Errorf("openai decode: %w", context.DeadlineExceeded)
+		},
+	}
+
+	rp := NewRetroactiveProcessor(store, embedPlugin, DigestEmbed)
+	if ok := rp.processBatch(context.Background()); !ok {
+		t.Fatal("processBatch returned false")
+	}
+
+	for _, id := range []ULID{{1}, {2}, {3}} {
+		flags := mustGetFlags(t, store, id)
+		if flags != 0 {
+			t.Errorf("engram %v must be left completely unstamped on an embedder-down failure, flags=%08b", id, flags)
+		}
+	}
+	if store.setFlagCalls != 0 {
+		t.Errorf("no SetDigestFlag call should happen on an embedder-down failure, got %d", store.setFlagCalls)
+	}
+	if got := len(embedPlugin.calls); got != 1 {
+		t.Errorf("an embedder-down failure must not trigger bisection (expected exactly 1 Embed call), got %d calls: %v", got, embedPlugin.calls)
+	}
+}
+
+// TestRetroactiveProcessor_EmbedAmbiguousErrorLeavesEngramPending verifies
+// that an error we cannot positively classify as either "provider down" or
+// "this engram's content is bad" leaves the engram pending rather than
+// guessing — the safe default when a provider hasn't adopted structured
+// ProviderErrors (e.g. all embed providers other than the OpenAI-compatible
+// one, today).
+func TestRetroactiveProcessor_EmbedAmbiguousErrorLeavesEngramPending(t *testing.T) {
+	engrams := []*Engram{
+		{ID: ULID{1}, Concept: "only", Content: "content"},
+	}
+	store := newFlagAwareStore(engrams...)
+
+	embedPlugin := &embedMockForRetro{
+		mockPlugin: mockPlugin{name: "bisect-ambiguous", tier: TierEmbed},
+		embedFunc: func(texts []string) ([]float32, error) {
+			return nil, fmt.Errorf("some unclassified failure")
+		},
+	}
+
+	rp := NewRetroactiveProcessor(store, embedPlugin, DigestEmbed)
+	if ok := rp.processBatch(context.Background()); !ok {
+		t.Fatal("processBatch returned false")
+	}
+
+	if flags := mustGetFlags(t, store, ULID{1}); flags != 0 {
+		t.Errorf("engram must be left unstamped on an unclassified single-engram failure, flags=%08b", flags)
+	}
+	if store.setFlagCalls != 0 {
+		t.Errorf("no SetDigestFlag call should happen for an unclassified error, got %d", store.setFlagCalls)
 	}
 }
