@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -108,9 +107,8 @@ func (p *OpenAIProvider) Init(ctx context.Context, cfg ProviderHTTPConfig) (int,
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("API authentication failed — check MUNINNDB_EMBED_API_KEY (status %d: %s)",
-			resp.StatusCode, string(bodyBytes))
+		return 0, fmt.Errorf("API authentication failed — check MUNINNDB_EMBED_API_KEY (%w)",
+			plugin.ProviderHTTPError(p.Name(), resp))
 	}
 
 	var openaiResp openAIEmbedResponse
@@ -153,7 +151,7 @@ func (p *OpenAIProvider) EmbedBatch(ctx context.Context, texts []string) ([]floa
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, providerHTTPError("openai", resp)
+		return nil, plugin.ProviderHTTPError(p.Name(), resp)
 	}
 
 	var openaiResp openAIEmbedResponse

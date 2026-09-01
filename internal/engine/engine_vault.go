@@ -97,7 +97,7 @@ func (e *Engine) refuseAppend(ctx context.Context) error {
 // It evicts all in-memory state (HNSW, FTS IDF cache, novelty fingerprints, coherence
 // counters, activity tracking) and adjusts the global engramCount.
 func (e *Engine) ClearVault(ctx context.Context, vaultName string) error {
-	if err := e.refuseAppend(ctx); err != nil {
+	if err := e.refuseWrite(ctx); err != nil {
 		return err
 	}
 	if !e.beginVaultOp() {
@@ -137,6 +137,33 @@ func (e *Engine) clearVault(ctx context.Context, vaultName string) error {
 	// ClearVault on a renamed vault would silently range-delete an empty
 	// prefix and leave the real engrams orphaned.
 	ws := e.store.ResolveVaultPrefix(vaultName)
+
+	// Establish the clear boundary before deleting storage. Each processor
+	// invalidates its current scan, closes admission for this vault, and waits
+	// for already-admitted calls to finish persistence. Admission and waiting
+	// are scoped per vault.
+	finishProcessorClears := make([]func(), 0, len(e.retroProcessors))
+	finishClears := func() {
+		for i := len(finishProcessorClears) - 1; i >= 0; i-- {
+			finishProcessorClears[i]()
+		}
+	}
+	for _, processor := range e.retroProcessors {
+		if processor != nil {
+			finish, err := processor.BeginVaultClear(ctx, ws)
+			if err != nil {
+				// Abort the whole clear. Any boundary already established on an
+				// earlier processor must be released before returning.
+				finishClears()
+				return fmt.Errorf("clear vault %q: wait for retroactive processor: %w", vaultName, err)
+			}
+			finishProcessorClears = append(finishProcessorClears, finish)
+		}
+	}
+	// Keep this defer registered before the FTS clearing defer below. Defers run
+	// in LIFO order, so FTS accepts writes again before processors are released
+	// and notified to discover post-clear records.
+	defer finishClears()
 
 	// NOTE: Jobs already mid-flush may write ghost FTS entries after the range
 	// tombstones land. This is harmless — activation filtering skips engrams
@@ -201,7 +228,7 @@ var ErrVaultJobActive = fmt.Errorf("vault has an active clone/merge job in progr
 // persisted 0x0F index — but for renamed vaults we need the index lookup
 // (not raw SipHash) to find the real ws, so we capture it up front.
 func (e *Engine) DeleteVault(ctx context.Context, vaultName string) error {
-	if err := e.refuseAppend(ctx); err != nil {
+	if err := e.refuseWrite(ctx); err != nil {
 		return err
 	}
 	if !e.beginVaultOp() {
@@ -301,6 +328,10 @@ func (e *Engine) ensureVaultRegistered(name string) (bool, error) {
 // operations (reindex-fts, vault export, vault clear) can find it immediately,
 // even before the first engram has been written.
 func (e *Engine) RegisterVaultName(name string) error {
+	// Cluster single-writer gate (#596).
+	if err := e.refuseNonLeaderWrite(); err != nil {
+		return err
+	}
 	ws := e.store.ResolveVaultPrefix(name)
 	return e.store.WriteVaultName(ws, name)
 }
@@ -318,7 +349,7 @@ func (e *Engine) VaultNameExists(name string) bool {
 // doesn't exist, ErrVaultJobActive if a clone/merge job targets the vault,
 // or an error if newName already exists.
 func (e *Engine) RenameVault(ctx context.Context, oldName, newName string) error {
-	if err := e.refuseAppend(ctx); err != nil {
+	if err := e.refuseWrite(ctx); err != nil {
 		return err
 	}
 	if !e.beginVaultOp() {

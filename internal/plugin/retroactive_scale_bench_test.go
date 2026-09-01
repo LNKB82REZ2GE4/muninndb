@@ -63,7 +63,7 @@ func TestRetroactiveProcessor_EmbedPass_ManyVaults_ScalesWithBacklogNotCorpus(t 
 	defer store.Close()
 
 	ctx := context.Background()
-	const DigestEmbed uint8 = 0x02
+	const DigestEmbed uint16 = 0x02
 
 	var backlogIDs []storage.ULID
 	for v := 0; v < numVaults; v++ {

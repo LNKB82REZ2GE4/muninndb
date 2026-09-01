@@ -131,6 +131,10 @@ func (m *mockEngine) ReindexFTSVault(ctx context.Context, vaultName string) (int
 	return 0, nil
 }
 
+func (m *mockEngine) ResetRepairWatermark(ctx context.Context, vaultName string, which engine.RepairWatermarkKind) error {
+	return nil
+}
+
 func (m *mockEngine) Checkpoint(destDir string) error {
 	return nil
 }
@@ -180,11 +184,11 @@ func (m *mockEngine) StartReembedVault(ctx context.Context, vaultName, modelName
 	return &vaultjob.Job{ID: "mock-reembed-job", Operation: "reembed", Source: vaultName, Target: vaultName}, nil
 }
 
-func (m *mockEngine) CountEmbedded(ctx context.Context) int64 {
+func (m *mockEngine) CountEmbedded(ctx context.Context, vault string) int64 {
 	return 0
 }
 
-func (m *mockEngine) CountEmbeddableTotal(ctx context.Context) int64 {
+func (m *mockEngine) CountEmbeddableTotal(ctx context.Context, vault string) int64 {
 	return 0
 }
 

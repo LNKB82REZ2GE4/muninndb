@@ -88,9 +88,63 @@ func parseEmbeddingArg(args map[string]any) ([]float32, string) {
 	return embedding, ""
 }
 
+// normalizeTags coerces a raw MCP `tags` argument into the canonical tag set:
+// non-strings, empty strings, and tags longer than 128 characters are skipped,
+// and the set is capped at 50. Shared by muninn_remember, muninn_remember_batch,
+// and muninn_update_tags so a tag set applied on update obeys exactly the same
+// rules as one applied at creation — otherwise evolve's tag inheritance could
+// carry forward a set muninn_remember could never have created (#720).
+func normalizeTags(raw []any) []string {
+	tags, _ := normalizeTagsReporting(raw)
+	return tags
+}
+
+// normalizeTagsReporting is normalizeTags with the rejects reported rather than
+// discarded: dropped carries one human-readable reason per rejected entry, in
+// input order, naming the offending value.
+//
+// Create-time leniency (muninn_remember/_batch) is deliberate and stays — one
+// junk entry beside good ones should not fail an entire write. muninn_update_tags
+// REPLACES the set rather than adding to it, so the identical leniency has a
+// different cost there: a `tags` array non-empty on the wire but empty after
+// normalization silently wiped every real tag on the engram and returned ok.
+// Measured at three tags destroyed end-to-end by one 129-byte input (#720
+// review, finding 4). A caller that replaces must reject loudly — see
+// handleUpdateTags.
+func normalizeTagsReporting(raw []any) (tags []string, dropped []string) {
+	for i, t := range raw {
+		tag, ok := t.(string)
+		if !ok {
+			dropped = append(dropped, fmt.Sprintf("entry %d: not a string", i))
+			continue
+		}
+		switch {
+		case len(tag) == 0:
+			dropped = append(dropped, fmt.Sprintf("entry %d: empty string", i))
+		case len(tag) > 128:
+			dropped = append(dropped, fmt.Sprintf("entry %d: %d bytes, over the 128-byte limit (starts %q)",
+				i, len(tag), tag[:32]))
+		default:
+			tags = append(tags, tag)
+		}
+	}
+	if len(tags) > 50 {
+		for _, over := range tags[50:] {
+			dropped = append(dropped, fmt.Sprintf("%q: past the 50-tag limit", over))
+		}
+		tags = tags[:50]
+	}
+	return tags, dropped
+}
+
 func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
 	opID, _ := args["op_id"].(string)
-	if opID != "" {
+	upsertMode, _ := args["upsert_mode"].(bool)
+	// Upsert uses the durable 0x2F forward index (keyed by op_id) and merges on
+	// change — it must NOT go through the receipt-based dedup below (which would
+	// return the original engram on retry instead of merging). The engine's
+	// upsertKeyLock serializes concurrent upserts on the same key.
+	if opID != "" && !upsertMode {
 		// Acquire a per-op_id mutex to prevent TOCTOU races: without this lock,
 		// two concurrent requests with the same op_id could both pass the nil
 		// receipt check and each call Write, producing duplicate engrams.
@@ -116,6 +170,10 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 		sendError(w, id, -32602, "invalid params: 'content' is required (non-empty string)")
 		return
 	}
+	if upsertMode && strings.TrimSpace(opID) == "" {
+		sendError(w, id, -32602, "invalid params: 'upsert_mode' requires 'op_id' (the key the engram is pinned to)")
+		return
+	}
 	req := &mbp.WriteRequest{
 		Vault:   vault,
 		Content: content,
@@ -124,14 +182,7 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 		req.Concept = c
 	}
 	if tags, ok := args["tags"].([]any); ok {
-		for _, t := range tags {
-			if s, ok := t.(string); ok && len(s) > 0 && len(s) <= 128 {
-				req.Tags = append(req.Tags, s)
-			}
-		}
-		if len(req.Tags) > 50 {
-			req.Tags = req.Tags[:50]
-		}
+		req.Tags = normalizeTags(tags)
 	}
 	if conf, ok := args["confidence"].(float64); ok {
 		if conf < 0 {
@@ -176,6 +227,11 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 		req.Embedding = emb
 	}
 
+	if upsertMode {
+		req.UpsertMode = true
+		req.IdempotentID = opID // the durable upsert key (0x30 forward index)
+	}
+
 	// Multi-vault fan-out (project-vaults phase 2): "vaults" is mutually
 	// exclusive with "vault" and writes one independent engram per listed
 	// vault via this same single-vault Write path — separate IDs, separate
@@ -197,6 +253,14 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 		for _, v := range vaults {
 			clone := *req
 			clone.Vault = v
+			// Upsert identity is per (caller, vault): the fan-out writes one
+			// INDEPENDENT engram per vault, so sharing one op_id across them
+			// would point every vault's upsert key at the same identity and
+			// make the second vault's write look like a change to the first's
+			// engram. Same suffixing the idempotency receipt below uses.
+			if upsertMode {
+				clone.IdempotentID = opID + "|" + v
+			}
 			if len(clone.Embedding) > 0 {
 				if vaultDim := s.engine.GetVaultEmbedDim(ctx, v); vaultDim > 0 && len(clone.Embedding) != vaultDim {
 					sendError(w, id, -32602, fmt.Sprintf("invalid params: embedding dimension %d does not match vault %q dimension %d", len(clone.Embedding), v, vaultDim))
@@ -208,7 +272,8 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 				sendError(w, id, -32000, "tool error: vault "+v+": "+err.Error())
 				return
 			}
-			if opID != "" {
+			// Upsert is tracked by the durable forward index, not a receipt.
+			if opID != "" && !upsertMode {
 				vOpID := opID + "|" + v
 				if err := s.engine.WriteIdempotency(ctx, vOpID, vResp.ID); err != nil {
 					slog.Warn("mcp: failed to record idempotency receipt", "op_id", vOpID, "engram_id", vResp.ID, "err", err)
@@ -225,7 +290,9 @@ func (s *MCPServer) handleRemember(ctx context.Context, w http.ResponseWriter, i
 		sendError(w, id, -32000, "tool error: "+err.Error())
 		return
 	}
-	if opID != "" {
+	// Upsert is tracked by the durable forward index, not a receipt — don't
+	// write one (a receipt would make a later non-upsert retry return stale).
+	if opID != "" && !upsertMode {
 		if err := s.engine.WriteIdempotency(ctx, opID, resp.ID); err != nil {
 			slog.Warn("mcp: failed to record idempotency receipt", "op_id", opID, "engram_id", resp.ID, "err", err)
 		}
@@ -307,14 +374,7 @@ func (s *MCPServer) handleRememberBatch(ctx context.Context, w http.ResponseWrit
 			req.Concept = c
 		}
 		if tags, ok := m["tags"].([]any); ok {
-			for _, t := range tags {
-				if s, ok := t.(string); ok && len(s) > 0 && len(s) <= 128 {
-					req.Tags = append(req.Tags, s)
-				}
-			}
-			if len(req.Tags) > 50 {
-				req.Tags = req.Tags[:50]
-			}
+			req.Tags = normalizeTags(tags)
 		}
 		if conf, ok := m["confidence"].(float64); ok {
 			if conf < 0 {
@@ -667,7 +727,7 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 			if isMulti && item.Vault != "" {
 				itemVault = item.Vault
 			}
-			ann, err := s.engine.GetAnnotations(ctx, itemVault, item.ID)
+			ann, err := s.engine.GetAnnotations(ctx, itemVault, item.ID, req)
 			if err != nil || ann == nil {
 				// Non-fatal: log and skip annotations for this result.
 				slog.Warn("handleRecall: GetAnnotations failed", "id", item.ID, "err", err)
@@ -703,6 +763,18 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 	// TestRecallOverMCP_ConflictBlockAndAnnotations exists to catch.
 	if resp.Conflict != nil {
 		result["conflict"] = resp.Conflict
+	}
+	// COG-29 amendment: the vault-wide unresolved-contradiction debt readout,
+	// on mode="recent" ONLY. That condition is not a heuristic guess at "is this
+	// a session start" — it is the exact call generateGuide instructs agents to
+	// make for session continuity, in BOTH the shared and single-user branches,
+	// so it is an agent-DECLARED orientation intent. Default-mode recall, the hot
+	// path, is untouched.
+	if mode == "recent" {
+		rp := s.orientationPlasticity(ctx, vault)
+		if block := s.contradictionDebtAttachment(ctx, vault, rp, time.Now()); block != nil {
+			result["unresolved_contradictions"] = block
+		}
 	}
 	// THE PUSH: prospective notices — focal set derives from the RETURNED
 	// results; readOnly (COG-11) suppresses the fired-marker write. Omitted
@@ -770,7 +842,16 @@ func (s *MCPServer) handleForget(ctx context.Context, w http.ResponseWriter, id 
 		sendError(w, id, -32602, "invalid params: 'id' is required")
 		return
 	}
-	req := &mbp.ForgetRequest{ID: engramID, Hard: false, Vault: vault}
+	// #807: honor the caller's explicit hard flag instead of silently
+	// downgrading it to a soft delete. Same authorization as any other
+	// mutating tool call — muninn_forget is already isMutatingTool-classified
+	// (blocked for observe-mode credentials) and the engine itself refuses
+	// EVERY Forget call, hard or soft, from an append-mode credential
+	// (SEC-15) — the identical bar gRPC's ForgetRequest.Hard already clears
+	// with no additional elevation, so this does not make MCP more
+	// permissive than the other transports that already reach hard delete.
+	hard, _ := args["hard"].(bool)
+	req := &mbp.ForgetRequest{ID: engramID, Hard: hard, Vault: vault}
 
 	// not_true_since: invalidate on the valid-time axis (stamp ValidUntil)
 	// instead of soft-deleting. The memory stays recoverable via as_of /
@@ -923,6 +1004,16 @@ func (s *MCPServer) handleStatus(ctx context.Context, w http.ResponseWriter, id 
 }
 
 func (s *MCPServer) handleEvolve(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	// Tags are metadata, and evolve is not a metadata update: it mints a new
+	// ULID and archives the predecessor. Unknown MCP params are not rejected
+	// in general, so accepting `tags` here would return success with the tags
+	// silently discarded — the worst failure class in this project (#720).
+	if _, present := args["tags"]; present {
+		sendError(w, id, -32602, "invalid params: 'tags' is not accepted by muninn_evolve — "+
+			"tags are metadata, and evolving to change them would archive this memory under a new ID; "+
+			"use muninn_update_tags(id, tags) to retag in place")
+		return
+	}
 	engramID, ok1 := args["id"].(string)
 	newContent, ok2 := args["new_content"].(string)
 	reason, ok3 := args["reason"].(string)
@@ -1388,15 +1479,22 @@ func (s *MCPServer) handleWhereLeftOff(ctx context.Context, w http.ResponseWrite
 	if entries == nil {
 		entries = []WhereLeftOffEntry{}
 	}
+	rp := s.orientationPlasticity(ctx, vault)
 	hint := "These are your most recently accessed memories. Use them to orient yourself for this session."
-	if p, perr := s.engine.GetVaultPlasticity(ctx, vault); perr == nil && p != nil && p.MultiUser {
+	if rp.MultiUser {
 		hint = "These are the most recently accessed memories across ALL users of this shared vault — not necessarily yours. For your own session context, use muninn_recall scoped to your per-user tag."
 	}
-	sendResult(w, id, textContent(mustJSON(map[string]any{
+	out := map[string]any{
 		"memories": entries,
 		"count":    len(entries),
 		"hint":     hint,
-	})))
+	}
+	// COG-29 amendment: the vault-wide unresolved-contradiction debt readout.
+	// Absent, not empty, when the vault owes nothing.
+	if block := s.contradictionDebtAttachment(ctx, vault, rp, time.Now()); block != nil {
+		out["unresolved_contradictions"] = block
+	}
+	sendResult(w, id, textContent(mustJSON(out)))
 }
 
 func (s *MCPServer) handleRetryEnrich(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
@@ -1431,7 +1529,14 @@ func (s *MCPServer) handleGuide(ctx context.Context, w http.ResponseWriter, id j
 		EngramCount: statResp.EngramCount,
 		VaultCount:  statResp.VaultCount,
 	}
-	guide := generateGuide(vault, *plasticity, stats)
+	// COG-29 amendment: the vault-wide unresolved-contradiction debt readout,
+	// rendered into the guide's contradiction section. nil ⇒ nothing is added.
+	debt, debtFailed := s.contradictionDebtFor(ctx, vault, *plasticity)
+	debtSection := contradictionDebtGuideSection(debt, plasticity.MultiUser, time.Now())
+	if debtFailed {
+		debtSection = "\n**This vault's unresolved-contradiction state could not be read.** It is UNKNOWN, not zero — `muninn_contradictions` reads the same data directly.\n"
+	}
+	guide := generateGuide(vault, *plasticity, stats, debtSection)
 	sendResult(w, id, textContent(guide))
 }
 
@@ -2822,9 +2927,26 @@ func augmentAnnotations(m *Memory, item *mbp.ActivationItem, data *engine.Annota
 		m.Annotations = &MemoryAnnotations{}
 	}
 	ann := m.Annotations
-	staleDays := math.Round(time.Since(time.Unix(0, item.LastAccess)).Hours()/24.0*10) / 10
-	ann.Stale = staleDays > annotationStaleDays
-	ann.StaleDays = staleDays
+	// A never-accessed engram has no staleness to report, so we report NONE —
+	// both fields are omitted from the wire rather than defaulted. Before #810, a
+	// vault cloned with the zero-time sentinel reported stale_days=99317.8,
+	// stale=true for EVERY memory: 272 years of decay, announced to the calling
+	// agent, on a vault created seconds earlier. Emitting stale_days=0 /
+	// stale=false instead would be a SMALLER lie, not the truth — an agent reads
+	// that as "accessed today", which is plausible and wrong, the failure class
+	// principle #2 names as the worst one. Omission is the only honest answer
+	// available: the system does not know when this memory was last accessed.
+	//
+	// This guard is needed on top of the ERF decode-side repair, not covered by
+	// it: item.LastAccess is time.Time{}.UnixNano() for a never-accessed engram
+	// either way, so this surface sees the 1754 instant regardless.
+	lastAccess := time.Unix(0, item.LastAccess)
+	if !storage.IsUnsetTimestamp(lastAccess) {
+		staleDays := math.Round(time.Since(lastAccess).Hours()/24.0*10) / 10
+		stale := staleDays > annotationStaleDays
+		ann.StaleDays = &staleDays
+		ann.Stale = &stale
+	}
 	ann.ConflictsWith = data.ConflictsWith
 	if ann.SupersededBy == "" {
 		ann.SupersededBy = data.SupersededBy
@@ -2858,6 +2980,56 @@ func (s *MCPServer) handleSetTrust(ctx context.Context, w http.ResponseWriter, i
 		"trust": trustStr,
 		"ok":    true,
 	})))
+}
+
+// handleUpdateTags replaces an engram's full tag set IN PLACE. Unlike
+// muninn_evolve — which mints a new ULID and archives the predecessor — the
+// ID, version lineage, and access history are preserved, which is the whole
+// reason this tool exists rather than a `tags` argument on evolve (#720).
+func (s *MCPServer) handleUpdateTags(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {
+	engramID, ok := args["id"].(string)
+	if !ok || engramID == "" {
+		sendError(w, id, -32602, "invalid params: 'id' is required")
+		return
+	}
+	rawTags, present := args["tags"]
+	if !present || rawTags == nil {
+		sendError(w, id, -32602, "invalid params: 'tags' is required (pass an empty array to clear all tags)")
+		return
+	}
+	tagsAny, ok := rawTags.([]any)
+	if !ok {
+		sendError(w, id, -32602, "invalid params: 'tags' must be an array of strings")
+		return
+	}
+	tags, dropped := normalizeTagsReporting(tagsAny)
+	// An explicit empty array stays a deliberate clear-all. But a NON-empty
+	// array that normalizes to nothing is a caller mistake, and because this
+	// tool replaces the set, honoring it would erase every tag on the engram and
+	// report ok — the same silent-drop failure class that #720 exists to fix,
+	// pointed the other way. Reject it and name what was wrong.
+	if len(tagsAny) > 0 && len(tags) == 0 {
+		sendError(w, id, -32602, "invalid params: no usable tag in 'tags' — every entry was rejected ("+
+			strings.Join(dropped, "; ")+"). Pass an empty array to clear all tags deliberately.")
+		return
+	}
+	if tags == nil {
+		// REST coerces a nil body field to []string{}; clear-all sends an empty
+		// set, not nil, and the response payload renders [] rather than null.
+		tags = []string{}
+	}
+	if err := s.engine.UpdateTags(ctx, vault, engramID, tags); err != nil {
+		sendError(w, id, -32000, "tool error: "+err.Error())
+		return
+	}
+	// Partial normalization still succeeds — some usable tag survived — but the
+	// caller is told what did not land rather than having to diff the echo.
+	out := map[string]any{"id": engramID, "tags": tags, "ok": true}
+	if len(dropped) > 0 {
+		out["dropped"] = len(dropped)
+		out["dropped_detail"] = dropped
+	}
+	sendResult(w, id, textContent(mustJSON(out)))
 }
 
 func (s *MCPServer) handleCompareAndSet(ctx context.Context, w http.ResponseWriter, id json.RawMessage, vault string, args map[string]any) {

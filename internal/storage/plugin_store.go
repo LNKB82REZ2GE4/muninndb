@@ -16,19 +16,7 @@ import (
 // CountWithoutFlag returns the number of engrams across all vaults that are
 // missing the given digest flag bit. Engrams that have any skipFlags bit set
 // are excluded from the count (e.g. permanently-failed engrams).
-//
-// Cost note: this and ScanWithoutFlag both do a full linear scan of the
-// cross-vault engram keyspace on every call (called once per
-// RetroactiveProcessor pass) — there is no secondary index of "pending"
-// engrams, so the scan cost is O(total engrams on the instance) regardless
-// of how few are actually pending. This is a known, currently-accepted cost
-// (unlike the O(candidates × total engrams) FindVaultPrefix-per-call bug
-// that PluginStore.UpdateEmbedding's doc describes and that RetroactiveProcessor
-// no longer pays) — see TestRetroactiveProcessor_EmbedPass_ManyVaults_ScalesWithBacklogNotCorpus
-// in internal/plugin for a measured example. Worth revisiting with a proper
-// pending-engram index if per-pass latency becomes a problem again at larger
-// scale.
-func (ps *PebbleStore) CountWithoutFlag(ctx context.Context, flag, skipFlags uint8) (int64, error) {
+func (ps *PebbleStore) CountWithoutFlag(ctx context.Context, flag, skipFlags uint16) (int64, error) {
 	lowerBound := []byte{prefix.Engram}
 	upperBound := []byte{prefix.Meta}
 
@@ -69,10 +57,9 @@ func (ps *PebbleStore) CountWithoutFlag(ctx context.Context, flag, skipFlags uin
 	return count, nil
 }
 
-// CountWithFlag returns the number of DigestFlags records across the whole
-// store that have the given digest flag bit set. It scans the 0x11
-// DigestFlags key space directly (a global key space — no vault scope
-// needed).
+// CountWithFlag returns the number of engrams across all vaults that have the
+// given digest flag bit set. It scans the 0x11 DigestFlags key space directly
+// (a global key space — no vault scope needed).
 //
 // WARNING: 0x11 is keyed globally by ULID and is deliberately never cleaned
 // up on ClearVault or a hard delete (see ClearVault's doc comment: "digest
@@ -82,7 +69,7 @@ func (ps *PebbleStore) CountWithoutFlag(ctx context.Context, flag, skipFlags uin
 // against a live-engram count (e.g. Stat's EngramCount) — use
 // CountEngramsWithFlag for that, which can never orphan-inflate because it
 // only counts flags on engrams it can still see in the live keyspace.
-func (ps *PebbleStore) CountWithFlag(ctx context.Context, flag uint8) (int64, error) {
+func (ps *PebbleStore) CountWithFlag(ctx context.Context, flag uint16) (int64, error) {
 	lowerBound := []byte{prefix.DigestFlags}
 	upperBound := []byte{prefix.Coherence}
 
@@ -97,32 +84,42 @@ func (ps *PebbleStore) CountWithFlag(ctx context.Context, flag uint8) (int64, er
 
 	var count int64
 	for valid := iter.First(); valid; valid = iter.Next() {
-		val := iter.Value()
-		if len(val) > 0 && val[0]&flag != 0 {
+		if decodeDigestFlags(iter.Value())&flag != 0 {
 			count++
 		}
 	}
 	return count, iter.Error()
 }
 
-// CountEngramsWithFlag returns the number of LIVE engrams (excluding
-// soft-deleted and archived) across all vaults that have the given digest
-// flag bit set. Unlike CountWithFlag, which scans the global 0x11 DigestFlags
-// keyspace directly and can therefore count flags orphaned by ClearVault or a
-// hard delete, this scans live engram records the same way CountWithoutFlag
-// does — so its result can never exceed a live-engram total computed the same
-// way (e.g. CountEngrams). This is what the embed-status API's EmbeddedCount
-// should use: without it, EmbeddedCount could exceed TotalCount and the
-// "indexing" bool would go permanently false while a real backlog was still
-// being processed (the flag comparison `embedded < total` never holds).
-func (ps *PebbleStore) CountEngramsWithFlag(ctx context.Context, flag uint8) (int64, error) {
-	lowerBound := []byte{prefix.Engram}
-	upperBound := []byte{prefix.Meta}
+// CountEmbeddedInVault returns the number of engrams IN THE GIVEN VAULT that
+// have the given digest flag bit set. Unlike CountWithFlag (which scans the
+// global 0x11 DigestFlags keyspace directly — that keyspace is deliberately
+// NOT vault-scoped, see docs/internals/keyspace-registry.md), this scans the
+// vault's own 0x01 Engram keyspace for its member IDs and looks up each one's
+// digest flags individually, so it costs O(engrams in this vault) rather than
+// O(all engrams in the store). Mirrors countEngramsForVault's bound
+// construction so the numerator and denominator of an embedding-coverage
+// ratio agree on which rows are "in the vault" (#802).
+//
+// Soft-deleted and archived engrams are EXCLUDED, matching CountEngramsWithFlag
+// and CountLiveEngramsInVault. Both sides of the coverage ratio have to apply
+// the same live-state filter or EmbeddedCount can sit permanently below (or
+// above) TotalCount and the embed-status API's `indexing` bool latches — see
+// CountLiveEngrams.
+func (ps *PebbleStore) CountEmbeddedInVault(ctx context.Context, wsPrefix [8]byte, flag uint16) (int64, error) {
+	lower := keys.EngramKey(wsPrefix, [16]byte{})
+	upperWS := wsPrefix
+	for i := 7; i >= 0; i-- {
+		upperWS[i]++
+		if upperWS[i] != 0 {
+			break
+		}
+	}
+	upper := make([]byte, 1+8)
+	upper[0] = prefix.Engram
+	copy(upper[1:9], upperWS[:])
 
-	iter, err := ps.db.NewIter(&pebble.IterOptions{
-		LowerBound: lowerBound,
-		UpperBound: upperBound,
-	})
+	iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
 	if err != nil {
 		return 0, err
 	}
@@ -134,75 +131,26 @@ func (ps *PebbleStore) CountEngramsWithFlag(ctx context.Context, flag uint8) (in
 		if len(k) < 25 {
 			continue
 		}
+		if !engramValueIsLive(iter.Value()) {
+			continue
+		}
 		var id [16]byte
 		copy(id[:], k[9:25])
-
-		val := make([]byte, len(iter.Value()))
-		copy(val, iter.Value())
-		if erfEng, decErr := erf.Decode(val); decErr == nil {
-			eng := fromERFEngram(erfEng)
-			if eng.State == StateSoftDeleted || eng.State == StateArchived {
-				continue
-			}
-		}
-
 		raw, err := ps.getDigestFlagsRaw(id)
 		if err == nil && raw&flag != 0 {
 			count++
 		}
 	}
-	return count, iter.Error()
-}
-
-// CountLiveEngrams returns the number of LIVE engrams (excluding soft-deleted
-// and archived) across all vaults — the same live-state filter
-// CountEngramsWithFlag applies, with no flag check. It exists so a caller
-// comparing "how many are embedded" against "how many total" can compute both
-// sides over the identical filter.
-//
-// Do not use engine's engramCount (backing Stat's EngramCount) for that
-// comparison instead: it only decrements on a HARD delete, never on soft
-// delete or archive, so it still counts engrams CountEngramsWithFlag
-// deliberately excludes. A vault with embedded-then-soft-deleted engrams
-// would read EmbeddedCount permanently below that counter with nothing left
-// to do, making the embed-status API's "indexing" bool report true forever.
-func (ps *PebbleStore) CountLiveEngrams(ctx context.Context) (int64, error) {
-	lowerBound := []byte{prefix.Engram}
-	upperBound := []byte{prefix.Meta}
-
-	iter, err := ps.db.NewIter(&pebble.IterOptions{
-		LowerBound: lowerBound,
-		UpperBound: upperBound,
-	})
-	if err != nil {
-		return 0, err
+	if err := iter.Error(); err != nil {
+		return 0, fmt.Errorf("count embedded in vault scan: %w", err)
 	}
-	defer iter.Close()
-
-	var count int64
-	for valid := iter.First(); valid; valid = iter.Next() {
-		k := iter.Key()
-		if len(k) < 25 {
-			continue
-		}
-
-		val := make([]byte, len(iter.Value()))
-		copy(val, iter.Value())
-		if erfEng, decErr := erf.Decode(val); decErr == nil {
-			eng := fromERFEngram(erfEng)
-			if eng.State == StateSoftDeleted || eng.State == StateArchived {
-				continue
-			}
-		}
-		count++
-	}
-	return count, iter.Error()
+	return count, nil
 }
 
 // ScanWithoutFlag returns a forward-only iterator over all engrams that are
 // missing the given digest flag bit. Engrams that have any skipFlags bit set
 // are skipped during iteration.
-func (ps *PebbleStore) ScanWithoutFlag(ctx context.Context, flag, skipFlags uint8) *PluginEngramIterator {
+func (ps *PebbleStore) ScanWithoutFlag(ctx context.Context, flag, skipFlags uint16) *PluginEngramIterator {
 	lowerBound := []byte{prefix.Engram}
 	upperBound := []byte{prefix.Meta}
 
@@ -229,7 +177,7 @@ func (ps *PebbleStore) ScanWithoutFlag(ctx context.Context, flag, skipFlags uint
 }
 
 // SetDigestFlag sets a digest flag bit on an engram's digest flags record.
-func (ps *PebbleStore) SetDigestFlag(ctx context.Context, id ULID, flag uint8) error {
+func (ps *PebbleStore) SetDigestFlag(ctx context.Context, id ULID, flag uint16) error {
 	raw, err := ps.getDigestFlagsRaw([16]byte(id))
 	if err != nil {
 		if !errors.Is(err, pebble.ErrNotFound) {
@@ -239,25 +187,65 @@ func (ps *PebbleStore) SetDigestFlag(ctx context.Context, id ULID, flag uint8) e
 	}
 	raw |= flag
 	key := keys.DigestFlagsKey([16]byte(id))
-	return ps.db.Set(key, []byte{raw}, pebble.NoSync)
+	return ps.db.Set(key, encodeDigestFlags(raw), pebble.NoSync)
 }
 
-// GetDigestFlags returns the current digest flags byte for an engram.
-func (ps *PebbleStore) GetDigestFlags(ctx context.Context, id ULID) (uint8, error) {
+// GetDigestFlags returns the current digest flags for an engram.
+func (ps *PebbleStore) GetDigestFlags(ctx context.Context, id ULID) (uint16, error) {
 	return ps.getDigestFlagsRaw([16]byte(id))
 }
 
-func (ps *PebbleStore) getDigestFlagsRaw(id [16]byte) (uint8, error) {
+func (ps *PebbleStore) getDigestFlagsRaw(id [16]byte) (uint16, error) {
 	key := keys.DigestFlagsKey(id)
 	val, closer, err := ps.db.Get(key)
 	if err != nil {
 		return 0, err
 	}
 	defer closer.Close()
-	if len(val) == 0 {
-		return 0, nil
+	return decodeDigestFlags(val), nil
+}
+
+// decodeDigestFlags decodes a raw DigestFlagsKey value into the 16-bit flags
+// space. Tolerant of the legacy 1-byte encoding (#605): before the bit split,
+// DigestEmbedFailed and DigestEnrichFailed were literally the same bit
+// (0x80), so a legacy record carrying that bit cannot say which stage failed.
+// Rather than rewrite every existing record (a repair-pass migration), reads
+// reinterpret a legacy 0x80 as BOTH failure bits set — the same outcome the
+// old aliasing already produced (skipped by both the embed and enrich
+// retroactive passes), so no previously-flagged engram becomes newly stuck or
+// newly eligible on upgrade. Only NEW failures, recorded after this fix, are
+// distinguished. Any write through SetDigestFlag re-encodes as 2 bytes, so a
+// legacy record widens the first time it is touched.
+// legacyDigestEmbedFailed and legacyDigestEnrichFailed mirror
+// plugin.DigestEmbedFailed / plugin.DigestEnrichFailed. Duplicated here
+// (rather than imported) because internal/storage cannot depend on
+// internal/plugin (plugin already depends on storage) — internal/storage's
+// own embed_migration.go and entity.go carry the same kind of local mirror
+// for the same reason.
+const (
+	legacyDigestEmbedFailed  uint16 = 0x80
+	legacyDigestEnrichFailed uint16 = 0x100
+)
+
+func decodeDigestFlags(val []byte) uint16 {
+	switch len(val) {
+	case 0:
+		return 0
+	case 1:
+		raw := uint16(val[0])
+		if raw&legacyDigestEmbedFailed != 0 {
+			raw |= legacyDigestEmbedFailed | legacyDigestEnrichFailed
+		}
+		return raw
+	default:
+		return uint16(val[0]) | uint16(val[1])<<8
 	}
-	return val[0], nil
+}
+
+// encodeDigestFlags encodes the 16-bit flags space as the 2-byte
+// DigestFlagsKey value (low byte, then high byte).
+func encodeDigestFlags(flags uint16) []byte {
+	return []byte{byte(flags), byte(flags >> 8)}
 }
 
 // UpdateEmbedding stores an embedding vector for an engram.
@@ -355,8 +343,8 @@ type PluginEngramIterator struct {
 	ps        *PebbleStore
 	iter      *pebble.Iterator
 	iterErr   error // set when NewIter failed; Next() immediately returns false
-	flag      uint8
-	skipFlags uint8 // skip engrams that have any of these bits set (e.g. DigestEmbedFailed)
+	flag      uint16
+	skipFlags uint16 // skip engrams that have any of these bits set (e.g. DigestEmbedFailed)
 	started   bool
 	current   *Engram
 	// wsCache maps ULID -> vault prefix so callers can retrieve it.
@@ -448,4 +436,132 @@ func (it *PluginEngramIterator) Close() error {
 		return it.iterErr
 	}
 	return it.iter.Close()
+}
+
+// engramValueIsLive reports whether a raw 0x01 engram record is in a live
+// state — neither soft-deleted nor archived. A value that cannot be decoded is
+// treated as live: this filter exists to EXCLUDE records known to be dead, and
+// guessing "dead" from a decode failure would silently shrink counts.
+func engramValueIsLive(val []byte) bool {
+	erfEng, err := erf.Decode(val)
+	if err != nil {
+		return true
+	}
+	eng := fromERFEngram(erfEng)
+	return eng.State != StateSoftDeleted && eng.State != StateArchived
+}
+
+// CountEngramsWithFlag returns the number of LIVE engrams (excluding
+// soft-deleted and archived) across all vaults that have the given digest flag
+// bit set. Unlike CountWithFlag, which scans the global 0x11 DigestFlags
+// keyspace directly and can therefore count flags orphaned by ClearVault or a
+// hard delete, this scans live engram records the same way CountWithoutFlag
+// does — so its result can never exceed a live-engram total computed the same
+// way (CountLiveEngrams). This is what the embed-status API's EmbeddedCount
+// uses: without it, EmbeddedCount could exceed TotalCount and the "indexing"
+// bool would go permanently false while a real backlog was still being
+// processed (the comparison `embedded < total` never holds).
+//
+// CountEmbeddedInVault is the vault-scoped counterpart (#802).
+func (ps *PebbleStore) CountEngramsWithFlag(ctx context.Context, flag uint16) (int64, error) {
+	iter, err := ps.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte{prefix.Engram},
+		UpperBound: []byte{prefix.Meta},
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+
+	var count int64
+	for valid := iter.First(); valid; valid = iter.Next() {
+		k := iter.Key()
+		if len(k) < 25 {
+			continue
+		}
+		if !engramValueIsLive(iter.Value()) {
+			continue
+		}
+		var id [16]byte
+		copy(id[:], k[9:25])
+		raw, err := ps.getDigestFlagsRaw(id)
+		if err == nil && raw&flag != 0 {
+			count++
+		}
+	}
+	return count, iter.Error()
+}
+
+// CountLiveEngrams returns the number of LIVE engrams (excluding soft-deleted
+// and archived) across all vaults — the same live-state filter
+// CountEngramsWithFlag applies, with no flag check. It exists so a caller
+// comparing "how many are embedded" against "how many total" computes both
+// sides over the identical filter.
+//
+// Do not use engine's engramCount (backing Stat's EngramCount) for that
+// comparison instead: it only decrements on a HARD delete, never on soft
+// delete or archive, so it still counts engrams CountEngramsWithFlag
+// deliberately excludes. A vault with embedded-then-soft-deleted engrams would
+// read EmbeddedCount permanently below that counter with nothing left to do,
+// making the embed-status API's "indexing" bool report true forever.
+func (ps *PebbleStore) CountLiveEngrams(ctx context.Context) (int64, error) {
+	iter, err := ps.db.NewIter(&pebble.IterOptions{
+		LowerBound: []byte{prefix.Engram},
+		UpperBound: []byte{prefix.Meta},
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+
+	var count int64
+	for valid := iter.First(); valid; valid = iter.Next() {
+		if len(iter.Key()) < 25 {
+			continue
+		}
+		if !engramValueIsLive(iter.Value()) {
+			continue
+		}
+		count++
+	}
+	return count, iter.Error()
+}
+
+// CountLiveEngramsInVault is CountLiveEngrams scoped to one vault — the
+// denominator to CountEmbeddedInVault's numerator (#802). Both apply
+// engramValueIsLive, so the per-vault embed-status ratio obeys the same
+// EmbeddedCount <= TotalCount invariant the instance-wide pair does.
+func (ps *PebbleStore) CountLiveEngramsInVault(ctx context.Context, wsPrefix [8]byte) (int64, error) {
+	lower := keys.EngramKey(wsPrefix, [16]byte{})
+	upperWS := wsPrefix
+	for i := 7; i >= 0; i-- {
+		upperWS[i]++
+		if upperWS[i] != 0 {
+			break
+		}
+	}
+	upper := make([]byte, 1+8)
+	upper[0] = prefix.Engram
+	copy(upper[1:9], upperWS[:])
+
+	iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+
+	var count int64
+	for valid := iter.First(); valid; valid = iter.Next() {
+		if len(iter.Key()) < 25 {
+			continue
+		}
+		if !engramValueIsLive(iter.Value()) {
+			continue
+		}
+		count++
+	}
+	if err := iter.Error(); err != nil {
+		return 0, fmt.Errorf("count live engrams in vault scan: %w", err)
+	}
+	return count, nil
 }

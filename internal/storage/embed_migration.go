@@ -21,9 +21,9 @@ import (
 //
 // Returns the number of digest records that were written (created or updated).
 func (ps *PebbleStore) ClearEmbedFlagsForVault(ctx context.Context, ws [8]byte) (int64, error) {
-	const DigestEmbed uint8 = 0x02
-	const DigestEmbedFailed uint8 = 0x80
-	const embedMask uint8 = DigestEmbed | DigestEmbedFailed
+	const DigestEmbed uint16 = 0x02
+	const DigestEmbedFailed uint16 = 0x80
+	const embedMask uint16 = DigestEmbed | DigestEmbedFailed
 
 	wsPlus, err := keys.IncrementWSPrefix(ws)
 	if err != nil {
@@ -98,7 +98,7 @@ func (ps *PebbleStore) ClearEmbedFlagsForVault(ctx context.Context, ws [8]byte) 
 
 		raw &^= embedMask
 		flagKey := keys.DigestFlagsKey(id)
-		if err := batch.Set(flagKey, []byte{raw}, nil); err != nil {
+		if err := batch.Set(flagKey, encodeDigestFlags(raw), nil); err != nil {
 			return cleared, fmt.Errorf("clear embed flags: batch set: %w", err)
 		}
 		cleared++
@@ -156,9 +156,9 @@ func (ps *PebbleStore) ClearEmbedFlagsForVault(ctx context.Context, ws [8]byte) 
 // path for every embed/enrich completion in the codebase, not something to
 // change as a side effect of this admin-recovery addition.
 func (ps *PebbleStore) ClearEmbedFlagsForEngrams(ctx context.Context, wsPrefix [8]byte, ids []ULID) (int64, error) {
-	const DigestEmbed uint8 = 0x02
-	const DigestEmbedFailed uint8 = 0x80
-	const embedMask uint8 = DigestEmbed | DigestEmbedFailed
+	const DigestEmbed uint16 = 0x02
+	const DigestEmbedFailed uint16 = 0x80
+	const embedMask uint16 = DigestEmbed | DigestEmbedFailed
 
 	var cleared int64
 	batch := ps.db.NewBatch()
@@ -179,7 +179,7 @@ func (ps *PebbleStore) ClearEmbedFlagsForEngrams(ctx context.Context, wsPrefix [
 		}
 		raw &^= embedMask
 
-		if err := batch.Set(keys.DigestFlagsKey([16]byte(id)), []byte{raw}, nil); err != nil {
+		if err := batch.Set(keys.DigestFlagsKey([16]byte(id)), encodeDigestFlags(raw), nil); err != nil {
 			return cleared, fmt.Errorf("clear embed flags: batch set %s: %w", id, err)
 		}
 		batch.Delete(keys.EmbeddingKey(wsPrefix, [16]byte(id)), nil)

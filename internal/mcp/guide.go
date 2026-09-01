@@ -12,7 +12,11 @@ type engineStats struct {
 	VaultCount  int
 }
 
-func generateGuide(vaultName string, resolved auth.ResolvedPlasticity, stats engineStats) string {
+// generateGuide renders the per-vault guide. debtSection is the pre-rendered
+// COG-29 debt readout (see contradictionDebtGuideSection) — empty when the
+// vault carries no unresolved declared contradiction, which is the overwhelming
+// default and adds zero bytes.
+func generateGuide(vaultName string, resolved auth.ResolvedPlasticity, stats engineStats, debtSection string) string {
 	var b strings.Builder
 
 	// Header
@@ -89,6 +93,7 @@ func generateGuide(vaultName string, resolved auth.ResolvedPlasticity, stats eng
 	b.WriteString("- **muninn_contradictions** — Check for known contradictions\n")
 	b.WriteString("- **muninn_status** — Get vault health and stats\n")
 	b.WriteString("- **muninn_evolve** — Update a memory with new information (optional `entities` replaces the carried entity set when the update changed what the memory is about; optional `importance` and `effective_at`)\n")
+	b.WriteString("- **muninn_update_tags** — Replace a memory's tag set IN PLACE (id, version lineage, and access history preserved). `muninn_evolve` inherits tags but cannot change them and REJECTS a `tags` argument, so to update content and tags together: evolve first, then `muninn_update_tags(new_id, tags)`. Use this for mutable tag conventions such as `due:<ISO-date>`. An empty array clears all tags. A soft-deleted memory can still be retagged, but while it is deleted its keyword-search postings are DROPPED rather than rebuilt — that is what keeps a deleted memory out of search results — so retag it again after `muninn_restore` if it must be findable by the new tags. Tags are normalized leniently, exactly as `muninn_remember` normalizes them — non-string, empty, and over-128-BYTE entries are DROPPED (not rejected) and the set is TRUNCATED to 50 — so read the `tags` the response echoes back to see what was actually stored. That limit is bytes, not glyphs: a 50-glyph CJK tag is 150 bytes and is dropped.\n")
 	b.WriteString("- **muninn_consolidate** — Merge related memories into one\n")
 	if resolved.MultiUser {
 		b.WriteString("- **muninn_session** — Recent memory activity across ALL users of this shared vault (admin/audit)\n")
@@ -191,6 +196,10 @@ func generateGuide(vaultName string, resolved auth.ResolvedPlasticity, stats eng
 	b.WriteString("`muninn_contradictions` reports each pair's `status` (`declared` = an explicit link exists; `detected` = the detector found it), its ")
 	b.WriteString("`confidence_penalty` (`pending`|`applied` — an asynchronous ~30s batch job that affects confidence only, never whether the contradiction ")
 	b.WriteString("is honored), and `resolved_by` on pairs that are no longer live.\n")
+	// The vault's OWN outstanding debt, appended to the doctrine above. Nothing
+	// else in this document reports per-vault contradiction state: everything
+	// above explains what happens WHEN you declare one.
+	b.WriteString(debtSection)
 
 	// Hierarchical memory
 	b.WriteString("\n## Hierarchical Memory\n\n")

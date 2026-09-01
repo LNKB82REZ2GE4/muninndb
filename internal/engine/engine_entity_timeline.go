@@ -41,24 +41,12 @@ func (e *Engine) GetEntityTimeline(ctx context.Context, vault string, entityName
 		limit = 50
 	}
 
-	// Resolve the vault prefix.
+	// Resolve the vault prefix first — the 0x1F entity record is vault-scoped
+	// (#683), so "does this entity exist" is a question only a vault can answer.
 	ws := e.store.ResolveVaultPrefix(vault)
 
-	// The 0x1F entity registry is global/vault-agnostic (docs/plans/2026-07-19-
-	// project-vaults.md §4.1 correction), so gate on vault presence BEFORE
-	// reading the global record — otherwise a caller could probe the
-	// existence, first-seen time, and global mention count of an entity that
-	// only appears in a vault they have no access to.
-	present, err := e.entityVisibleInVault(ctx, ws, entityName)
-	if err != nil {
-		return nil, fmt.Errorf("check entity presence: %w", err)
-	}
-	if !present {
-		return nil, fmt.Errorf("entity_name not found in entity registry")
-	}
-
 	// Get the entity record to check if it exists and get FirstSeen + MentionCount.
-	entityRecord, err := e.store.GetEntityRecord(ctx, entityName)
+	entityRecord, err := e.store.GetEntityRecord(ctx, ws, entityName)
 	if err != nil {
 		return nil, fmt.Errorf("get entity record: %w", err)
 	}

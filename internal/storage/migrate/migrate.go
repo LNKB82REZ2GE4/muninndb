@@ -50,15 +50,30 @@ func RegisterMigrations(r *Runner) {
 	r.Register(Migration{Version: 2, Description: "backfill relationship entity index (0x26) for GetEntityAggregate optimisation", Up: BackfillRelEntityIndex})
 	r.Register(Migration{Version: 3, Description: "relocate auth prefixes 0x11–0x14 to 0x42–0x45 (#611)", Up: RelocateAuthPrefixes})
 	r.Register(Migration{Version: 4, Description: "backfill ordered raw-tag-range index (0x2C) for existing key:value tags (S1)", Up: BackfillRawTagRange})
+	// FORK/UPSTREAM MIGRATION NUMBERING — read before adding a migration.
+	//
+	// The runner stores a single high-water mark, not a set of applied
+	// versions. This fork shipped its own v5 and v6 and applied them to live
+	// data directories before the upstream 0.11.0 merge, so those data dirs are
+	// stamped at 6. Renumbering the fork's migrations upward would leave
+	// upstream's own v5/v6 BELOW the stored mark, where the runner skips them
+	// silently — the replication keyspace would stay on the double-allocated
+	// 0x19 and entity records would stay global, which are precisely the two
+	// defects upstream 0.11.0 exists to fix. So the fork keeps 5 and 6, and
+	// upstream's v5/v6 are renumbered to 8 and 9 here. Keep that direction on
+	// every future merge: renumber the INCOMING migrations, never the applied
+	// ones.
 	r.Register(Migration{Version: 5, Description: "backfill glob-scope api key index (0x46) and prune stale 0x29 entries", Up: BackfillAPIKeyGlobIndex})
 	r.Register(Migration{Version: 6, Description: "backfill per-vault declared-contradiction marker (0x31) for COG-29's O(1) recall gate", Up: BackfillDeclaredContradictionMark})
-	// Fork/upstream numbering. Versions 5 and 6 are THIS FORK's, and were
-	// applied to live data dirs before the 0.11.0 merge, so they keep their
-	// numbers; upstream's own v5 (replication keyspace relocation) and v6
-	// (vault-scoped entity records) are renumbered to 8 and 9 by that merge.
-	// v7 must stay below the relocated replication migration — see
-	// PurgeLegacyDeclaredContradictionMark for why the ordering is load-bearing.
+	// v7 must stay BELOW the replication relocation: it clears this fork's
+	// legacy 0x2F marker keys out of the range v8 is about to move replication
+	// into. See PurgeLegacyDeclaredContradictionMark — the ordering is
+	// load-bearing and pinned by a test.
 	r.Register(Migration{Version: 7, Description: "purge legacy 0x2F declared-contradiction markers and rebuild them at 0x31 (fork/upstream keyspace collision)", Up: PurgeLegacyDeclaredContradictionMark})
+	// Upstream v5, renumbered.
+	r.Register(Migration{Version: 8, Description: "relocate the replication keyspace off the double-allocated 0x19 onto 0x2F (#726) [upstream v5]", Up: RelocateReplicationPrefix})
+	// Upstream v6, renumbered.
+	r.Register(Migration{Version: 9, Description: "vault-scope entity records: 0x1F|nameHash -> 0x1F|ws|nameHash, mention_count recomputed per vault (#683) [upstream v6]", Up: VaultScopeEntityRecords})
 }
 
 // MaxRegisteredVersion returns the highest migration version this binary knows.

@@ -36,7 +36,7 @@ func TestStartReembedVault_Success(t *testing.T) {
 	ctx := context.Background()
 
 	const vaultName = "reembed-success"
-	const DigestEmbed uint8 = 0x02
+	const DigestEmbed uint16 = 0x02
 
 	// Write a few engrams.
 	idStrings := make([]string, 3)
@@ -126,8 +126,8 @@ func TestRetryEmbedFailed_ClearsOnlyListedEngrams(t *testing.T) {
 	ctx := context.Background()
 
 	const vaultName = "retry-embed-failed"
-	const DigestEmbed uint8 = 0x02
-	const DigestEmbedFailed uint8 = 0x80
+	const DigestEmbed uint16 = 0x02
+	const DigestEmbedFailed uint16 = 0x80
 
 	idStrings := make([]string, 3)
 	for i := range idStrings {

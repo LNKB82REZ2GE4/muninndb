@@ -109,7 +109,7 @@ func (e *Engine) FindSimilarEntities(ctx context.Context, vault string, threshol
 //
 // When dryRun=true the function reports what would happen without writing anything.
 func (e *Engine) MergeEntity(ctx context.Context, vault, entityA, entityB string, dryRun bool) (*MergeEntityResult, error) {
-	if err := e.refuseAppend(ctx); err != nil {
+	if err := e.refuseWrite(ctx); err != nil {
 		return nil, err
 	}
 	if entityA == "" || entityB == "" {
@@ -134,28 +134,7 @@ func (e *Engine) MergeEntity(ctx context.Context, vault, entityA, entityB string
 
 	ws := e.store.ResolveVaultPrefix(vault)
 
-	// The 0x1F entity registry is global/vault-agnostic (docs/plans/2026-07-19-
-	// project-vaults.md §4.1 correction), so gate on vault presence for BOTH
-	// entities before any read or write — otherwise a caller could probe the
-	// existence of, or mutate the global state of, an entity that only
-	// appears in a vault they have no access to (e.g. marking someone else's
-	// entity "merged" purely by guessing its name).
-	presentA, err := e.entityVisibleInVault(ctx, ws, entityA)
-	if err != nil {
-		return nil, fmt.Errorf("merge_entity: check entity_a presence: %w", err)
-	}
-	if !presentA {
-		return nil, fmt.Errorf("merge_entity: entity_a %q not found", entityA)
-	}
-	presentB, err := e.entityVisibleInVault(ctx, ws, entityB)
-	if err != nil {
-		return nil, fmt.Errorf("merge_entity: check entity_b presence: %w", err)
-	}
-	if !presentB {
-		return nil, fmt.Errorf("merge_entity: entity_b %q not found", entityB)
-	}
-
-	recA, err := e.store.GetEntityRecord(ctx, entityA)
+	recA, err := e.store.GetEntityRecord(ctx, ws, entityA)
 	if err != nil {
 		return nil, fmt.Errorf("merge_entity: read entity_a: %w", err)
 	}
@@ -166,7 +145,7 @@ func (e *Engine) MergeEntity(ctx context.Context, vault, entityA, entityB string
 		return nil, fmt.Errorf("merge_entity: entity_a %q is already merged into %q", entityA, recA.MergedInto)
 	}
 
-	recB, err := e.store.GetEntityRecord(ctx, entityB)
+	recB, err := e.store.GetEntityRecord(ctx, ws, entityB)
 	if err != nil {
 		return nil, fmt.Errorf("merge_entity: read entity_b: %w", err)
 	}
@@ -224,7 +203,7 @@ func (e *Engine) MergeEntity(ctx context.Context, vault, entityA, entityB string
 	}
 
 	// Step 2: mark A as merged.
-	if err := e.store.UpsertEntityRecord(ctx, storage.EntityRecord{
+	if err := e.store.UpsertEntityRecord(ctx, ws, storage.EntityRecord{
 		Name:       recA.Name,
 		Type:       recA.Type,
 		Confidence: recA.Confidence,
@@ -240,7 +219,7 @@ func (e *Engine) MergeEntity(ctx context.Context, vault, entityA, entityB string
 	if recA.Confidence > newConf {
 		newConf = recA.Confidence
 	}
-	if err := e.store.UpsertEntityRecord(ctx, storage.EntityRecord{
+	if err := e.store.UpsertEntityRecord(ctx, ws, storage.EntityRecord{
 		Name:       recB.Name,
 		Type:       recB.Type,
 		Confidence: newConf,

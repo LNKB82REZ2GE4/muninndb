@@ -20,8 +20,25 @@ func markerTestStore(t *testing.T) *PebbleStore {
 	return ps
 }
 
+// writeMarkerEngram creates the minimal real engram an association endpoint
+// needs. Upstream's STO-12 guard (#803) refuses an edge whose endpoints have no
+// 0x01 record, so these fixtures can no longer invent bare ULIDs — the ids must
+// belong to engrams that actually exist in the vault.
+func writeMarkerEngram(t *testing.T, ps *PebbleStore, ws [8]byte, id ULID) {
+	t.Helper()
+	if _, err := ps.WriteEngram(context.Background(), ws, &Engram{
+		ID:      id,
+		Concept: "marker fixture",
+		Content: "marker fixture content",
+	}); err != nil {
+		t.Fatalf("WriteEngram(%s): %v", id.String(), err)
+	}
+}
+
 func writeContradictsEdge(t *testing.T, ps *PebbleStore, ws [8]byte, src, dst ULID) {
 	t.Helper()
+	writeMarkerEngram(t, ps, ws, src)
+	writeMarkerEngram(t, ps, ws, dst)
 	if err := ps.WriteAssociation(context.Background(), ws, src, dst, &Association{
 		TargetID:   dst,
 		RelType:    RelContradicts,

@@ -23,7 +23,7 @@ import (
 // goroutine (typically seconds). Actual re-embedding is handled by the existing
 // RetroactiveProcessor micro-batch pipeline.
 func (e *Engine) StartReembedVault(ctx context.Context, vaultName, modelName string) (*vaultjob.Job, error) {
-	if err := e.refuseAppend(ctx); err != nil {
+	if err := e.refuseWrite(ctx); err != nil {
 		return nil, err
 	}
 	if !e.beginVaultOp() {
@@ -81,7 +81,7 @@ func (e *Engine) StartReembedVault(ctx context.Context, vaultName, modelName str
 // targeted recovery, not a whole-vault re-embed), so there is no need for the
 // 202/job pattern.
 func (e *Engine) RetryEmbedFailed(ctx context.Context, vaultName string, ids []string) (int64, error) {
-	if err := e.refuseAppend(ctx); err != nil {
+	if err := e.refuseWrite(ctx); err != nil {
 		return 0, err
 	}
 	if !e.beginVaultOp() {

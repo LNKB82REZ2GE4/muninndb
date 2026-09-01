@@ -678,17 +678,26 @@ type EmbedStatusResponse struct {
 	HardwareAccelerated *bool `json:"hardware_accelerated,omitempty"`
 }
 
-// handleEmbedStatus returns the current embedder configuration and indexing state.
+// handleEmbedStatus returns the current embedder configuration and indexing
+// state. An optional ?vault= query param scopes embedded_count/total_count to
+// that vault (#802) — omitted or empty means instance-wide, the historical
+// behavior. Both counts share the SAME scope: without that, a vault-scoped
+// numerator over an instance-wide denominator produces a coverage ratio that
+// looks plausible and is wrong, exactly the silent-substitution failure this
+// project treats as worst.
 func (s *Server) handleEmbedStatus(w http.ResponseWriter, r *http.Request) {
+	vault := r.URL.Query().Get("vault")
+
 	// TotalCount must come from CountEmbeddableTotal, NOT Stat's EngramCount:
 	// the latter only decrements on a hard delete, never on soft delete or
-	// archive, while EmbeddedCount (CountEmbedded) excludes both. Comparing
-	// the two would let EmbeddedCount sit permanently below EngramCount for a
-	// vault holding embedded-then-soft-deleted engrams, reporting `indexing`
-	// true forever with nothing left to embed. Both counts here are computed
-	// over the identical live-state filter so the comparison is meaningful.
-	totalCount := s.engine.CountEmbeddableTotal(r.Context())
-	embeddedCount := s.engine.CountEmbedded(r.Context())
+	// archive, while EmbeddedCount (CountEmbedded) excludes both. Comparing the
+	// two would let EmbeddedCount sit permanently below EngramCount for a vault
+	// holding embedded-then-soft-deleted engrams, reporting `indexing` true
+	// forever with nothing left to embed. Both counts here are computed over the
+	// identical live-state filter, and both honour the same #802 vault scoping,
+	// so the comparison is meaningful per-vault as well as instance-wide.
+	totalCount := s.engine.CountEmbeddableTotal(r.Context(), vault)
+	embeddedCount := s.engine.CountEmbedded(r.Context(), vault)
 	indexing := embeddedCount >= 0 && totalCount >= 0 && embeddedCount < totalCount
 
 	resp := EmbedStatusResponse{
@@ -701,7 +710,11 @@ func (s *Server) handleEmbedStatus(w http.ResponseWriter, r *http.Request) {
 		HardwareAccelerated: s.embedHardwareAccelerated,
 	}
 
-	// Only populate rate/ETA when actively indexing.
+	// Only populate rate/ETA when actively indexing. rate_per_sec/eta_seconds
+	// remain instance-wide regardless of ?vault= — the RetroactiveProcessor
+	// backing EmbedStats does not track per-vault throughput. A named
+	// deferral, not silently wrong: embedded_count/total_count (the coverage
+	// ratio the reported defect was about) are vault-scoped when requested.
 	if indexing {
 		stats := s.engine.EmbedStats()
 		resp.RatePerSec = stats.RatePerSec
@@ -1261,6 +1274,61 @@ func (s *Server) handleReindexFTSVault(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{
 		"vault":             name,
 		"engrams_reindexed": count,
+	})
+}
+
+// handleResetRepairWatermark deletes a per-vault repair watermark (0x2B evolve
+// entity-link repair, 0x2E full-weight association repair, or both) so the
+// next boot re-scans instead of trusting a prior clean pass (#761). Neither
+// repair is leader-gated or replicated — each node runs its own startup
+// pass — so this resets THIS node's own copy only; an operator suspecting
+// several cluster nodes are affected calls it once per node.
+// POST /api/admin/vaults/{name}/repair-watermark/reset
+// Body: {"which": "evolve" | "assoc_weight" | "all"}
+// Response 200: {"vault": "...", "which": "..."}
+func (s *Server) handleResetRepairWatermark(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "vault name required")
+		return
+	}
+	if !isValidVaultName(name) {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "vault name contains invalid characters")
+		return
+	}
+
+	var req struct {
+		Which string `json:"which"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "invalid request body: "+err.Error())
+			return
+		}
+	}
+	if req.Which == "" {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "which required: evolve, assoc_weight, or all")
+		return
+	}
+
+	if err := s.engine.ResetRepairWatermark(r.Context(), name, engine.RepairWatermarkKind(req.Which)); err != nil {
+		if errors.Is(err, engine.ErrVaultNotFound) {
+			s.sendError(r, w, http.StatusNotFound, ErrVaultNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, engine.ErrUnknownRepairWatermark) {
+			s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, err.Error())
+			return
+		}
+		s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
+		return
+	}
+	s.EmitAudit(r, "vault.repair_watermark_reset", "vault", name, "ok", map[string]string{"which": req.Which})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{
+		"vault": name,
+		"which": req.Which,
 	})
 }
 

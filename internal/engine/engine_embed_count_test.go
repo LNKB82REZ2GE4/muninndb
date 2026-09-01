@@ -24,7 +24,7 @@ func TestCountEmbeddableTotal_MatchesCountEmbeddedFilter(t *testing.T) {
 	ctx := context.Background()
 
 	const vaultName = "embeddable-total-vault"
-	const DigestEmbed uint8 = 0x02
+	const DigestEmbed uint16 = 0x02
 
 	idStrings := make([]string, 3)
 	for i := range idStrings {
@@ -50,8 +50,8 @@ func TestCountEmbeddableTotal_MatchesCountEmbeddedFilter(t *testing.T) {
 	}
 
 	// Before any deletion: both counts must be equal (every live engram is embedded).
-	embedded := eng.CountEmbedded(ctx)
-	total := eng.CountEmbeddableTotal(ctx)
+	embedded := eng.CountEmbedded(ctx, "")
+	total := eng.CountEmbeddableTotal(ctx, "")
 	if embedded != total {
 		t.Fatalf("before soft delete: CountEmbedded=%d, CountEmbeddableTotal=%d, want equal", embedded, total)
 	}
@@ -61,8 +61,8 @@ func TestCountEmbeddableTotal_MatchesCountEmbeddedFilter(t *testing.T) {
 		t.Fatalf("Forget (soft): %v", err)
 	}
 
-	embedded = eng.CountEmbedded(ctx)
-	total = eng.CountEmbeddableTotal(ctx)
+	embedded = eng.CountEmbedded(ctx, "")
+	total = eng.CountEmbeddableTotal(ctx, "")
 	if embedded != total {
 		t.Errorf("after soft delete: CountEmbedded=%d, CountEmbeddableTotal=%d, want equal (both must exclude the soft-deleted engram)", embedded, total)
 	}

@@ -138,6 +138,16 @@ func (a *mcpEngineAdapter) GetContradictionReport(ctx context.Context, vault str
 	}
 	return out, nil
 }
+
+// ContradictionDebt satisfies the optional contradictionDebtReporter probed by
+// the three orientation handlers (COG-29 amendment). It passes the engine type
+// through unconverted on purpose: increment 2 moves the block onto
+// mbp.ActivateResponse, and a second conversion site here would be the
+// dual-source drift the obligations doc names explicitly.
+func (a *mcpEngineAdapter) ContradictionDebt(ctx context.Context, vault string) (*engine.ContradictionDebt, error) {
+	return a.eng.ContradictionDebt(ctx, vault)
+}
+
 func (a *mcpEngineAdapter) Evolve(ctx context.Context, vault, oldID, newContent, reason string, embedding []float32, concept string, entities []mbp.InlineEntity, importance *float32, effectiveAt time.Time) (*WriteResult, error) {
 	id, err := a.eng.EvolveAt(ctx, vault, oldID, newContent, reason, embedding, concept, entities, importance, effectiveAt)
 	if err != nil {
@@ -151,6 +161,26 @@ func (a *mcpEngineAdapter) Evolve(ctx context.Context, vault, oldID, newContent,
 	res := &WriteResult{ID: id.String()}
 	if eng, err := a.eng.GetEngram(ctx, vault, id); err == nil && eng != nil {
 		res.Concept = eng.Concept
+		// #769: a carried concept is a silent assertion about content that just
+		// changed. Inheriting it is the right default — most evolves sharpen a
+		// fact without changing what it is about — but saying nothing left a
+		// successor whose label describes the OLD fact, which every
+		// concept-surfacing view (muninn_where_left_off, session summaries, the
+		// console list) then presents as current. Announce it and NAME the
+		// carried label so the caller can judge it.
+		//
+		// The trigger is the engine's OWN carry predicate (`concept == ""` in
+		// EvolveAt), not a judgement about how much the content moved: deciding
+		// whether a new fact still fits an old label needs a reader, and this
+		// runtime does not have one. Warn whenever the label was inherited,
+		// never guess whether it still holds.
+		if concept == "" && eng.Concept != "" {
+			res.Warnings = append(res.Warnings, fmt.Sprintf(
+				"concept was not supplied, so the predecessor's label was carried forward verbatim: %q. "+
+					"The content changed; the label did not. If it no longer describes this memory, re-run "+
+					"muninn_evolve with 'concept' — concept-surfacing views show the label, not the content.",
+				eng.Concept))
+		}
 	} else if err != nil {
 		// Never fail an accepted write over a cosmetic read-back; say so rather
 		// than reporting an empty concept as if that were the stored value.
@@ -341,7 +371,7 @@ func (a *mcpEngineAdapter) RetryEnrich(ctx context.Context, vault, id string) (*
 	// Persist entities, links, and co-occurrence pairs.
 	var linkedEntityNames []string
 	for _, entity := range result.Entities {
-		if err := a.pStore.UpsertEntity(ctx, entity); err != nil {
+		if err := a.pStore.UpsertEntity(ctx, plugin.ULID(ulid), entity); err != nil {
 			slog.Warn("retry enrich: failed to upsert entity", "id", id, "name", entity.Name, "err", err)
 			continue
 		}
@@ -740,6 +770,14 @@ func (a *mcpEngineAdapter) SetTrust(ctx context.Context, vault, id, trust string
 	return a.eng.SetTrust(ctx, vault, id, trust)
 }
 
+func (a *mcpEngineAdapter) UpdateTags(ctx context.Context, vault, id string, tags []string) error {
+	ulid, err := storage.ParseULID(id)
+	if err != nil {
+		return fmt.Errorf("invalid engram id: %w", err)
+	}
+	return a.eng.UpdateTags(ctx, vault, ulid, tags)
+}
+
 func (a *mcpEngineAdapter) CompareAndSet(ctx context.Context, vault, id string, expectState, setState *string) (bool, string, string, error) {
 	res, err := a.eng.CompareAndSet(ctx, vault, id, expectState, setState)
 	if err != nil {
@@ -764,8 +802,8 @@ func (a *mcpEngineAdapter) Release(ctx context.Context, vault, id, owner string)
 	return res.Released, res.Owner, nil
 }
 
-func (a *mcpEngineAdapter) GetAnnotations(ctx context.Context, vault, id string) (*engine.AnnotationData, error) {
-	return a.eng.GetAnnotations(ctx, vault, id)
+func (a *mcpEngineAdapter) GetAnnotations(ctx context.Context, vault, id string, req *mbp.ActivateRequest) (*engine.AnnotationData, error) {
+	return a.eng.GetAnnotations(ctx, vault, id, req)
 }
 
 func (a *mcpEngineAdapter) ListEntities(ctx context.Context, vault string, limit int, state string) ([]EntitySummary, error) {
