@@ -37,7 +37,7 @@ func writeContradictsEdge(t *testing.T, ps *PebbleStore, ws [8]byte, src, dst UL
 // RED for the merge back door.
 //
 // MergeVaultData UNION-copies raw 0x03/0x04 bytes into the target. It never
-// calls WriteAssociation, so nothing stages the target's 0x2F marker. A target
+// calls WriteAssociation, so nothing stages the target's 0x31 marker. A target
 // previously proven clean therefore kept its `none` marker after receiving a
 // declared `contradicts` edge — and vaultMayHaveContradictions then answers
 // "no" forever, skipping COG-29 on a vault that durably contains a declared

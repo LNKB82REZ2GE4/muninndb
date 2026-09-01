@@ -13,7 +13,7 @@ import (
 )
 
 // writePreUpgradeAssoc writes a raw 0x03 forward-association key directly,
-// simulating an edge written by a binary that predates the 0x2F marker: the
+// simulating an edge written by a binary that predates the 0x31 marker: the
 // edge exists, no marker was ever written for its vault.
 func writePreUpgradeAssoc(t *testing.T, db *pebble.DB, ws [8]byte, src, dst [16]byte, rel storage.RelType) {
 	t.Helper()
@@ -49,7 +49,7 @@ func readMark(t *testing.T, db *pebble.DB, ws [8]byte) (byte, bool) {
 }
 
 // TestDeclaredContradictionMark_Backfill is the pre-upgrade acceptance case:
-// vaults whose associations were all written before the 0x2F marker existed
+// vaults whose associations were all written before the 0x31 marker existed
 // must be classified correctly in one pass — the vault with a contradicts edge
 // marked `yes`, the vault without marked `none` — so the recall gate becomes
 // O(1) on a vault far too large to scan per query.

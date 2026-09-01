@@ -9,7 +9,7 @@ import (
 )
 
 // TestContradictionMarker_WrittenWithTheEdge pins the write path: declaring a
-// contradiction must leave a DURABLE 0x2F marker, not just an in-process flag.
+// contradiction must leave a DURABLE 0x31 marker, not just an in-process flag.
 // Without it the recall gate has no O(1) way to know, and falls back to the
 // capped keyspace scan that a large vault can never complete.
 func TestContradictionMarker_WrittenWithTheEdge(t *testing.T) {

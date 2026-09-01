@@ -1161,7 +1161,7 @@ func (ps *PebbleStore) GetContradictionRecords(ctx context.Context, wsPrefix [8]
 	return recs, nil
 }
 
-// Values of the per-vault declared-contradiction marker (0x2F). The key being
+// Values of the per-vault declared-contradiction marker (0x31). The key being
 // ABSENT is a third state — UNKNOWN — and is deliberately not a constant here:
 // there is no byte that means it, so no caller can accidentally treat it as
 // DeclaredContradictionNone.
@@ -1324,7 +1324,7 @@ func (ps *PebbleStore) SetDeclaredContradictionMark(ctx context.Context, wsPrefi
 // association keys into it.
 //
 // Bulk copies move raw 0x03/0x04 bytes; they never call WriteAssociation, so
-// nothing stages the 0x2F marker. Without this, merging a source that contains
+// nothing stages the 0x31 marker. Without this, merging a source that contains
 // a declared `contradicts` edge into a target previously proven clean leaves
 // the target's `none` marker standing over a durable contradiction — and COG-29
 // is then skipped on that vault forever, silently. That is the failure class

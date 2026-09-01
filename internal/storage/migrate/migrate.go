@@ -51,7 +51,14 @@ func RegisterMigrations(r *Runner) {
 	r.Register(Migration{Version: 3, Description: "relocate auth prefixes 0x11–0x14 to 0x42–0x45 (#611)", Up: RelocateAuthPrefixes})
 	r.Register(Migration{Version: 4, Description: "backfill ordered raw-tag-range index (0x2C) for existing key:value tags (S1)", Up: BackfillRawTagRange})
 	r.Register(Migration{Version: 5, Description: "backfill glob-scope api key index (0x46) and prune stale 0x29 entries", Up: BackfillAPIKeyGlobIndex})
-	r.Register(Migration{Version: 6, Description: "backfill per-vault declared-contradiction marker (0x2F) for COG-29's O(1) recall gate", Up: BackfillDeclaredContradictionMark})
+	r.Register(Migration{Version: 6, Description: "backfill per-vault declared-contradiction marker (0x31) for COG-29's O(1) recall gate", Up: BackfillDeclaredContradictionMark})
+	// Fork/upstream numbering. Versions 5 and 6 are THIS FORK's, and were
+	// applied to live data dirs before the 0.11.0 merge, so they keep their
+	// numbers; upstream's own v5 (replication keyspace relocation) and v6
+	// (vault-scoped entity records) are renumbered to 8 and 9 by that merge.
+	// v7 must stay below the relocated replication migration — see
+	// PurgeLegacyDeclaredContradictionMark for why the ordering is load-bearing.
+	r.Register(Migration{Version: 7, Description: "purge legacy 0x2F declared-contradiction markers and rebuild them at 0x31 (fork/upstream keyspace collision)", Up: PurgeLegacyDeclaredContradictionMark})
 }
 
 // MaxRegisteredVersion returns the highest migration version this binary knows.

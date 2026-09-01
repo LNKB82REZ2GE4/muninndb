@@ -10,7 +10,7 @@ package prefix
 
 // Source-of-truth prefix bytes. Storage unchanged; auth RELOCATED 0x11–0x14 → 0x42–0x45.
 const (
-	// Storage (0x01–0x2E)
+	// Storage (0x01–0x2E, 0x31; 0x2F/0x30 reserved for upstream)
 	Engram             byte = 0x01
 	Meta               byte = 0x02
 	AssocFwd           byte = 0x03
@@ -79,13 +79,26 @@ const (
 	// one-shot watermark is sound because the fixed encoder cannot create new
 	// damage of this kind.
 	AssocWeightRepairMark byte = 0x2E
-	// DeclaredContradictionMark (0x2F) — per-vault O(1) answer to "does this
+	// DeclaredContradictionMark (0x31) — per-vault O(1) answer to "does this
 	// vault contain ANY declared `contradicts` association?", the fast-path
-	// gate for COG-29 contradiction honesty. Key: 0x2F | ws(8) = 9 bytes.
+	// gate for COG-29 contradiction honesty. Key: 0x31 | ws(8) = 9 bytes.
 	// Value: 1 byte — 0x01 declared (sticky), 0x00 proven clean. ABSENT means
 	// UNKNOWN and must never be read as clean; see keys.DeclaredContradictionMarkKey
 	// and docs/internals/keyspace-registry.md.
-	DeclaredContradictionMark byte = 0x2F
+	//
+	// RELOCATION (fork, pre-0.11.0 merge): this marker was originally allocated
+	// 0x2F by this fork. Upstream #726 subsequently claimed 0x2F for the
+	// relocated Replication keyspace and #556 claimed 0x30 for UpsertKey, so
+	// both are now RESERVED FOR UPSTREAM and must not be reused here. The
+	// collision was not merely a registry clash: upstream's replication layout
+	// is 0x2F|0x01|seq_be64(8) for log entries and 0x2F|0x02|name for metadata,
+	// while this marker's key is 0x2F|ws(8) — a vault hash whose first byte
+	// happens to be 0x01 or 0x02 would have landed inside upstream's log-entry
+	// or metadata sub-range. Migration v7 (PurgeLegacyDeclaredContradictionMark)
+	// removes every stale 0x2F marker key and rebuilds the marker at 0x31; it is
+	// ordered BEFORE the renumbered upstream replication relocation so the purge
+	// can never delete a replication record.
+	DeclaredContradictionMark byte = 0x31
 	// Capability (0x40/0x41 — clean since #612)
 	Capability         byte = 0x40
 	CapabilityVaultIdx byte = 0x41

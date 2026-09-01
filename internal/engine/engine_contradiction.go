@@ -119,7 +119,7 @@ func (ce contradictionEdge) other(id storage.ULID) storage.ULID {
 //     deployment — the default, and the evaluators' case — honors a declaration
 //     on the very next query.
 //
-//  2. The durable per-vault 0x2F marker: ONE point lookup. `none` is the only
+//  2. The durable per-vault 0x31 marker: ONE point lookup. `none` is the only
 //     answer that lets this gate return false, and it is only ever written off
 //     a scan that ran to completion (migration v6, or probe 4 below). `yes` is
 //     written in the same batch as the contradicts edge itself, so it is also
@@ -136,7 +136,7 @@ func (ce contradictionEdge) other(id storage.ULID) storage.ULID {
 //     muninn_link(contradicts) and that flush loses the flag while the marker
 //     was never written. Recall would then silently stop honoring a durable,
 //     correctly-declared contradiction FOREVER. A COMPLETE clean scan is now
-//     persisted to 0x2F, so a contradiction-free vault pays it exactly once
+//     persisted to 0x31, so a contradiction-free vault pays it exactly once
 //     per DATABASE rather than once per process.
 //
 // Named residual, unchanged in kind but no longer permanent: the once-per-
@@ -193,7 +193,7 @@ func (e *Engine) declaredContradictionsProbe(ctx context.Context, ws [8]byte) bo
 		// Promote to the sticky flag: the vault demonstrably has a declared
 		// contradiction, so never pay this scan again.
 		e.contradictionsDeclared.Store(ws, struct{}{})
-		// Durable too: this is a proven Yes, and the 0x2F marker is what
+		// Durable too: this is a proven Yes, and the 0x31 marker is what
 		// spares the NEXT process the scan.
 		if err := e.store.SetDeclaredContradictionMark(ctx, ws, storage.DeclaredContradictionYes); err != nil {
 			slog.Warn("recall: failed to persist declared-contradiction marker", "err", err)

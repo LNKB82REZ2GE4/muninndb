@@ -83,7 +83,7 @@ func (ps *PebbleStore) CloneVaultData(
 
 	var copiedEngrams int64
 	// Whether phase 2 moved any association key into the target — the trigger
-	// for reconciling the target's declared-contradiction marker (0x2F).
+	// for reconciling the target's declared-contradiction marker (0x31).
 	copiedAssociations := false
 
 	// ---- Phase 1: Copy engrams (0x01) with ERF decode → reset → re-encode ----
@@ -268,7 +268,7 @@ func (ps *PebbleStore) CloneVaultData(
 	}
 
 	// ---- Phase 6: Reconcile the target's declared-contradiction marker ----
-	// The copy moved raw association bytes; nothing staged the 0x2F marker for
+	// The copy moved raw association bytes; nothing staged the 0x31 marker for
 	// them. If the source is known to hold a declared contradiction the target
 	// now does too; otherwise the target goes UNKNOWN and the recall gate
 	// re-derives it. Never leave a `none` marker standing over imported edges.
@@ -309,7 +309,7 @@ func (ps *PebbleStore) MergeVaultData(
 
 	var mergedEngrams int64
 	// See CloneVaultData: a bulk copy moves raw 0x03/0x04 bytes and never calls
-	// WriteAssociation, so the target's 0x2F marker has to be reconciled by hand.
+	// WriteAssociation, so the target's 0x31 marker has to be reconciled by hand.
 	copiedAssociations := false
 
 	// ---- Phase 1: Merge engrams (0x01) with collision detection ----

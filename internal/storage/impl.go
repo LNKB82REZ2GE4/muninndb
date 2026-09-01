@@ -87,7 +87,7 @@ type PebbleStore struct {
 	// closing the lifecycle-state TOCTOU and backing the ownership lease.
 	casLocks stripedMutex
 	// declaredContradictionLocks serialises the ONE read-modify-write on the
-	// 0x2F declared-contradiction marker (SetDeclaredContradictionMark's `none`
+	// 0x31 declared-contradiction marker (SetDeclaredContradictionMark's `none`
 	// path, which is check-then-set) against the edge writers that set `yes`.
 	// Edge writers take the READ side around their batch commit — they never
 	// conflict with each other — so the hot path pays an uncontended RLock and

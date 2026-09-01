@@ -34,7 +34,7 @@ type pebbleStoreBatch struct {
 	// stateUpdatedIDs tracks engrams whose state was changed by UpdateEngramState.
 	// Their cache entries are invalidated in Commit after the batch flushes to Pebble.
 	stateUpdatedIDs []stateUpdate
-	// markedContradictionWS holds the vaults for which this batch staged a 0x2F
+	// markedContradictionWS holds the vaults for which this batch staged a 0x31
 	// `yes` marker. Unlike the immediate-commit paths, this batch's Set and its
 	// Commit are separated in time, so the marker read lock can only be taken
 	// at Commit — see PebbleStore.holdDeclaredContradictionMarks.

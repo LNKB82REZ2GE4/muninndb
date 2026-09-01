@@ -284,7 +284,7 @@ func (ps *PebbleStore) ImportVaultData(
 		committed   bool
 		// copiedAssoc records whether any association key landed in the target.
 		// An import writes raw 0x03/0x04 bytes without going through
-		// WriteAssociation, so nothing stages the 0x2F declared-contradiction
+		// WriteAssociation, so nothing stages the 0x31 declared-contradiction
 		// marker for them and the target's marker must be reconciled.
 		copiedAssoc bool
 	}
@@ -519,10 +519,10 @@ func (ps *PebbleStore) ImportVaultData(
 			kv.batch.Close()
 			kv.committed = true
 
-			// The import wrote raw association bytes; return the target's 0x2F
+			// The import wrote raw association bytes; return the target's 0x31
 			// marker to UNKNOWN so a pre-import `none` cannot stand over an
 			// imported declared contradiction. There is no source marker to
-			// adopt — 0x2F is not exported.
+			// adopt — 0x31 is not exported.
 			if err := ps.ReconcileDeclaredContradictionMarkAfterBulkCopy(ctx, wsTarget, kv.copiedAssoc, false); err != nil {
 				return nil, fmt.Errorf("import: reconcile contradiction marker: %w", err)
 			}

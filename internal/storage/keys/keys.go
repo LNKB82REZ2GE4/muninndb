@@ -1002,8 +1002,9 @@ func AssocWeightRepairMarkKey(ws [8]byte) []byte {
 }
 
 // DeclaredContradictionMarkKey constructs the per-vault declared-contradiction
-// marker key (0x2F). Value: one byte — DeclaredContradictionYes (0x01) or
-// DeclaredContradictionNone (0x00). Key: 0x2F | wsPrefix(8) = 9 bytes.
+// marker key (0x31). Value: one byte — DeclaredContradictionYes (0x01) or
+// DeclaredContradictionNone (0x00). Key: 0x31 | wsPrefix(8) = 9 bytes.
+// (Was 0x2F before the 0.11.0 merge; see prefix.DeclaredContradictionMark.)
 //
 // The three-state read (yes / none / ABSENT-means-unknown) is the whole point:
 // it is what lets recall answer "may this vault have contradictions?" with one

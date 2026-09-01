@@ -10,7 +10,7 @@ import (
 	"github.com/scrypster/muninndb/internal/storage/keys"
 )
 
-// BackfillDeclaredContradictionMark writes the per-vault 0x2F declared-
+// BackfillDeclaredContradictionMark writes the per-vault 0x31 declared-
 // contradiction marker for every vault that already has associations, by
 // scanning the forward-association keyspace (0x03) exactly once.
 //
@@ -123,7 +123,7 @@ func BackfillDeclaredContradictionMark(db *pebble.DB) error {
 		return fmt.Errorf("backfill declared-contradiction mark: commit: %w", err)
 	}
 
-	slog.Info("migration: backfilled declared-contradiction markers (0x2F)",
+	slog.Info("migration: backfilled declared-contradiction markers (0x31)",
 		"associations_scanned", scanned, "malformed_keys_skipped", skipped,
 		"vaults_with_contradictions", yes, "vaults_clean", none, "vaults_left_marked", kept)
 	return nil
