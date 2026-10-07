@@ -120,6 +120,19 @@ func (w *Worker) runPhase2Dedup(ctx context.Context, store *storage.PebbleStore,
 
 	report.DedupClusters = len(clusters)
 
+	// The identity guard needs to know which words THIS vault capitalizes where
+	// capitalization is not forced. Build the profile once per pass, from every
+	// live engram fetched above, and only when there is a cluster to judge.
+	var prof *caseProfile
+	if len(clusters) > 0 {
+		prof = newCaseProfile()
+		for _, eng := range allEngrams {
+			if eng != nil && eng.State != storage.StateArchived && eng.State != storage.StateSoftDeleted {
+				prof.add(eng)
+			}
+		}
+	}
+
 	// Process each cluster: keep representative, archive others
 	for _, clust := range clusters {
 		if len(clust.members) < 2 {
@@ -160,7 +173,7 @@ func (w *Worker) runPhase2Dedup(ctx context.Context, store *storage.PebbleStore,
 			if member.ID == representative.ID {
 				continue
 			}
-			if divergesOnLoadBearingToken(representative, member) {
+			if divergesOnLoadBearingToken(representative, member, prof) {
 				report.DedupSeparated++
 				slog.Debug("consolidation phase 2: separation guard refused merge",
 					"survivor", representative.ID, "kept", member.ID)

@@ -135,6 +135,42 @@ they behave today instead of half-converted. And the live-support filter is **ab
 than applied to a partial view** past its scan cap — filtering on a subset of the truth deletes
 real edges, which is strictly worse than reporting a stale one.
 
+### Dedup refuses name swaps and morphological negation, not just numbers
+
+Dream's phase-2 dedup archives the lower-scored member of any pair at cosine >= 0.85. The
+pattern-separation guard (#688) already refused pairs differing by a number, a date or an
+explicit negation word, and documented entity swaps as a blind spot. A RED test showed the
+blind spot is live: "owned by Priya" / "owned by Marcus", "reads from QueueStore" / "reads
+from JobLedger", "supported" / "unsupported" and "enabled" / "disabled" all merged at cosine
+~0.9999, with the loser archived and its access count folded into the survivor.
+
+The second stage (`internal/consolidation/dedup_identity.go`) refuses a merge when **each**
+side carries a name-shaped token absent from the other side (a swap; a one-sided addition is
+an elaboration and still merges), or when a word unique to one side is a morphological
+negation of a word unique to the other. Name shape is structural: an identifier shape, a
+capital in a non-initial position, or a sentence-initial capital the vault's own text
+capitalizes mid-sentence by majority. Without that per-vault evidence a sentence-initial
+word is never a name, so "Use uv" / "Prefer uv" keeps merging. No word list, no tuned
+threshold. Not gated by plasticity: the existing guard is unconditional, and refusing a merge
+only leaves a duplicate in place.
+
+Measured offline on three production vault clones (bge-m3 vectors; aggregates only). In
+**steady state** the old guard already refuses 1,596 of the 1,618 live candidate pairs. Long
+captured turns nearly always differ in some number, so nightly dedup there is close to a
+no-op. The new stage refuses 9 more, and 13 still merge. **Retrospectively**, of 720
+already-archived engrams paired with their nearest live neighbour, the new stage would have
+kept 117 apart. On a blind two-judge sample of 40 of those 117, the identity rule held up
+on short atomic facts (both judges "different fact" on 9/13) and was weak on long texts
+(5/25 strict, 12/25 counting information loss). The polarity rule fired 8 times in total, and
+neither sampled pair was judged distinct, so its value on real data is unproven. Controls
+behaved: number-guard anchors were 8/8 "different", and pairs both guards let merge were
+judged same with no loss on 9/12.
+
+**Principle: a separation guard is only as good as the shapes it can see. Each blind spot a
+guard documents should be RED-tested against the live mechanism, because a documented gap
+is still an open gap. When the measured precision is mixed, say so per text shape rather
+than tuning a length cutoff into the product.**
+
 ## Security & credentials
 
 **Security properties are structural, not policy-checked (#612).** The obvious design
