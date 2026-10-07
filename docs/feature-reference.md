@@ -97,6 +97,15 @@ The ACTIVATE pipeline has **6 phases**:
 | **Phase 5** | BFS Traversal | Walks the association graph from top candidates, discovering related memories up to N hops deep. **Currently inert:** its hop threshold has been above the mechanism's own score ceiling since the initial commit, so on real corpora it discovers nothing (measured, #801 — see `docs/internals/decision-record.md`). The association graph reaches your results through Phase 4, not through hops. |
 | **Phase 6** | Final Scoring + Filter | Computes ACT-R score, applies filters, ranks, truncates, and builds response |
 
+#### Result content: full text vs preview
+
+REST `POST /api/activate`, gRPC `Activate`, and MBP return every result's **full** content.
+MCP `muninn_recall` returns a **preview** by default, so a recall over long memories stays a
+bounded number of tokens: content longer than 500 characters is cut on a line or word boundary
+(at most 80 characters early) and ends with a visible marker — `…[+5,312 chars, muninn_read <id>]`
+— and the row carries `content_truncated: true` and `content_chars` (the full length in
+characters). Pass `full_content: true` to get every row's whole text; `muninn_read` fetches one.
+
 #### Scoring Models
 - **ACT-R** (default, production) — `ContentMatch × softplus(BaseLevel + HebbianScale × HebbianBoost + TransitionBoost)`. Power-law temporal decay based on access count and recency. This is the only production scorer
 - **CGDN** (Cognitive-Gated Divisive Normalization) — experimental, and **currently inert at any positive activation threshold**: its component producer never sets the field the abstention gate reads, so `absolute` is 0.0 for every non-tag-pool candidate and every threshold above zero drops the whole result set (measured, #768 — see `docs/internals/decision-record.md`). Requires `experimental_cgdn: true` in vault plasticity config

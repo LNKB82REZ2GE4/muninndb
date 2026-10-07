@@ -378,6 +378,16 @@ func TestSmoke_AllMCPTools(t *testing.T) {
 		if errVal, hasErr := result["error"]; hasErr {
 			t.Errorf("muninn_recall returned error field: %v", errVal)
 		}
+		// G11: the full_content opt-in is accepted end-to-end.
+		full := mcpTool(t, tok, "muninn_recall", map[string]any{
+			"vault":        vault,
+			"context":      []string{"explorer ruins Alice"},
+			"limit":        5,
+			"full_content": true,
+		})
+		if errVal, hasErr := full["error"]; hasErr {
+			t.Errorf("muninn_recall full_content=true returned error field: %v", errVal)
+		}
 	})
 
 	t.Run("muninn_read", func(t *testing.T) {
