@@ -53,10 +53,14 @@ var clearVaultDataPrefixes = []byte{
 // Safe TOCTOU ordering:
 //  1. Point-delete VaultCountKey (0x15, 9-byte) from Pebble FIRST to prevent a
 //     concurrent writer from re-seeding the counter from the stale persisted value.
-//  2. Evict the in-memory vaultCounters entry — any subsequent write that races
-//     here now seeds from a scan of the (already range-tombstoned) key space → 0.
-//  3. Commit the range tombstones for all vault-scoped data prefixes.
+//  2. Evict the in-memory vaultCounters entry and its coalescer entry.
+//  3. Commit the range tombstones for all vault-scoped data prefixes, then
+//     evict the counter again (a reader may have re-seeded it from the
+//     not-yet-tombstoned keys between 2 and 3).
 //  4. Evict all in-memory caches (L1, assocCache, metaCache, recentActiveCache).
+//
+// The whole sequence runs under the exclusive side of vaultClearGate(ws), so
+// no counter-mutating write to ws interleaves with it (STO-6a).
 //
 // Prefixes cleared (vault-scoped): 0x01–0x0D, 0x10, 0x12–0x17, 0x1F,
 // 0x20–0x22, 0x24–0x2E, 0x30
@@ -65,6 +69,13 @@ var clearVaultDataPrefixes = []byte{
 //   - 0x0F name index    (global by name hash, deleted by DeleteVaultNameOnly)
 //   - 0x11 digest flags  (globally keyed by ULID — orphans are acceptable)
 func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error) {
+	// Exclude every counter-mutating write to ws for the whole clear
+	// (vaultClearGate; STO-6a): in-flight writes finish first, later ones
+	// start against the cleared keyspace. Writes to other vaults are untouched.
+	gate := ps.vaultClearGate(ws)
+	gate.Lock()
+	defer gate.Unlock()
+
 	// Capture count before anything is deleted.
 	vaultCount := ps.GetVaultCount(ctx, ws)
 
@@ -118,6 +129,22 @@ func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error
 	}
 	if err := batch.Commit(pebble.Sync); err != nil {
 		return 0, fmt.Errorf("clear vault: commit: %w", err)
+	}
+
+	// Step 3b: evict the counter AGAIN, now that the tombstones are committed.
+	// The gate keeps writers out, but a plain GetVaultCount between Step 2 and
+	// Step 3 re-seeds the counter from a scan of the NOT-yet-tombstoned keys;
+	// left in place, that counter reported the pre-clear count for an empty
+	// vault. Seeded after this point, the scan sees the cleared keyspace.
+	// The persisted key is point-deleted again for the same reason: a
+	// coalescer flush already in progress at Step 2 can write a pre-clear
+	// count after Step 1, and the next seed would read it. (A flush still in
+	// progress HERE could do the same; that window is a single Pebble Set and
+	// is recorded as the STO-6a residual.)
+	ps.vaultCounters.Delete(ws)
+	ps.counterFlush.Delete(ws)
+	if err := ps.db.Delete(vaultCountKey, pebble.NoSync); err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return 0, fmt.Errorf("clear vault: re-delete count key: %w", err)
 	}
 
 	// Step 4: evict all in-memory caches.

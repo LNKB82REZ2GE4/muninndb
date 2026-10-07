@@ -48,6 +48,7 @@ type PebbleStore struct {
 	gc            *wal.GroupCommitter
 	noSyncEngrams bool
 	vaultCounters sync.Map // [8]byte -> *vaultCounter
+	vaultGates    sync.Map // [8]byte -> *sync.RWMutex; see vaultClearGate
 	// contradictsGen counts RelContradicts association writes per vault, so the
 	// COG-29 debt readout can cache the expensive declared-edge scan and know
 	// when it is stale. See contradicts_gen.go for why this lives in the store.
@@ -274,13 +275,23 @@ type vaultCounter struct {
 }
 
 // getOrInitCounter returns the vault counter, initializing it from Pebble on first access.
+//
+// EVERY caller passes through once.Do, including the one that finds the
+// counter already in the map. The fast path used to return a Load hit
+// directly, so a caller could receive a counter another goroutine was still
+// seeding: a writer then committed while the seed scan ran (the scan counted
+// it and so did its Add — high) or Added before the seed's Store overwrote it
+// (low). Reachable on every first touch of a vault, and on every reseed after
+// ClearVault. once.Do on a completed Once is a single atomic load. Pinned by
+// TestClearVault_WritesRacingSameVaultClearKeepCounterExact.
 func (ps *PebbleStore) getOrInitCounter(ctx context.Context, wsPrefix [8]byte) *vaultCounter {
+	var loaded *vaultCounter
 	if v, ok := ps.vaultCounters.Load(wsPrefix); ok {
-		return v.(*vaultCounter)
+		loaded = v.(*vaultCounter)
+	} else {
+		actual, _ := ps.vaultCounters.LoadOrStore(wsPrefix, &vaultCounter{})
+		loaded = actual.(*vaultCounter)
 	}
-	vc := &vaultCounter{}
-	actual, _ := ps.vaultCounters.LoadOrStore(wsPrefix, vc)
-	loaded := actual.(*vaultCounter)
 	loaded.once.Do(func() {
 		// Try to read persisted count from Pebble
 		countKey := keys.VaultCountKey(wsPrefix)
@@ -559,6 +570,10 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	// already contains this engram and the Add below counts it a second time
 	// (G9: a fresh vault's first write reported 2). Seeded here, the scan
 	// excludes it and the Add is its only count.
+	//
+	// Held against a concurrent ClearVault of this vault from here through the
+	// provenance Submit (vaultClearGate; STO-6a).
+	defer ps.holdVaultsAgainstClear(wsPrefix)()
 	vc := ps.getOrInitCounter(ctx, wsPrefix)
 
 	releaseMark := ps.holdDeclaredContradictionMark(wsPrefix, markedContradiction)
@@ -894,6 +909,18 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 	// Seed every touched vault's counter BEFORE the commit (G9) — see the
 	// matching comment in WriteEngram. Seeded after it, the first batch a
 	// fresh vault ever received was counted twice: 50 written, 100 reported.
+	//
+	// Every touched vault is held against a concurrent ClearVault through the
+	// post-commit counter Adds and provenance Submits (vaultClearGate; STO-6a).
+	gated := make([][8]byte, 0, len(items))
+	for i := range items {
+		if errs[i] == nil {
+			gated = append(gated, items[i].WSPrefix)
+		}
+	}
+	if len(gated) > 0 {
+		defer ps.holdVaultsAgainstClear(gated...)()
+	}
 	for i := range items {
 		if errs[i] == nil {
 			ps.getOrInitCounter(ctx, items[i].WSPrefix)

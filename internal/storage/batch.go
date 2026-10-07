@@ -453,6 +453,15 @@ func (b *pebbleStoreBatch) Commit() error {
 	// the commit would scan this batch's engrams and the per-item Add below
 	// would count them a second time.
 	ctx := context.Background()
+	// Held against a concurrent ClearVault of any touched vault through the
+	// post-commit counter Adds and provenance Submits (vaultClearGate; STO-6a).
+	if len(b.pendingItems) > 0 {
+		gated := make([][8]byte, len(b.pendingItems))
+		for i, item := range b.pendingItems {
+			gated[i] = item.wsPrefix
+		}
+		defer b.ps.holdVaultsAgainstClear(gated...)()
+	}
 	for _, item := range b.pendingItems {
 		b.ps.getOrInitCounter(ctx, item.wsPrefix)
 	}

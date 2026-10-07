@@ -102,9 +102,15 @@ func TestVaultCounter_DeleteAfterQueuedWritesSurvivesRestart(t *testing.T) {
 	}
 }
 
-// A delete that commits, then has a ClearVault land before it decrements, must
-// not write its pre-clear count back over the cleared vault. The entity lock
-// holds the delete inside its post-commit entity cleanup, deterministically.
+// A delete that commits, then has a ClearVault arrive before it decrements,
+// must not leave its pre-clear count behind over the cleared vault. The entity
+// lock holds the delete inside its post-commit entity cleanup,
+// deterministically.
+//
+// Since vaultClearGate (STO-6a) the clear can no longer LAND inside that
+// window: it must wait for the in-flight delete to finish and then clear. The
+// test therefore asserts both halves — the clear is held while the delete is
+// parked, and once released the count is 0 in memory and after a restart.
 func TestVaultCounter_DeleteRacingClearVaultLeavesZero(t *testing.T) {
 	d := newCounterRestartDir(t)
 	const vault = "counter-delete-clear"
@@ -141,12 +147,22 @@ func TestVaultCounter_DeleteRacingClearVaultLeavesZero(t *testing.T) {
 		}
 		runtime.Gosched()
 	}
-	if _, err := s.ClearVault(ctx, ws); err != nil {
+	cleared := make(chan error, 1)
+	go func() {
+		_, err := s.ClearVault(ctx, ws)
+		cleared <- err
+	}()
+	select {
+	case err := <-cleared:
 		mu.Unlock()
-		t.Fatal(err)
+		t.Fatalf("ClearVault completed (err=%v) while a delete of the same vault was mid-flight", err)
+	case <-time.After(100 * time.Millisecond):
 	}
 	mu.Unlock()
 	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-cleared; err != nil {
 		t.Fatal(err)
 	}
 	if got := s.GetVaultCount(ctx, ws); got != 0 {

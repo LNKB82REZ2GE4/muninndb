@@ -528,6 +528,10 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 	// A seed scan run after the commit would already exclude this engram, and
 	// the decrement at the end would subtract it a second time (G9's mirror).
 	// Done ahead of the stripe lock so a one-time seed scan never holds it.
+	//
+	// Held against a concurrent ClearVault of this vault through the counter
+	// decrement (vaultClearGate; STO-6a). Gate before stripe lock, always.
+	defer ps.holdVaultsAgainstClear(wsPrefix)()
 	vc := ps.getOrInitCounter(ctx, wsPrefix)
 
 	mu := ps.casLocks.For(id[:])
