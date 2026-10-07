@@ -3943,11 +3943,19 @@ func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.Forge
 	}
 
 	if req.Hard {
-		// Read the engram before hard-deleting so we can clean up the
-		// content-hash mapping (the record is gone after DeleteEngram).
-		eng, _ := e.store.GetEngram(ctx, wsPrefix, id)
-
-		if err := e.store.DeleteEngram(ctx, wsPrefix, id); err != nil {
+		// The record used for the content-hash and FTS cleanup below is the one
+		// DeleteEngramReturning read UNDER the stripe lock — the lock
+		// UpdateDigestIndexed and UpdateTags hold for their in-place FTS
+		// rewrites. This used to be an unlocked pre-read, so a digest (or
+		// retag) landing between it and the delete indexed key points (or
+		// tags) the cleanup never saw: they outlived the engram in the FTS
+		// index (26/200 forced races). A rewrite that takes the lock after the
+		// delete finds no record and indexes nothing.
+		if forgetHardBeforeDelete != nil {
+			forgetHardBeforeDelete(id)
+		}
+		eng, err := e.store.DeleteEngramReturning(ctx, wsPrefix, id)
+		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				return nil, ErrEngramNotFound
 			}
@@ -4012,6 +4020,12 @@ func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.Forge
 
 	return &mbp.ForgetResponse{OK: true}, nil
 }
+
+// forgetHardBeforeDelete is a test seam: when non-nil, Forget(hard) calls it
+// immediately before its delete, so a test can land a concurrent in-place
+// rewrite in exactly the window the old unlocked pre-read left open. Always
+// nil in production.
+var forgetHardBeforeDelete func(id storage.ULID)
 
 // cleanSearchIndexesAfterHardDelete removes a hard-deleted engram from the FTS
 // posting lists and tombstones it in the HNSW vector index.
@@ -5226,10 +5240,11 @@ func (e *Engine) PruneVault(ctx context.Context, vaultName string) (int64, error
 			}
 			for i := 0; i < toDelete; i++ {
 				id := scored[i].id
-				// Read before deleting: FTS cleanup needs the indexed fields,
-				// which are gone once the 0x01 record is.
-				victim, _ := e.store.GetEngram(opCtx, ws, id)
-				if err := e.store.DeleteEngram(opCtx, ws, id); err != nil {
+				// FTS cleanup needs the indexed fields, which are gone once the
+				// 0x01 record is: use the record the delete read under the
+				// stripe lock, not an unlocked pre-read (see Forget's hard arm).
+				victim, err := e.store.DeleteEngramReturning(opCtx, ws, id)
+				if err != nil {
 					slog.Debug("prune vault: hard-delete failed", "vault", vaultName, "id", id, "err", err)
 					continue
 				}
@@ -5273,8 +5288,8 @@ func (e *Engine) PruneVault(ctx context.Context, vaultName string) (int64, error
 			return pruned, fmt.Errorf("prune vault %s (retention scan): %w", vaultName, err)
 		}
 		for _, id := range ids {
-			victim, _ := e.store.GetEngram(opCtx, ws, id)
-			if err := e.store.DeleteEngram(opCtx, ws, id); err != nil {
+			victim, err := e.store.DeleteEngramReturning(opCtx, ws, id)
+			if err != nil {
 				slog.Debug("prune vault: retention hard-delete failed", "vault", vaultName, "id", id, "err", err)
 				continue
 			}

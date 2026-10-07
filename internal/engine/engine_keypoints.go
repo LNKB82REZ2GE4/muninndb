@@ -58,9 +58,12 @@ func (e *Engine) indexedPrevDocument(ws [8]byte, eng *storage.Engram) fts.Docume
 //
 // The stripe lock serialises this against Engine.UpdateTags, the other in-place
 // FTS rewrite of an existing engram, so neither can compute its "previous
-// document" from a record the other is halfway through changing. Forget does
-// not take it for its pre-read; it closes the race from its side by also
-// deleting the postings of a post-SoftDelete re-read (see Forget).
+// document" from a record the other is halfway through changing. Forget closes
+// the race from its side on both branches: a SOFT forget also deletes the
+// postings of a post-SoftDelete re-read, and a HARD forget de-indexes the
+// record storage.DeleteEngramReturning read under this same stripe lock (not
+// an unlocked pre-read, which missed key points indexed between the two — the
+// soft-only wording this comment used to carry was wrong for hard forget).
 //
 // FTS is a derived index: a failed reindex is logged, not returned, exactly as
 // in UpdateTags — the digest is already durable, and `muninn reindex-fts`

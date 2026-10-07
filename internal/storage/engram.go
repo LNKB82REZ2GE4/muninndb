@@ -512,6 +512,17 @@ func (ps *PebbleStore) StampValidUntil(ctx context.Context, wsPrefix [8]byte, id
 // DeleteEngram performs a hard delete: removes the engram, all association keys,
 // and all secondary indexes. Reads the engram first to gather index data.
 func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id ULID) error {
+	_, err := ps.DeleteEngramReturning(ctx, wsPrefix, id)
+	return err
+}
+
+// DeleteEngramReturning is DeleteEngram, also returning the record it deleted
+// as read UNDER the per-engram stripe lock (nil when the engram was not
+// found, i.e. the key-only fallback ran). A caller that must clean an index
+// living outside the store (FTS) has to use this record, not an unlocked
+// pre-read: an in-place rewrite holding the stripe lock (UpdateDigestIndexed,
+// UpdateTags) may have indexed terms between that pre-read and this delete.
+func (ps *PebbleStore) DeleteEngramReturning(ctx context.Context, wsPrefix [8]byte, id ULID) (*Engram, error) {
 	// Serialize against CompareAndSet on the same engram: hold the per-engram
 	// stripe lock across the read + delete-batch-commit, mirroring what
 	// CompareAndSet does. Otherwise a concurrent CAS can read the engram, this
@@ -562,12 +573,12 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 		batch.Delete(keys.LeaseKey(wsPrefix, [16]byte(id)), nil)
 		if err := batch.Commit(pebble.NoSync); err != nil {
 			mu.Unlock()
-			return err
+			return nil, err
 		}
 		ps.cache.Delete(wsPrefix, id)
 		mu.Unlock()
 		ps.replicateBatch(batch)
-		return nil
+		return nil, nil
 	}
 
 	batch := ps.db.NewBatch()
@@ -820,7 +831,7 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		mu.Unlock()
-		return fmt.Errorf("delete engram: %w", err)
+		return nil, fmt.Errorf("delete engram: %w", err)
 	}
 	// Evict before releasing the stripe lock (see the eviction above the read).
 	ps.cache.Delete(wsPrefix, id)
@@ -879,7 +890,7 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 		slog.Warn("storage: failed to persist vault count", "error", err)
 	}
 
-	return nil
+	return eng, nil
 }
 
 // SoftDelete sets state to StateSoftDeleted and updates the record.
