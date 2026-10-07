@@ -676,6 +676,9 @@ type EmbedStatusResponse struct {
 	ETASeconds int64 `json:"eta_seconds"`
 	// HardwareAccelerated is nil for cloud providers; true/false for Ollama (GPU vs CPU).
 	HardwareAccelerated *bool `json:"hardware_accelerated,omitempty"`
+	// Backend is the embed backend's live health, including the last provider
+	// error (G4). Omitted when the engine exposes no embed-health record.
+	Backend *plugin.EmbedHealthSnapshot `json:"backend,omitempty"`
 }
 
 // handleEmbedStatus returns the current embedder configuration and indexing
@@ -708,6 +711,10 @@ func (s *Server) handleEmbedStatus(w http.ResponseWriter, r *http.Request) {
 		TotalCount:          totalCount,
 		Indexing:            indexing,
 		HardwareAccelerated: s.embedHardwareAccelerated,
+	}
+	if hr, ok := s.engine.(embedHealthReporter); ok {
+		snap := hr.EmbedHealth()
+		resp.Backend = &snap
 	}
 
 	// Only populate rate/ETA when actively indexing. rate_per_sec/eta_seconds

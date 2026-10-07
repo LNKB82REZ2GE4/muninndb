@@ -59,3 +59,11 @@ func (p *prefixedEmbedPlugin) HardwareAccelerated() bool {
 	}
 	return false
 }
+
+// SetHealth forwards the embed-health tracker to the wrapped plugin so the
+// wrapper does not hide the instrumentation hook from type assertions (G4).
+func (p *prefixedEmbedPlugin) SetHealth(h *plugin.EmbedHealth) {
+	if s, ok := p.EmbedPlugin.(interface{ SetHealth(*plugin.EmbedHealth) }); ok {
+		s.SetHealth(h)
+	}
+}

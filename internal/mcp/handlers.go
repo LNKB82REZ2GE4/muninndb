@@ -1000,6 +1000,13 @@ func (s *MCPServer) handleStatus(ctx context.Context, w http.ResponseWriter, id 
 		EnrichmentMode: enrichMode,
 		// Plugins: populated in a future task when plugin registry is accessible via handleStatus.
 	}
+	if hr, ok := s.engine.(embedHealthReporter); ok {
+		snap := hr.EmbedHealth()
+		status.EmbedBackend = &snap
+		if snap.Degraded() {
+			status.Health = "degraded"
+		}
+	}
 	sendResult(w, id, textContent(mustJSON(status)))
 }
 

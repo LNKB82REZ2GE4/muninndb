@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/scrypster/muninndb/internal/engine"
+	"github.com/scrypster/muninndb/internal/plugin"
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 )
 
@@ -338,6 +339,16 @@ type VaultStatus struct {
 	// Enrichment capability
 	EnrichmentMode string                `json:"enrichment_mode"` // "none", "inline", "plugin:<name>"
 	Plugins        []PluginStatusSummary `json:"plugins,omitempty"`
+
+	// EmbedBackend is the embed backend's health (G4). When its state is
+	// "degraded" or "disabled", recall is BM25-only and Health is "degraded".
+	EmbedBackend *plugin.EmbedHealthSnapshot `json:"embed_backend,omitempty"`
+}
+
+// embedHealthReporter is implemented by engines that track embed backend
+// health (mcpEngineAdapter). Optional so test fakes need not.
+type embedHealthReporter interface {
+	EmbedHealth() plugin.EmbedHealthSnapshot
 }
 
 // PluginStatusSummary is a brief health summary for one plugin.

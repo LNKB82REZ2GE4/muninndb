@@ -1283,3 +1283,54 @@ the shape; finding an instance of the shape is still per-subsystem work.
 one day is itself the evidence that "a claim that reads the same when false" is a species,
 not an incident — and the falsifier that catches most of a species does not catch all of
 it. State which half a general check reaches before treating it as coverage.**
+
+### "Loud" has to reach a reader: the BM25 fall-back was flagged and still invisible (G4, 2026-10-07)
+
+**The decision.** #578's degradation doctrine (embedder down → BM25-only recall, WARN, keep
+serving) stands unchanged. What changed is who can see it. The engine now keeps one
+process-wide embed-health record, fed by every `EmbedService.Embed` outcome (recall-time
+query embeds, the background retroactive embedder, and an idle probe every 20s), and serves
+it as `embed_backend` on `GET /api/health`, `GET /api/admin/embed/status` and `muninn_status`
+(which also stops reporting a hard-coded `health: "good"`). A state transition into
+`degraded` logs one ERROR line. A requested provider that fails at startup is `disabled`, not
+"no embedder configured".
+
+**Why it was needed, measured on an isolated instance.** With the embedder unreachable or
+answering 401, every recall carried `semantic_degraded: true` and the server logged a WARN
+per call — the doctrine was working as designed. A client that renders the flag still showed
+nothing: `ActivateMulti` built a fresh response and dropped `SemanticDegraded`, and the
+multi-vault path is the one a project-scoped recall client uses. The same failing-embedder
+recall that showed the flag single-vault returned an unannotated list multi-vault. Separately,
+nothing in `/api/health` or `muninn_status` changed during an outage; the plugin registry kept
+reporting the embedder healthy, because the plugin health checker that would update it is
+never started; and an embedder rejected at startup by a bad key was reported as "No embedder
+configured", sending the operator to configure something that was already configured.
+
+**What a write during an outage stores (checked, not assumed).** Nothing wrong. The write path
+embeds nothing itself (only a client-supplied vector is stored inline); the retroactive
+embedder classifies connection-refused, 401/403/404 and 5xx as provider-down and leaves the
+batch unflagged, so the engram is retried and embedded on recovery (observed: 1/1 after a
+startup-noop window, 1/1 after a runtime outage). A provider that *succeeds* with an all-zero
+vector was the one hole: the retroactive path would have stored it and set `DigestEmbed`, so
+it was never retried and scored 0 against every query. That vector is now refused, the engram
+left pending, and the refusal counted (`zero_vectors_refused`). Refusing zero vectors at the
+transport (a client-supplied embedding) was not added: that is the caller's explicit input and
+is out of this change's scope.
+
+**Measured alert latency** (isolated instance, poller at 15s, no recall traffic during the
+outage): embedder killed → alert 22s; embedder answering 401 at runtime → 32s; wrong key at
+startup → alert 13s after launch. Worst case by construction ≈ probe interval (20s) + probe
+timeout (15s, only for a hung backend) + poll interval (15s) ≈ 50s.
+
+**Residuals, named.** (1) A provider that fails at startup stays `disabled` for the life of the
+process; fixing the key needs a restart (the state says so). (2) A provider configured only
+through environment variables, with the bundled local model available and not opted out, is
+still substituted by the bundled model when it fails at startup — the #582 class, unfixed here
+because changing startup provider selection is its own increment. (3) gRPC still does not map
+`SemanticDegraded` (pre-existing deferral). (4) `degraded_recalls` counts per-vault
+activations, so one multi-vault recall counts once per vault. (5) Multi-vault responses still
+drop the per-vault `abstained`/`conflict` blocks; only the degradation flag is propagated.
+
+**Principle: a degradation signal is only loud if every path a reader actually uses carries it.
+Flagging the response is not enough when the response a client sees is rebuilt elsewhere —
+trace the flag to the rendered output, and give operators a pollable state, not a log line.**

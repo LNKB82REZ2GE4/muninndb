@@ -56,6 +56,9 @@ type CognitiveForwarder interface {
 
 // Engine is the cognitive database engine implementing mbp.EngineAPI.
 type Engine struct {
+	// embedHealth is the process-wide embed backend health record (G4). nil
+	// until SetEmbedHealth; every EmbedHealth method is nil-safe.
+	embedHealth *plugin.EmbedHealth
 	store       *storage.PebbleStore
 	authStore   *auth.Store // nil = use Plasticity defaults (e.g. in tests)
 	fts         *fts.Index
@@ -466,6 +469,14 @@ func (e *Engine) GetProcessorStats() []plugin.RetroactiveStats {
 	}
 	return stats
 }
+
+// SetEmbedHealth attaches the process-wide embed-health tracker. Call before
+// serving traffic.
+func (e *Engine) SetEmbedHealth(h *plugin.EmbedHealth) { e.embedHealth = h }
+
+// EmbedHealth returns the embed backend's current health. Without a tracker
+// attached it reports "unknown" rather than claiming the backend is fine.
+func (e *Engine) EmbedHealth() plugin.EmbedHealthSnapshot { return e.embedHealth.Snapshot() }
 
 // EmbedStats returns the current stats for the first embed retroactive processor.
 // Returns a zero-value RetroactiveStats when no embed processor is registered.
@@ -3155,6 +3166,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// degraded call.
 	if result.SemanticDegraded {
 		metrics.RecallEmbedFallbackTotal.WithLabelValues(req.Vault).Inc()
+		e.embedHealth.RecordDegradedRecall()
 	}
 
 	// Entity boost phase: spread activation through shared named entities.

@@ -481,6 +481,18 @@ type HealthResponse struct {
 	Version       string `json:"version"`
 	UptimeSeconds int64  `json:"uptime_seconds"`
 	DBWritable    bool   `json:"db_writable"`
+	// EmbedBackend reports whether semantic recall is available (G4). When
+	// its state is "degraded" or "disabled", recall is silently BM25-only.
+	// Omitted when the engine exposes no embed-health record. The provider
+	// error text is withheld here (unauthenticated endpoint); it is on
+	// GET /api/admin/embed/status.
+	EmbedBackend *plugin.EmbedHealthSnapshot `json:"embed_backend,omitempty"`
+}
+
+// embedHealthReporter is implemented by engines that track embed backend
+// health (the RESTEngineWrapper). Optional so test fakes need not.
+type embedHealthReporter interface {
+	EmbedHealth() plugin.EmbedHealthSnapshot
 }
 
 // ReadyResponse is returned by the ready check endpoint.

@@ -26,7 +26,7 @@ type mockEmbedPlugin struct {
 
 func (m *mockEmbedPlugin) Embed(ctx context.Context, texts []string) ([]float32, error) {
 	m.embedCalls++
-	return make([]float32, len(texts)*384), nil
+	return nonZeroVecs(len(texts), 384), nil
 }
 func (m *mockEmbedPlugin) Dimension() int    { return 384 }
 func (m *mockEmbedPlugin) MaxBatchSize() int { return 32 }

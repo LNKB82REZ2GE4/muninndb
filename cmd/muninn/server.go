@@ -366,6 +366,84 @@ func openAIEmbedLogAttrs(providerURL string) []any {
 //
 // Returns both the activation.Embedder (for query embedding) and the underlying
 // plugin.EmbedPlugin (for the RetroactiveProcessor), or nil for the plugin if noop.
+// embedEnvProviderVars are the environment variables that each request a
+// specific embed provider, in buildEmbedder's precedence order.
+var embedEnvProviderVars = []string{
+	"MUNINN_OLLAMA_URL", "MUNINN_OPENAI_KEY", "MUNINN_VOYAGE_KEY", "MUNINN_COHERE_KEY",
+	"MUNINN_GOOGLE_KEY", "MUNINN_JINA_KEY", "MUNINN_MISTRAL_KEY",
+}
+
+// envEmbedProviderRequested returns the first embed-provider env var that is
+// set, or "" when none is.
+func envEmbedProviderRequested() string {
+	for _, v := range embedEnvProviderVars {
+		if os.Getenv(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// embedProviderRequested reports which embed provider the operator asked
+// for, "" when none was (no env provider, no saved provider, and the bundled
+// local model is opted out or not built in). Used only to classify a noop
+// embedder as "disabled" (a requested provider failed — alert-worthy) versus
+// "unconfigured" (semantic recall off by choice).
+func embedProviderRequested(cfg plugincfg.PluginConfig) string {
+	if v := envEmbedProviderRequested(); v != "" {
+		return v
+	}
+	if cfg.EmbedProvider != "" && cfg.EmbedProvider != "none" {
+		return "saved config embed_provider=" + cfg.EmbedProvider
+	}
+	if cfg.EmbedProvider != "none" && os.Getenv("MUNINN_LOCAL_EMBED") != "0" && embedpkg.LocalAvailable() {
+		return "bundled local model"
+	}
+	return ""
+}
+
+// newEmbedHealth builds the process-wide embed-health tracker (G4) for the
+// embedder buildEmbedder produced, and attaches it to the embed service so
+// every embed call's outcome is recorded.
+func newEmbedHealth(cfg plugincfg.PluginConfig, embedPlugin plugin.EmbedPlugin) *plugin.EmbedHealth {
+	if embedPlugin == nil {
+		h := plugin.NewEmbedHealth("")
+		if requested := embedProviderRequested(cfg); requested != "" {
+			h.MarkDisabled(fmt.Sprintf("embed provider requested (%s) failed to initialize at startup; recall is keyword-only until it is fixed and the server restarted", requested))
+		} else {
+			h.MarkUnconfigured("no embed provider configured")
+		}
+		return h
+	}
+	h := plugin.NewEmbedHealth(embedPlugin.Name())
+	if s, ok := embedPlugin.(interface{ SetHealth(*plugin.EmbedHealth) }); ok {
+		s.SetHealth(h)
+	} else {
+		slog.Warn("embed plugin does not support health instrumentation; embed_backend will only reflect recall degradation",
+			"plugin", embedPlugin.Name())
+	}
+	return h
+}
+
+// embedHealthProbeInterval reads MUNINN_EMBED_HEALTH_PROBE_INTERVAL (default
+// 20s; "0" disables the idle probe).
+func embedHealthProbeInterval() time.Duration {
+	const def = 20 * time.Second
+	v := strings.TrimSpace(os.Getenv("MUNINN_EMBED_HEALTH_PROBE_INTERVAL"))
+	if v == "" {
+		return def
+	}
+	if v == "0" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < time.Second {
+		slog.Warn("invalid MUNINN_EMBED_HEALTH_PROBE_INTERVAL, using default", "value", v, "default", def)
+		return def
+	}
+	return d
+}
+
 func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir string) (activation.Embedder, plugin.EmbedPlugin, error) {
 	const (
 		ollamaURL  = "MUNINN_OLLAMA_URL"
@@ -646,6 +724,19 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 	}
 
 	// 4. Noop
+	// An env-configured provider that failed above is just as explicit as a
+	// saved one (G4): reporting it as "no embedder configured" hid the real
+	// cause — e.g. a rejected API key — behind advice to go configure one.
+	if envProvider := envEmbedProviderRequested(); envProvider != "" && !explicitExternalProvider {
+		slog.Error("embed provider configured via environment failed to initialize at startup — semantic similarity disabled until it is fixed and the server restarted",
+			"env_var", envProvider)
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintf(os.Stderr, "  ⚠  Embed provider configured via %s could not be initialized at startup.\n", envProvider)
+		fmt.Fprintln(os.Stderr, "     Semantic search is DISABLED (recall is keyword-only) until it is fixed and the server restarted.")
+		fmt.Fprintln(os.Stderr, "     See the \"embedder init failed\" line above for the provider's error.")
+		fmt.Fprintln(os.Stderr, "")
+		return activation.NewNoopEmbedder(), nil, nil
+	}
 	if explicitExternalProvider {
 		slog.Error("configured embed provider unreachable at startup, refusing to substitute a different model — semantic similarity disabled",
 			"embed_provider", cfg.EmbedProvider, "embed_url", cfg.EmbedURL)
@@ -1428,6 +1519,7 @@ func runServer() {
 		slog.Error("embedder build failed", "err", err)
 		os.Exit(1)
 	}
+	embedHealth := newEmbedHealth(savedPluginCfg, embedPlugin)
 
 	// Determine embedder provider and model for the status endpoint.
 	embedInfo := resolveEmbedInfo(savedPluginCfg)
@@ -1513,6 +1605,7 @@ func runServer() {
 		HNSWRegistry:     hnswRegistry,
 		EmbedModelName:   embedModelName,
 	})
+	eng.SetEmbedHealth(embedHealth)
 
 	eng.SetTransitionWorker(transitionWorkerImpl)
 
@@ -1803,8 +1896,14 @@ func runServer() {
 		// Re-evaluate push subscriptions once each engram's embedding lands (#512),
 		// so vector-scored matches on freshly-written engrams are not missed.
 		retroProcessor.SetOnEmbed(eng.ReevaluatePushOnEmbed)
+		retroProcessor.SetEmbedHealth(embedHealth)
 		retroProcessor.Start(ctx)
 		slog.Info("retroactive embed processor started")
+		// Keep embed_backend honest while idle: without traffic, a backend
+		// that dies would read "ok" until the next recall or write (G4).
+		if iv := embedHealthProbeInterval(); iv > 0 {
+			go plugin.RunEmbedHealthProbe(ctx, embedHealth, embedPlugin.Embed, iv, 15*time.Second)
+		}
 	}
 
 	// Start retroactive enrich processor if an enrich plugin is configured.

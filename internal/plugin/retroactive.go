@@ -58,6 +58,7 @@ type RetroactiveProcessor struct {
 	cancelFn context.CancelFunc
 	wg       sync.WaitGroup
 	notifyCh chan struct{} // buffered(1); non-blocking send from Notify()
+	health   *EmbedHealth  // optional; counts zero-vector refusals (G4)
 
 	// vaultGuards establish a clear boundary. Plugin calls hold a per-vault
 	// admission through persistence; ClearVault invalidates the generation,
@@ -97,6 +98,12 @@ func NewRetroactiveProcessor(store PluginStore, p Plugin, flagBit uint16) *Retro
 		flagBit:  flagBit,
 		notifyCh: make(chan struct{}, 1),
 	}
+}
+
+// SetEmbedHealth attaches the process-wide embed-health tracker so store-time
+// refusals of unusable vectors are visible on the health surfaces.
+func (rp *RetroactiveProcessor) SetEmbedHealth(h *EmbedHealth) {
+	rp.health = h
 }
 
 // Notify wakes the processor to run a scan immediately, without waiting for
@@ -464,6 +471,21 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 	// that yielded it — passed through rather than re-derived (see
 	// PluginStore.UpdateEmbedding's doc for why).
 	storeEmbedded := func(eng *Engram, ws [8]byte, vec []float32) {
+		// Never persist an all-zero vector as if it were a real embedding
+		// (G4). A normalized embedder cannot produce one for real text, so it
+		// means the provider answered without embedding anything. Stored, it
+		// would be flagged DigestEmbed and never retried, while scoring 0
+		// against every query. Left pending instead, it embeds normally once
+		// the provider recovers; the refusal is counted on EmbedHealth.
+		if IsZeroVector(vec) {
+			slog.Warn("retroactive processor: provider returned an all-zero vector, refusing to store it — engram left pending",
+				"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "dim", len(vec))
+			rp.statsMu.Lock()
+			rp.stats.Errors++
+			rp.statsMu.Unlock()
+			rp.health.RecordZeroVectorRefused()
+			return
+		}
 		if storeErr := rp.store.UpdateEmbedding(ctx, ws, eng.ID, vec); storeErr != nil {
 			var dimErr *hnswpkg.DimMismatchError
 			if errors.As(storeErr, &dimErr) {
