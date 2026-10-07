@@ -1523,3 +1523,33 @@ documents (that is the extraction worker's job, plan Phase 1b), not for every en
 (4-5x the engram count). Key points are not embedded; the semantic channel still sees only
 the content. gRPC/proto and non-Go SDKs do not carry `matched_key_point` (REST does, by type
 alias).
+
+### A truncated recall row says it is truncated, and the full text is one flag away (G11, 2026-10-07)
+
+`muninn_recall` cut every row's content at **byte** 500 and appended a bare `...`. Measured on
+a production vault: when an LLM judge saw recall results as MCP delivered them, long
+knowledge pages (~6 KB each) added +0.02 answer coverage; when the same results were expanded
+with one `muninn_read` each, they added +0.40. The pages were being retrieved; their content
+was not reaching the agent, and nothing on the row said so. The byte cut also split multi-byte
+UTF-8 mid-rune and truncated non-ASCII content that fit in 500 characters.
+
+REST, gRPC and MBP were never affected — they return `mbp.ActivationItem.Content` whole; the
+cut lived only in `internal/mcp/convert.go`. So the fix is MCP-only and no SDK changes.
+
+Options weighed: (a) an opt-in flag, (b) full content for rows tagged as pages, (c) a larger
+default preview. (b) bakes one deployment's tag vocabulary into the engine (principle #11)
+and still leaves every other long row silently cut. (c) inflates every default response
+for a need only some calls have. **Chosen: (a)**, as `full_content: bool` — the same shape as
+recall's existing `annotate` / `include_invalid` / `include_leased` presentation flags
+(principle #7) — and a non-bool value falls back to the preview rather than erroring
+(principle #4). The default preview stays 500, now counted in **characters**, cut on a
+line/word boundary within an 80-character window, and ends with a visible marker
+`…[+N chars, muninn_read <id>]` plus `content_truncated` / `content_chars` on the row. The
+marker was the actual defect (principle #2); the flag is the convenience.
+
+A blanket "always full" was ruled out by the prompt-injection hook clients: they recall on
+every prompt. (In practice the reference hook uses REST and truncates on its own side, but a
+client built on MCP recall would not.)
+
+**Principle: a presentation cut is acceptable; an unmarked one is a silently-wrong answer.
+Bound the default, say exactly what was withheld and how to get it, and offer the opt-in.**

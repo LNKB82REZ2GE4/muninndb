@@ -75,13 +75,21 @@ type WriteResult struct {
 type Memory struct {
 	ID      string `json:"id"`
 	Concept string `json:"concept"`
-	Content string `json:"content"` // recall: real content (truncated); read: full content
-	Summary string `json:"summary,omitempty"`
+	Content string `json:"content"` // recall: real content (preview unless full_content); read: full content
+	// ContentTruncated / ContentChars are G11's structured twins of the visible
+	// "…[+N chars, muninn_read <id>]" marker recall appends to a preview: set
+	// only when Content was cut, ContentChars is the FULL content length in
+	// characters (runes), so a caller can decide whether the rest is worth a
+	// muninn_read or a full_content=true recall. Never set by muninn_read.
+	ContentTruncated bool   `json:"content_truncated,omitempty"`
+	ContentChars     int    `json:"content_chars,omitempty"`
+	Summary          string `json:"summary,omitempty"`
 	// KeyPoints are the enricher's self-contained key points (G2). muninn_read
 	// only; recall carries just the one the query matched, below.
 	KeyPoints []string `json:"key_points,omitempty"`
 	// MatchedKeyPoint is recall's snippet: the key point this query matched
-	// (see mbp.ActivationItem.MatchedKeyPoint). Absent when none matched.
+	// (see mbp.ActivationItem.MatchedKeyPoint). Absent when none matched. It is
+	// never subject to the G11 content preview bound.
 	MatchedKeyPoint string  `json:"matched_key_point,omitempty"`
 	Score           float64 `json:"score,omitempty"`
 	VectorScore     float64 `json:"vector_score,omitempty"`

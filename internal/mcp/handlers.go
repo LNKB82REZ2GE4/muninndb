@@ -690,6 +690,10 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 	}
 
 	annotate, _ := args["annotate"].(bool)
+	// G11: opt into whole engram content instead of the marked 500-char
+	// preview. A presentation preference, so a non-bool value falls back to the
+	// bounded default rather than failing the recall (principle #4).
+	fullContent, _ := args["full_content"].(bool)
 
 	a := authFromContext(ctx)
 	vaults, weights, isMulti, vaultsErr := resolveVaultsWeighted(a.Scope, args)
@@ -718,7 +722,7 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 
 	var memories []Memory
 	for i := range resp.Activations {
-		memories = append(memories, activationToMemory(&resp.Activations[i]))
+		memories = append(memories, activationToMemoryContent(&resp.Activations[i], fullContent))
 	}
 
 	if annotate {

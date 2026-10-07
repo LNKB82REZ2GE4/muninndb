@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -114,11 +115,12 @@ func TestConvertTruncatesLongContent(t *testing.T) {
 		Content: string(long),
 	}
 	m := activationToMemory(item)
-	if len(m.Content) > 503 { // 500 + "..."
-		t.Errorf("content not truncated: len=%d", len(m.Content))
+	// G11: 500 chars + the visible "…[+N chars, muninn_read <id>]" marker.
+	if want := strings.Repeat("x", 500) + " …[+100 chars, muninn_read test-id]"; m.Content != want {
+		t.Errorf("content = %q, want %q", tail(m.Content, 60), tail(want, 60))
 	}
-	if m.Content[len(m.Content)-3:] != "..." {
-		t.Error("truncated content must end with '...'")
+	if !m.ContentTruncated || m.ContentChars != 600 {
+		t.Errorf("content_truncated=%v content_chars=%d, want true/600", m.ContentTruncated, m.ContentChars)
 	}
 }
 
@@ -427,11 +429,8 @@ func TestActivationToMemory_FallsBackToTruncated(t *testing.T) {
 	if m.Summary != "" {
 		t.Errorf("Summary should be empty, got %q", m.Summary)
 	}
-	if len(m.Content) > contentPreviewLen+3 {
-		t.Errorf("Content not truncated: len=%d", len(m.Content))
-	}
-	if m.Content[len(m.Content)-3:] != "..." {
-		t.Error("truncated content must end with '...'")
+	if !m.ContentTruncated || !markerRE.MatchString(m.Content) {
+		t.Errorf("Content not truncated with a visible marker: len=%d tail=%q", len(m.Content), tail(m.Content, 60))
 	}
 }
 
