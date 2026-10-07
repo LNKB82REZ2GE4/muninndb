@@ -84,8 +84,10 @@ func (ps *PebbleStore) ClearVault(ctx context.Context, ws [8]byte) (int64, error
 	// Step 2b: drain any in-flight provenance writes (0x16 keys) so they land
 	// BEFORE the range tombstones, not after. If they landed after the tombstones
 	// they would be visible to iterators despite the vault being cleared.
+	// Scoped to ws: a process-wide drain panicked under concurrent writes to
+	// other vaults (see provenanceWorker.inFlight).
 	if ps.provWork != nil {
-		ps.provWork.Drain()
+		ps.provWork.DrainVault(ws)
 	}
 
 	// Step 3: DeleteRange for all vault-scoped data prefixes.
