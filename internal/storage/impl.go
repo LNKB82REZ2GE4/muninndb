@@ -293,23 +293,44 @@ func (ps *PebbleStore) getOrInitCounter(ctx context.Context, wsPrefix [8]byte) *
 		// Fall back to per-vault scan (one-time cost on first startup)
 		n, _ := ps.countEngramsForVault(ctx, wsPrefix)
 		loaded.count.Store(n)
-		// Persist so the next startup avoids the scan — through the coalescer,
-		// NOT a direct write. Write paths seed BEFORE their commit (G9), so n
-		// excludes the write in flight; a durable direct Set of n would land
-		// ahead of that write's increment, and a crash inside the coalescer's
-		// flush window would then leave a stored count that is short by the
-		// write and never rescanned. Queued here, the coalescer persists the
-		// latest in-memory value instead, and a crash before any flush leaves
-		// the key absent, so the next start rescans and gets the truth.
-		if ps.counterFlush != nil {
-			ps.counterFlush.Submit(wsPrefix, n)
-		} else {
-			buf := make([]byte, 8)
-			binary.BigEndian.PutUint64(buf, uint64(n))
-			_ = ps.db.Set(countKey, buf, pebble.NoSync)
-		}
+		// The seed deliberately persists NOTHING. Write paths seed BEFORE their
+		// commit (G9), so n excludes the write in flight. A durable Set of n
+		// here would land ahead of that write's increment, and a crash before
+		// the increment reached disk would leave a short count that no later
+		// start rescans; queueing n on the coalescer instead lets that stale
+		// value overwrite a later direct Set (DeleteEngram, MergeVaultData)
+		// at the next flush. The first mutation persists the counter through
+		// its own path; until then the key stays absent and a restart simply
+		// rescans, which is the truth.
 	})
 	return loaded
+}
+
+// persistCounterNow durably writes n as vault ws's count on behalf of a path
+// that cannot wait for the coalescer (DeleteEngram, MergeVaultData). Two rules
+// it exists to enforce:
+//
+//   - n is written only if vc is still the live counter for ws. ClearVault
+//     evicts the counter and point-deletes the key; a mutation that loaded vc
+//     before the clear must not write its pre-clear count back afterwards.
+//   - n is also queued on the coalescer, replacing whatever value a recent
+//     write had queued. Without that, the next flush overwrites this direct Set
+//     with the older queued count (a write of 3 then a delete persisted 3, not 2).
+//
+// Reports whether it wrote.
+func (ps *PebbleStore) persistCounterNow(ws [8]byte, vc *vaultCounter, n int64, opt *pebble.WriteOptions) (bool, error) {
+	if current, ok := ps.vaultCounters.Load(ws); !ok || current.(*vaultCounter) != vc {
+		return false, nil
+	}
+	if ps.counterFlush != nil {
+		ps.counterFlush.Submit(ws, n)
+	}
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, uint64(n))
+	if err := ps.db.Set(keys.VaultCountKey(ws), buf, opt); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // countEngramsForVault scans the 0x01 prefix for a single vault.

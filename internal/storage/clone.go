@@ -341,6 +341,12 @@ func (ps *PebbleStore) MergeVaultData(
 		return 0, fmt.Errorf("merge: %w", err)
 	}
 
+	// Seed the target's counter BEFORE copying anything (G9). Seeded after the
+	// copy — as Phase 4's GetVaultCount used to do on a target with no persisted
+	// count — the scan already includes the merged engrams and Phase 4 then
+	// adds them a second time (2 existing + 4 merged reported 10).
+	targetCounter := ps.getOrInitCounter(ctx, wsTarget)
+
 	var mergedEngrams int64
 	// See CloneVaultData: a bulk copy moves raw 0x03/0x04 bytes and never calls
 	// WriteAssociation, so the target's 0x31 marker has to be reconciled by hand.
@@ -570,18 +576,12 @@ func (ps *PebbleStore) MergeVaultData(
 	}
 
 	// ---- Phase 4: Update VaultCountKey for target ----
-	// Count is the post-merge total: existing target count + newly merged engrams.
-	existingCount := ps.GetVaultCount(ctx, wsTarget)
-	newTotal := existingCount + mergedEngrams
-	vaultCountKey := keys.VaultCountKey(wsTarget)
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, uint64(newTotal))
-	if err := ps.db.Set(vaultCountKey, buf, pebble.NoSync); err != nil {
+	// Count is the post-merge total: the target counter (seeded before Phase 1,
+	// so it never saw the merged engrams — G9) plus the engrams merged in.
+	newTotal := targetCounter.count.Add(mergedEngrams)
+	if _, err := ps.persistCounterNow(wsTarget, targetCounter, newTotal, pebble.NoSync); err != nil {
 		return mergedEngrams, fmt.Errorf("merge: write vault count: %w", err)
 	}
-	// Update in-memory counter.
-	vc := ps.getOrInitCounter(ctx, wsTarget)
-	vc.count.Store(newTotal)
 
 	// ---- Phase 5: Reconcile the target's declared-contradiction marker ----
 	// UNION-copying 0x03/0x04 can hand the target a declared `contradicts` edge

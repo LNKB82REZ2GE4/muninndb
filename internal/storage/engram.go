@@ -3,7 +3,6 @@ package storage
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -856,9 +855,9 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 		vc.count.Store(0)
 		newCount = 0
 	}
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, uint64(newCount))
-	if err := ps.db.Set(keys.VaultCountKey(wsPrefix), buf, pebble.Sync); err != nil {
+	// persistCounterNow skips the write if ClearVault evicted vc meanwhile, and
+	// replaces any count a recent write queued on the coalescer.
+	if _, err := ps.persistCounterNow(wsPrefix, vc, newCount, pebble.Sync); err != nil {
 		slog.Warn("storage: failed to persist vault count", "error", err)
 	}
 
