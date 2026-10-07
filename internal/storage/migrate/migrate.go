@@ -74,6 +74,10 @@ func RegisterMigrations(r *Runner) {
 	r.Register(Migration{Version: 8, Description: "relocate the replication keyspace off the double-allocated 0x19 onto 0x2F (#726) [upstream v5]", Up: RelocateReplicationPrefix})
 	// Upstream v6, renumbered.
 	r.Register(Migration{Version: 9, Description: "vault-scope entity records: 0x1F|nameHash -> 0x1F|ws|nameHash, mention_count recomputed per vault (#683) [upstream v6]", Up: VaultScopeEntityRecords})
+	// Fork migration, numbered above everything already applied (see the
+	// numbering note above). On the next upstream merge, renumber upstream's
+	// incoming migrations above this one, not this one upward.
+	r.Register(Migration{Version: 10, Description: "recount persisted per-vault engram counters (0x15) inflated by the post-commit seed double-count (G9)", Up: RecountVaultCounters})
 }
 
 // MaxRegisteredVersion returns the highest migration version this binary knows.

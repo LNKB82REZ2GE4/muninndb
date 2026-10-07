@@ -448,6 +448,15 @@ func (b *pebbleStoreBatch) Commit() error {
 	if b.ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
+	// Seed every touched vault's counter BEFORE the commit (G9) — see the
+	// matching comment in PebbleStore.WriteEngram. A first-touch seed run after
+	// the commit would scan this batch's engrams and the per-item Add below
+	// would count them a second time.
+	ctx := context.Background()
+	for _, item := range b.pendingItems {
+		b.ps.getOrInitCounter(ctx, item.wsPrefix)
+	}
+
 	releaseMarks := b.ps.holdDeclaredContradictionMarks(b.markedContradictionWS)
 	commitErr := b.batch.Commit(syncOption)
 	releaseMarks()
@@ -490,7 +499,6 @@ func (b *pebbleStoreBatch) Commit() error {
 	}
 
 	// Post-commit side effects — mirrors PebbleStore.WriteEngram post-commit work.
-	ctx := context.Background()
 	for _, item := range b.pendingItems {
 		ws := item.wsPrefix
 		eng := item.eng

@@ -381,8 +381,8 @@ func TestRegisterMigrations_IncludesV9(t *testing.T) {
 	if !found {
 		t.Fatalf("migration v9 (upstream v6, #683 entity vault scoping) is not registered")
 	}
-	if got := MaxRegisteredVersion(); got != 9 {
-		t.Errorf("MaxRegisteredVersion() = %d; want 9 — the refuse-newer downgrade guard keys off this", got)
+	if got := MaxRegisteredVersion(); got < 9 {
+		t.Errorf("MaxRegisteredVersion() = %d; want >= 9 (later fork migrations sit above it) — the refuse-newer downgrade guard keys off this", got)
 	}
 }
 
