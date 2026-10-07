@@ -1312,9 +1312,14 @@ and no migration (`muninn reindex-fts` backfills existing vaults).
   Content-written questions on unenriched engrams (40) and on enriched engrams (20): paired
   diff exactly 0.000 — no inflation and no displacement.
 - 93 raw commit-history chunks with an extractor's facts as key points, 60 blind-judged
-  paraphrased questions: MRR 0.271 → 0.400 (+0.129 [+0.06, +0.21], 12 won / 1 lost). The
-  same facts as CHILD engrams (`add_child`): 0.892 (+0.621 [+0.50, +0.74], 42/0). Unenriched
-  control vault: identical lists before and after (60/60 tied).
+  paraphrased questions (final code, second judging pass): MRR 0.235 → 0.354 (+0.119
+  [+0.05, +0.20], 12 won / 1 lost; first pass on the pre-review code +0.129). The same facts
+  as CHILD engrams (`add_child`): 0.892 (+0.658 [+0.55, +0.77], 45/0). Unenriched control
+  vault: identical lists before and after (60/60 tied). Judge drift between the two passes
+  on the identical baseline lists: 0.036 MRR.
+- Adversarial review found four defects before landing, all fixed with RED-shown tests:
+  repeated key-point terms inflating TF (now presence-only), legacy unindexed key points
+  corrupting DF on re-enrich and retag, and Forget racing a key-point write.
 - Audit of 40 enriched engrams (blind Sonnet judges, seeded controls caught 20/20): key-point
   fidelity 81% supported, 18% partial, 1 unsupported; coverage of Sonnet-written key facts
   71% (HIGH 82%). Below a raw-text extractor measured at 95% / 96%.
