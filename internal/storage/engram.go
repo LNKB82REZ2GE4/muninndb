@@ -525,6 +525,12 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 	// is committed the metadata/lease are gone, so a later CAS reads not-found.
 	// Post-commit cleanup (replication, cache, entity counts) is unlocked to
 	// keep the stripe free during the O(n) entity work.
+	// Load (and on first touch seed) the vault counter BEFORE the delete commits.
+	// A seed scan run after the commit would already exclude this engram, and
+	// the decrement at the end would subtract it a second time (G9's mirror).
+	// Done ahead of the stripe lock so a one-time seed scan never holds it.
+	vc := ps.getOrInitCounter(ctx, wsPrefix)
+
 	mu := ps.casLocks.For(id[:])
 	mu.Lock()
 
@@ -843,8 +849,8 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 	}
 
 	// Decrement vault count synchronously to avoid a race where callers
-	// observe a stale count after DeleteEngram returns.
-	vc := ps.getOrInitCounter(ctx, wsPrefix)
+	// observe a stale count after DeleteEngram returns. vc was loaded before
+	// the commit, above.
 	newCount := vc.count.Add(-1)
 	if newCount < 0 {
 		vc.count.Store(0)

@@ -293,10 +293,21 @@ func (ps *PebbleStore) getOrInitCounter(ctx context.Context, wsPrefix [8]byte) *
 		// Fall back to per-vault scan (one-time cost on first startup)
 		n, _ := ps.countEngramsForVault(ctx, wsPrefix)
 		loaded.count.Store(n)
-		// Persist so next startup avoids the scan
-		buf := make([]byte, 8)
-		binary.BigEndian.PutUint64(buf, uint64(n))
-		_ = ps.db.Set(countKey, buf, pebble.NoSync)
+		// Persist so the next startup avoids the scan — through the coalescer,
+		// NOT a direct write. Write paths seed BEFORE their commit (G9), so n
+		// excludes the write in flight; a durable direct Set of n would land
+		// ahead of that write's increment, and a crash inside the coalescer's
+		// flush window would then leave a stored count that is short by the
+		// write and never rescanned. Queued here, the coalescer persists the
+		// latest in-memory value instead, and a crash before any flush leaves
+		// the key absent, so the next start rescans and gets the truth.
+		if ps.counterFlush != nil {
+			ps.counterFlush.Submit(wsPrefix, n)
+		} else {
+			buf := make([]byte, 8)
+			binary.BigEndian.PutUint64(buf, uint64(n))
+			_ = ps.db.Set(countKey, buf, pebble.NoSync)
+		}
 	})
 	return loaded
 }
@@ -522,6 +533,13 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	if ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
+	// Vault counter: load it, and on a first touch seed it, BEFORE the commit.
+	// The seed scans the vault's 0x01 keys; run after the commit, that scan
+	// already contains this engram and the Add below counts it a second time
+	// (G9: a fresh vault's first write reported 2). Seeded here, the scan
+	// excludes it and the Add is its only count.
+	vc := ps.getOrInitCounter(ctx, wsPrefix)
+
 	releaseMark := ps.holdDeclaredContradictionMark(wsPrefix, markedContradiction)
 	commitErr := batch.Commit(syncOption)
 	releaseMark()
@@ -537,8 +555,7 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	// NOTE: Intentionally NOT caching on write to avoid flooding L1 cache.
 
 	// Vault counter: in-memory atomic; coalescer persists every 100ms.
-	// Load-or-init before the Add so we hold a reference to the live counter.
-	vc := ps.getOrInitCounter(ctx, wsPrefix)
+	// vc was loaded (and seeded, on first touch) before the commit above.
 	newCount := vc.count.Add(1)
 	// Only submit if vc is still the current counter for this vault.
 	// ClearVault may have evicted the counter between Add and Submit; in that
@@ -853,6 +870,15 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 	if ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
+	// Seed every touched vault's counter BEFORE the commit (G9) — see the
+	// matching comment in WriteEngram. Seeded after it, the first batch a
+	// fresh vault ever received was counted twice: 50 written, 100 reported.
+	for i := range items {
+		if errs[i] == nil {
+			ps.getOrInitCounter(ctx, items[i].WSPrefix)
+		}
+	}
+
 	releaseMarks := ps.holdDeclaredContradictionMarks(markedContradictionWS)
 	commitErr := batch.Commit(syncOption)
 	releaseMarks()
