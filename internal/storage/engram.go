@@ -522,7 +522,7 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 	//
 	// The lock only needs to span the read and the batch commit: once the batch
 	// is committed the metadata/lease are gone, so a later CAS reads not-found.
-	// Post-commit cleanup (replication, cache, entity counts) is unlocked to
+	// Post-commit cleanup (replication, entity counts) is unlocked to
 	// keep the stripe free during the O(n) entity work.
 	// Load (and on first touch seed) the vault counter BEFORE the delete commits.
 	// A seed scan run after the commit would already exclude this engram, and
@@ -532,6 +532,20 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 
 	mu := ps.casLocks.For(id[:])
 	mu.Lock()
+
+	// Evict the L1 entry BEFORE the locked read, so the read below always
+	// reflects Pebble rather than the cache. Two concurrent hard deletes of
+	// the same engram used to double-decrement the vault counter: the first
+	// deleter released the stripe lock before evicting, so the second one's
+	// GetEngram hit the stale L1 entry, took the full-delete path, and
+	// decremented again. An unlocked reader can also repopulate L1 from a
+	// pre-commit Pebble read after the first delete's eviction, so evicting
+	// here (under the lock, immediately before the read) is what makes the
+	// "exists → decrement" decision authoritative. The post-commit eviction
+	// below also moved inside the lock. Pinned by
+	// TestDeleteEngram_ConcurrentHardDeleteDecrementsOnce and
+	// TestDeleteEngram_StaleL1EntryDoesNotDecrementTwice.
+	ps.cache.Delete(wsPrefix, id)
 
 	// Read engram to collect secondary index data for cleanup.
 	eng, err := ps.GetEngram(ctx, wsPrefix, id)
@@ -546,9 +560,9 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 			mu.Unlock()
 			return err
 		}
+		ps.cache.Delete(wsPrefix, id)
 		mu.Unlock()
 		ps.replicateBatch(batch)
-		ps.cache.Delete(wsPrefix, id)
 		return nil
 	}
 
@@ -804,10 +818,10 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 		mu.Unlock()
 		return fmt.Errorf("delete engram: %w", err)
 	}
+	// Evict before releasing the stripe lock (see the eviction above the read).
+	ps.cache.Delete(wsPrefix, id)
 	mu.Unlock()
 	ps.replicateBatch(batch)
-
-	ps.cache.Delete(wsPrefix, id)
 	for _, src := range assocCacheDirty {
 		ps.assocCache.Remove(assocCacheKey(wsPrefix, src))
 	}
