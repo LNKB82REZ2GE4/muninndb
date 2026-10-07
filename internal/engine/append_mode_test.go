@@ -151,6 +151,7 @@ func guardedOps(eng *Engine, ap context.Context) map[string]func() error {
 		"MergeEntity":          func() error { _, e := eng.MergeEntity(ap, v, "a", "b", false); return e },
 		"ReplayEnrichment":     func() error { _, e := eng.ReplayEnrichment(ap, v, nil, 10, false); return e },
 		"ApplyEnrichment":      func() error { _, e := eng.ApplyEnrichment(ap, v, &EnrichmentApplyRequest{}); return e },
+		"UpdateDigestIndexed":  func() error { return eng.UpdateDigestIndexed(ap, z, "s", []string{"k"}, "", "") },
 		"Evolve":               func() error { _, e := eng.Evolve(ap, v, id, "new", "r", nil, ""); return e },
 		"EvolveAt":             func() error { _, e := eng.EvolveAt(ap, v, id, "new", "r", nil, "", nil, nil, time.Time{}); return e },
 		"Forget":               func() error { _, e := eng.Forget(ap, &mbp.ForgetRequest{Vault: v, ID: id}); return e },

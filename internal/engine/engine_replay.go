@@ -253,7 +253,7 @@ func (e *Engine) ReplayEnrichment(ctx context.Context, vault string, stages []st
 		e.replayFailMu.Unlock()
 
 		// Persist enrichment results (summary, key_points, memory_type, type_label).
-		if updateErr := e.store.UpdateDigest(ctx, eng.ID, result.Summary, result.KeyPoints, result.MemoryType, result.TypeLabel); updateErr != nil {
+		if updateErr := e.UpdateDigestIndexed(ctx, eng.ID, result.Summary, result.KeyPoints, result.MemoryType, result.TypeLabel); updateErr != nil {
 			slog.Warn("replay enrichment: UpdateDigest failed",
 				"id", eng.ID.String(), "err", updateErr)
 			failed++
@@ -485,7 +485,9 @@ func (e *Engine) ApplyEnrichment(ctx context.Context, vault string, req *Enrichm
 	if err != nil {
 		return nil, fmt.Errorf("apply enrichment: %w", err)
 	}
-	if req.Summary != "" {
+	// Key points are summarize-stage output (the retroactive processor guards
+	// them by the summary flag), so key points alone complete that stage too.
+	if req.Summary != "" || len(req.KeyPoints) > 0 {
 		completedSet["summary"] = true
 	}
 	if req.MemoryType != "" || req.TypeLabel != "" || req.Classification != "" {
@@ -502,8 +504,11 @@ func (e *Engine) ApplyEnrichment(ctx context.Context, vault string, req *Enrichm
 		return nil, fmt.Errorf("apply enrichment: at least one enrichment field or completed stage is required")
 	}
 
-	if req.Summary != "" || req.MemoryType != "" || req.TypeLabel != "" {
-		if err := e.store.UpdateDigest(ctx, id, req.Summary, req.KeyPoints, req.MemoryType, req.TypeLabel); err != nil {
+	// len(req.KeyPoints) is in this condition because without it a request
+	// carrying ONLY key points was accepted and its key points silently
+	// dropped (G2).
+	if req.Summary != "" || len(req.KeyPoints) > 0 || req.MemoryType != "" || req.TypeLabel != "" {
+		if err := e.UpdateDigestIndexed(ctx, id, req.Summary, req.KeyPoints, req.MemoryType, req.TypeLabel); err != nil {
 			return nil, fmt.Errorf("apply enrichment: update digest: %w", err)
 		}
 	}

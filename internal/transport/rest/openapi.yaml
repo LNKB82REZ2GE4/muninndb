@@ -484,6 +484,14 @@ components:
             injected by a post-pipeline phase (entity-boost spread activation,
             supersession head promotion) and its aboutness against this query
             was never MEASURED — which is different from measured and low.
+        matched_key_point:
+          type: string
+          description: >-
+            The enricher key point this query matched: the one covering the
+            largest share of the query's IDF-weighted terms, and at least half
+            of them. Omitted when the engram has no key points or none covers
+            half the query. A snippet only; it changes no score or rank. The
+            full list is `key_points` on the read endpoint.
         score_components:
           $ref: "#/components/schemas/ScoreComponents"
         why:

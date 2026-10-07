@@ -1223,12 +1223,10 @@ func (e *Engine) UpdateTags(ctx context.Context, vault string, id storage.ULID, 
 	prev, prevErr := e.store.GetEngram(ctx, wsPrefix, id)
 	var prevDoc fts.Document
 	if prevErr == nil && prev != nil {
-		prevDoc = fts.Document{
-			Concept:   prev.Concept,
-			CreatedBy: prev.CreatedBy,
-			Content:   prev.Content,
-			Tags:      append([]string(nil), prev.Tags...),
-		}
+		// Key points included: they are part of the indexed document, and a
+		// reindex whose prev and next both omit them would delete the
+		// key-point posting of every term they share with the content.
+		prevDoc = e.indexedPrevDocument(wsPrefix, prev)
 	}
 
 	if err := e.store.UpdateTagsLocked(ctx, wsPrefix, id, tags); err != nil {
@@ -1257,8 +1255,7 @@ func (e *Engine) UpdateTags(ctx context.Context, vault string, id storage.ULID, 
 		// record away rather than superseding it, and Forget already de-indexed
 		// it. Drop whatever postings remain and write nothing back, so a retag
 		// cannot put a discarded document into the candidate pool.
-		if err := e.fts.DeleteEngram(wsPrefix, [16]byte(id),
-			prevDoc.Concept, prevDoc.CreatedBy, prevDoc.Content, prevDoc.Tags); err != nil {
+		if err := e.fts.DeleteDocument(wsPrefix, [16]byte(id), prevDoc); err != nil {
 			slog.Warn("engine: update_tags: fts delete failed", "id", id.String(), "err", err)
 		}
 		return nil
@@ -3348,6 +3345,9 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 			// uncalibrated, why.
 			RelevanceBand:      relevanceBands[i],
 			RelevanceBandBasis: relevanceBases[i],
+			// G2: the enricher key point this query matched, if any.
+			// Presentation only — computed after every scoring phase.
+			MatchedKeyPoint: e.matchedKeyPoint(wsPrefix, req.Context, scored.Engram),
 		}
 
 		// Supersession annotation from the supersedes-aware ranking phase (always-on
@@ -3991,8 +3991,21 @@ func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.Forge
 		}
 		// Remove FTS posting-list entries so soft-deleted engrams do not appear in search.
 		if readErr == nil && eng != nil && e.fts != nil {
-			if ftErr := e.fts.DeleteEngram(wsPrefix, [16]byte(id), eng.Concept, eng.CreatedBy, eng.Content, eng.Tags); ftErr != nil {
+			if ftErr := e.fts.DeleteDocument(wsPrefix, [16]byte(id), ftsDocument(eng)); ftErr != nil {
 				slog.Warn("engine: fts cleanup failed after soft delete", "id", req.ID, "error", ftErr)
+			}
+		}
+		// The pre-read above is unlocked, so an in-place rewrite that held the
+		// stripe lock while SoftDelete waited (UpdateDigestIndexed adding key
+		// points, UpdateTags adding tags) may have indexed terms it does not
+		// contain. Re-read the committed record and delete its document too.
+		// Deletes are idempotent and move no statistics. A rewrite that starts
+		// after SoftDelete sees the soft-deleted state and indexes nothing.
+		if e.fts != nil {
+			if post, err := e.store.GetEngram(ctx, wsPrefix, id); err == nil && post != nil {
+				if ftErr := e.fts.DeleteDocument(wsPrefix, [16]byte(id), ftsDocument(post)); ftErr != nil {
+					slog.Warn("engine: fts cleanup (post-read) failed after soft delete", "id", req.ID, "error", ftErr)
+				}
 			}
 		}
 	}
@@ -4013,7 +4026,7 @@ func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.Forge
 // the HNSW tombstone does not, so they are gated separately.
 func (e *Engine) cleanSearchIndexesAfterHardDelete(wsPrefix [8]byte, id [16]byte, eng *storage.Engram) {
 	if e.fts != nil && eng != nil {
-		if err := e.fts.DeleteEngram(wsPrefix, id, eng.Concept, eng.CreatedBy, eng.Content, eng.Tags); err != nil {
+		if err := e.fts.DeleteDocument(wsPrefix, id, ftsDocument(eng)); err != nil {
 			slog.Warn("engine: fts cleanup failed after hard delete",
 				"id", storage.ULID(id).String(), "error", err)
 		}

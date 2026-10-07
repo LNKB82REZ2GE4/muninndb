@@ -1474,3 +1474,52 @@ drop the per-vault `abstained`/`conflict` blocks; only the degradation flag is p
 **Principle: a degradation signal is only loud if every path a reader actually uses carries it.
 Flagging the response is not enough when the response a client sees is rebuilt elsewhere —
 trace the flag to the rendered output, and give operators a pollable state, not a log line.**
+
+### Enricher key points: index them, but never let a restatement count twice (G2, 2026-10-07)
+
+**Context.** The external enricher writes 3-7 self-contained key points per engram through
+`apply_enrichment`. They were persisted on the record (measured on two production vaults:
+548/549 and 54/57 engrams carry them, median 4 and 3) but invisible: `muninn_read`'s MCP
+convert dropped `ReadResponse.KeyPoints`, recall carried nothing, and no index read them. A
+second defect sat underneath: an apply carrying key points and no summary/type was accepted
+and its key points dropped (0/93 stored on the released binary in a reproduction).
+
+**Decision.** Index key points in their own FTS field and surface them, with no new LLM call
+and no migration (`muninn reindex-fts` backfills existing vaults).
+- A term's coverage is `max(content side, key-point side)`, never the sum, and a key-point
+  posting is normalised at the vault's own average document length. A key point is the
+  enricher's restatement of the content; summing would credit every enriched engram twice
+  for every word it already holds. With max + avgdl, a key point lifts an engram only where
+  it is the stronger evidence (paraphrase vocabulary, or a match buried in a longer-than-
+  average body) — self-calibrating per vault, no constant.
+- Recall rows carry `matched_key_point`: the key point covering the largest IDF-weighted share
+  of the query, and at least half of it. Presentation only, chosen after ranking.
+- One document builder (`ftsDocument`) for every path that rewrites an existing engram's
+  postings, so delete and reindex cannot forget the field.
+
+**Measured** (isolated instance, same data, released binary vs branch):
+- Real production vault, 548 engrams, half enriched. Questions written from ONE key point:
+  MRR 0.702 → 0.804, paired +0.103 [+0.031, +0.189], 7 won / 0 lost, top-3 31 → 37 of 40.
+  Content-written questions on unenriched engrams (40) and on enriched engrams (20): paired
+  diff exactly 0.000 — no inflation and no displacement.
+- 93 raw commit-history chunks with an extractor's facts as key points, 60 blind-judged
+  paraphrased questions (final code, second judging pass): MRR 0.235 → 0.354 (+0.119
+  [+0.05, +0.20], 12 won / 1 lost; first pass on the pre-review code +0.129). The same facts
+  as CHILD engrams (`add_child`): 0.892 (+0.658 [+0.55, +0.77], 45/0). Unenriched control
+  vault: identical lists before and after (60/60 tied). Judge drift between the two passes
+  on the identical baseline lists: 0.036 MRR.
+- Adversarial review found four defects before landing, all fixed with RED-shown tests:
+  repeated key-point terms inflating TF (now presence-only), legacy unindexed key points
+  corrupting DF on re-enrich and retag, and Forget racing a key-point write.
+- Audit of 40 enriched engrams (blind Sonnet judges, seeded controls caught 20/20): key-point
+  fidelity 81% supported, 18% partial, 1 unsupported; coverage of Sonnet-written key facts
+  71% (HIGH 82%). Below a raw-text extractor measured at 95% / 96%.
+
+**Honest negative / what was not done.** Key points as a field rescue retrieval for short
+turn engrams, but for long multi-fact sources they recover a fifth of what child engrams do:
+one 2.8k-character document still competes as one unit, and the snippet floor shows the
+matched key point on only 18 of 60 questions there. Children are the right shape for
+documents (that is the extraction worker's job, plan Phase 1b), not for every enriched turn
+(4-5x the engram count). Key points are not embedded; the semantic channel still sees only
+the content. gRPC/proto and non-Go SDKs do not carry `matched_key_point` (REST does, by type
+alias).

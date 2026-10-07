@@ -156,7 +156,7 @@ func (e *Engine) reindexVault(ctx context.Context, ws [8]byte, job *vaultjob.Job
 		// before copying and clear it after indexing, we bypass the clearing guard
 		// by calling the underlying fts.Index directly here.
 		if e.fts != nil {
-			if err := e.fts.IndexEngram(ws, [16]byte(eng.ID), eng.Concept, eng.CreatedBy, eng.Content, eng.Tags); err != nil {
+			if err := e.fts.IndexDocument(ws, [16]byte(eng.ID), ftsDocument(eng)); err != nil {
 				slog.Warn("reindex: FTS index failed for engram", "id", eng.ID, "err", err)
 			}
 		}
@@ -318,9 +318,9 @@ func (e *Engine) GetVaultJob(jobID string) (*vaultjob.Job, bool) {
 // ftsIndexEngram is a helper that calls fts.Index.IndexEngram directly,
 // bypassing the async worker. Used during re-index to avoid the clearing guard.
 func ftsIndexEngram(idx interface {
-	IndexEngram(ws [8]byte, id [16]byte, concept, createdBy, content string, tags []string) error
+	IndexDocument(ws [8]byte, id [16]byte, d fts.Document) error
 }, ws [8]byte, eng *storage.Engram) {
-	_ = idx.IndexEngram(ws, [16]byte(eng.ID), eng.Concept, eng.CreatedBy, eng.Content, eng.Tags)
+	_ = idx.IndexDocument(ws, [16]byte(eng.ID), ftsDocument(eng))
 }
 
 // ensure fts import is used (IndexJob is referenced only via worker.Submit in engine.go)
