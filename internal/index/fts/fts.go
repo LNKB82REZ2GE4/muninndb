@@ -243,6 +243,16 @@ func docTermCounts(d Document) (map[string]map[uint8]int, uint16) {
 	for _, kp := range d.KeyPoints {
 		addTerms(kp, FieldKeyPoints)
 	}
+	// Key-point TF is PRESENCE, clamped to 1. Enrichers repeat the topic noun in
+	// every key point; counting those repeats (tf=3 at avgdl → tfNorm 1.57)
+	// would let a restatement outscore one content mention, which is the
+	// inflation the max rule exists to prevent
+	// (TestKeyPoints_RepeatedTermsDoNotInflate).
+	for _, fc := range termCounts {
+		if fc[FieldKeyPoints] > 1 {
+			fc[FieldKeyPoints] = 1
+		}
+	}
 
 	allTokens := Tokenize(concept + " " + content + " " + createdBy + " " + strings.Join(tags, " "))
 	return termCounts, uint16(len(allTokens))
@@ -886,6 +896,32 @@ func (idx *Index) searchTokenCoverage(ws [8]byte, term string, numer map[[16]byt
 		numer[id] += idf * cov
 	}
 	return nil
+}
+
+// KeyPointsIndexed reports whether any of keyPoints has a key-point posting for
+// id. Key points persisted before they were indexed (every enriched engram in a
+// vault that predates G2 and has not been through reindex-fts) are on the
+// record but not in the index; an in-place reindex that took them as part of
+// the PREVIOUS document would decrement document frequencies other engrams own
+// (re-enrich) or keep postings it never counted (retag). Callers building a
+// prev document use this to drop key points that were never indexed.
+func (idx *Index) KeyPointsIndexed(ws [8]byte, id [16]byte, keyPoints []string) bool {
+	seen := make(map[string]struct{})
+	for _, kp := range keyPoints {
+		for _, t := range Tokenize(kp) {
+			if _, dup := seen[t]; dup {
+				continue
+			}
+			seen[t] = struct{}{}
+			v, closer, err := idx.db.Get(keys.FTSPostingKey(ws, t, FieldKeyPoints, id))
+			if err == nil {
+				_ = v
+				closer.Close()
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // keyPointMatchFloor is the share of a query's IDF mass a key point must cover

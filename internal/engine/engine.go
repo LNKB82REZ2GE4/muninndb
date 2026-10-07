@@ -1215,7 +1215,7 @@ func (e *Engine) UpdateTags(ctx context.Context, vault string, id storage.ULID, 
 		// Key points included: they are part of the indexed document, and a
 		// reindex whose prev and next both omit them would delete the
 		// key-point posting of every term they share with the content.
-		prevDoc = ftsDocument(prev)
+		prevDoc = e.indexedPrevDocument(wsPrefix, prev)
 	}
 
 	if err := e.store.UpdateTagsLocked(ctx, wsPrefix, id, tags); err != nil {
@@ -3986,6 +3986,19 @@ func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.Forge
 		if readErr == nil && eng != nil && e.fts != nil {
 			if ftErr := e.fts.DeleteDocument(wsPrefix, [16]byte(id), ftsDocument(eng)); ftErr != nil {
 				slog.Warn("engine: fts cleanup failed after soft delete", "id", req.ID, "error", ftErr)
+			}
+		}
+		// The pre-read above is unlocked, so an in-place rewrite that held the
+		// stripe lock while SoftDelete waited (UpdateDigestIndexed adding key
+		// points, UpdateTags adding tags) may have indexed terms it does not
+		// contain. Re-read the committed record and delete its document too.
+		// Deletes are idempotent and move no statistics. A rewrite that starts
+		// after SoftDelete sees the soft-deleted state and indexes nothing.
+		if e.fts != nil {
+			if post, err := e.store.GetEngram(ctx, wsPrefix, id); err == nil && post != nil {
+				if ftErr := e.fts.DeleteDocument(wsPrefix, [16]byte(id), ftsDocument(post)); ftErr != nil {
+					slog.Warn("engine: fts cleanup (post-read) failed after soft delete", "id", req.ID, "error", ftErr)
+				}
 			}
 		}
 	}

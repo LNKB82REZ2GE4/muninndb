@@ -38,6 +38,18 @@ func ftsDocument(eng *storage.Engram) fts.Document {
 	}
 }
 
+// indexedPrevDocument is ftsDocument for the PREVIOUS state of an in-place
+// reindex: key points that were never indexed (stored before G2, vault not yet
+// through reindex-fts) are dropped, so ReindexEngram's membership-based DF
+// bookkeeping sees exactly what the index holds.
+func (e *Engine) indexedPrevDocument(ws [8]byte, eng *storage.Engram) fts.Document {
+	d := ftsDocument(eng)
+	if e.fts != nil && len(d.KeyPoints) > 0 && !e.fts.KeyPointsIndexed(ws, [16]byte(eng.ID), d.KeyPoints) {
+		d.KeyPoints = nil
+	}
+	return d
+}
+
 // UpdateDigestIndexed persists an enrichment digest (store.UpdateDigest) and
 // brings the engram's FTS key-point postings in step with the key points it
 // wrote. It is the only way enrichment output should reach the store: the MCP
@@ -46,7 +58,9 @@ func ftsDocument(eng *storage.Engram) fts.Document {
 //
 // The stripe lock serialises this against Engine.UpdateTags, the other in-place
 // FTS rewrite of an existing engram, so neither can compute its "previous
-// document" from a record the other is halfway through changing.
+// document" from a record the other is halfway through changing. Forget does
+// not take it for its pre-read; it closes the race from its side by also
+// deleting the postings of a post-SoftDelete re-read (see Forget).
 //
 // FTS is a derived index: a failed reindex is logged, not returned, exactly as
 // in UpdateTags — the digest is already durable, and `muninn reindex-fts`
@@ -68,7 +82,7 @@ func (e *Engine) UpdateDigestIndexed(ctx context.Context, id storage.ULID, summa
 	havePrev := false
 	if found {
 		if prev, err := e.store.GetEngram(ctx, ws, id); err == nil && prev != nil {
-			prevDoc, havePrev = ftsDocument(prev), true
+			prevDoc, havePrev = e.indexedPrevDocument(ws, prev), true
 		}
 	}
 
