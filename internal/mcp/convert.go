@@ -85,15 +85,18 @@ func activationToMemory(item *mbp.ActivationItem) Memory {
 		}
 	}
 	m := Memory{
-		Annotations:    annotations,
-		ID:             item.ID,
-		Concept:        item.Concept,
-		Content:        previewContent,
-		Summary:        item.Summary,
-		Score:          roundScore(item.Score),
-		VectorScore:    roundScore(item.ScoreComponents.SemanticSimilarity),
-		VectorScoreRaw: roundScore(item.ScoreComponents.SemanticSimilarityRaw),
-		EntityBoost:    roundScore(item.ScoreComponents.EntityBoost),
+		Annotations: annotations,
+		ID:          item.ID,
+		Concept:     item.Concept,
+		Content:     previewContent,
+		Summary:     item.Summary,
+		// G2: the matched key point. Top-level for the same reason as
+		// relevance_band: nothing allocation-gated can drop it.
+		MatchedKeyPoint: item.MatchedKeyPoint,
+		Score:           roundScore(item.Score),
+		VectorScore:     roundScore(item.ScoreComponents.SemanticSimilarity),
+		VectorScoreRaw:  roundScore(item.ScoreComponents.SemanticSimilarityRaw),
+		EntityBoost:     roundScore(item.ScoreComponents.EntityBoost),
 		// #773: the honest, cross-query-comparable quantities. They were
 		// computed on every row and mapped onto MBP/REST, and this function —
 		// the ONLY path from an activation row to an MCP agent — dropped both.
@@ -141,10 +144,13 @@ func activationToMemory(item *mbp.ActivationItem) Memory {
 // Entities and EntityRelationships are included when populated by the engine.
 func readResponseToMemory(r *mbp.ReadResponse) Memory {
 	m := Memory{
-		ID:          r.ID,
-		Concept:     r.Concept,
-		Content:     r.Content, // full content, no truncation
-		Summary:     r.Summary,
+		ID:      r.ID,
+		Concept: r.Concept,
+		Content: r.Content, // full content, no truncation
+		Summary: r.Summary,
+		// G2: the engine's ReadResponse always carried key points (REST
+		// returned them); this mapping dropped them from muninn_read.
+		KeyPoints:   r.KeyPoints,
 		Confidence:  r.Confidence,
 		Tags:        r.Tags,
 		State:       storage.LifecycleState(r.State).String(),

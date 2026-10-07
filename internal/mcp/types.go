@@ -72,12 +72,18 @@ type WriteResult struct {
 }
 
 type Memory struct {
-	ID          string  `json:"id"`
-	Concept     string  `json:"concept"`
-	Content     string  `json:"content"` // recall: real content (truncated); read: full content
-	Summary     string  `json:"summary,omitempty"`
-	Score       float64 `json:"score,omitempty"`
-	VectorScore float64 `json:"vector_score,omitempty"`
+	ID      string `json:"id"`
+	Concept string `json:"concept"`
+	Content string `json:"content"` // recall: real content (truncated); read: full content
+	Summary string `json:"summary,omitempty"`
+	// KeyPoints are the enricher's self-contained key points (G2). muninn_read
+	// only; recall carries just the one the query matched, below.
+	KeyPoints []string `json:"key_points,omitempty"`
+	// MatchedKeyPoint is recall's snippet: the key point this query matched
+	// (see mbp.ActivationItem.MatchedKeyPoint). Absent when none matched.
+	MatchedKeyPoint string  `json:"matched_key_point,omitempty"`
+	Score           float64 `json:"score,omitempty"`
+	VectorScore     float64 `json:"vector_score,omitempty"`
 	// VectorScoreRaw is the uncalibrated cosine similarity behind VectorScore
 	// (COG-26's honesty backstop — see activation.ScoreComponents.
 	// SemanticSimilarityRaw). Lets an operator see the raw signal for a match

@@ -73,7 +73,7 @@ type Engram struct {
 	Associations   []Association
 	Embedding      []float32 // nil if no embedding
 	Summary        string    // extractive first 2 sentences
-	KeyPoints      []string  // top 5 sentences by IDF rarity
+	KeyPoints      []string  // enricher key points: 3-7 self-contained statements (G2); FTS-indexed in their own field
 	MemoryType     MemoryType
 	TypeLabel      string     // free-form label, e.g. "architectural_decision", "coding_pattern"
 	Classification uint16     // concept-cluster ID

@@ -1630,7 +1630,7 @@ func runServer() {
 	// Shared plugin store — bridges raw storage to the plugin.PluginStore interface.
 	// Created here so it can be shared by the MCP adapter (RetryEnrich) and both
 	// retroactive processors (embed + enrich) which are started below.
-	pStore := plugin.NewStoreAdapter(store, hnswRegistry)
+	pStore := plugin.NewIndexedStoreAdapter(store, hnswRegistry, eng.UpdateDigestIndexed)
 
 	// Build MCP server
 	mcpAdapter := mcp.NewEngineAdapter(eng, enrichPlugin, pStore)

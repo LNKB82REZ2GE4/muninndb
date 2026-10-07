@@ -25,11 +25,17 @@ const (
 	FieldTags      = uint8(0x02)
 	FieldContent   = uint8(0x03)
 	FieldCreatedBy = uint8(0x04)
+	// FieldKeyPoints holds the enricher's key points (G2): short, self-contained
+	// statements about the engram. Unlike the other fields it is NOT summed into
+	// a term's coverage (see searchTokenCoverage), and its tokens are NOT part of
+	// the document length the other fields are normalised against.
+	FieldKeyPoints = uint8(0x05)
 
 	fieldWeightConcept   = 3.0
 	fieldWeightTags      = 2.0
 	fieldWeightContent   = 1.0
 	fieldWeightCreatedBy = 0.5
+	fieldWeightKeyPoints = 1.0
 
 	ContentCompressThreshold = 512
 )
@@ -181,6 +187,8 @@ func fieldWeight(field uint8) float64 {
 		return fieldWeightTags
 	case FieldContent:
 		return fieldWeightContent
+	case FieldKeyPoints:
+		return fieldWeightKeyPoints
 	case FieldCreatedBy:
 		return fieldWeightCreatedBy
 	default:
@@ -196,13 +204,25 @@ type Document struct {
 	CreatedBy string
 	Content   string
 	Tags      []string
+	// KeyPoints are the enricher's key points (G2). Every path that indexes,
+	// re-indexes or deletes an engram that may carry them must pass them, or
+	// their postings are orphaned (delete) or dropped (reindex).
+	KeyPoints []string
 }
 
-// docTermCounts returns the per-(term, field) term frequency for a document plus
-// its total token length — the BM25 length normalizer, which must count every
-// indexed field. Shared by IndexEngram and ReindexEngram so the two entry points
-// cannot drift on what a document's terms are.
-func docTermCounts(concept, createdBy, content string, tags []string) (map[string]map[uint8]int, uint16) {
+// allFields is every posting field a document can write. Delete and reindex
+// iterate it, so a field added here cannot be forgotten by either.
+var allFields = []uint8{FieldConcept, FieldContent, FieldTags, FieldCreatedBy, FieldKeyPoints}
+
+// docTermCounts returns the per-(term, field) term frequency for a document and
+// its BM25 length normalizer docLen, which counts every field EXCEPT the key
+// points: folding their tokens in would length-penalise every content match of
+// an enriched engram (TestKeyPoints_DoNotChangeContentLengthNormalisation).
+// Key-point postings carry no length at all (see postingDocLen). Shared by
+// IndexDocument and ReindexEngram so the two entry points cannot drift on what a
+// document's terms are.
+func docTermCounts(d Document) (map[string]map[uint8]int, uint16) {
+	concept, createdBy, content, tags := d.Concept, d.CreatedBy, d.Content, d.Tags
 	termCounts := make(map[string]map[uint8]int)
 	addTerms := func(text string, field uint8) {
 		tokens := Tokenize(text)
@@ -220,9 +240,30 @@ func docTermCounts(concept, createdBy, content string, tags []string) (map[strin
 	for _, tag := range tags {
 		addTerms(tag, FieldTags)
 	}
+	for _, kp := range d.KeyPoints {
+		addTerms(kp, FieldKeyPoints)
+	}
 
 	allTokens := Tokenize(concept + " " + content + " " + createdBy + " " + strings.Join(tags, " "))
 	return termCounts, uint16(len(allTokens))
+}
+
+// postingDocLen is the length a posting in field is normalised against.
+//
+// A key-point posting stores 0, which searchTokenCoverage reads as "the corpus
+// average" (dl < 1 → avgdl): a key-point mention counts exactly like one
+// mention in an average-length document of this vault. Normalising against the
+// key points' own (short) length instead would score every key-point term
+// above an average content mention and lift every enriched engram on any query
+// its key points restate. With avgdl, and with the max rule in
+// searchTokenCoverage, a key point only wins where the content is longer than
+// this vault's average or lacks the word — self-calibrating per vault, no
+// constant.
+func postingDocLen(field uint8, docLen uint16) uint16 {
+	if field == FieldKeyPoints {
+		return 0
+	}
+	return docLen
 }
 
 // docTermSet returns the set of distinct terms a document was indexed under.
@@ -230,7 +271,8 @@ func docTermCounts(concept, createdBy, content string, tags []string) (map[strin
 // coincide with a content token, and the two entry points that reason about a
 // term entering or leaving the index (DeleteEngram, ReindexEngram) must agree on
 // what "the document contains this term" means.
-func docTermSet(concept, createdBy, content string, tags []string) map[string]struct{} {
+func docTermSet(d Document) map[string]struct{} {
+	concept, createdBy, content, tags := d.Concept, d.CreatedBy, d.Content, d.Tags
 	termSet := make(map[string]struct{})
 	addTerms := func(text string) {
 		for _, t := range Tokenize(text) {
@@ -244,14 +286,25 @@ func docTermSet(concept, createdBy, content string, tags []string) map[string]st
 	for _, tag := range tags {
 		addTerms(tag)
 	}
+	for _, kp := range d.KeyPoints {
+		addTerms(kp)
+	}
 	return termSet
 }
 
-// IndexEngram writes FTS posting list entries for an engram.
-// ws is the 8-byte workspace prefix. id is the ULID.
+// IndexEngram writes FTS posting list entries for an engram that carries no key
+// points: every write path (a write never carries them; the enricher adds them
+// later). A path that indexes an EXISTING engram uses IndexDocument so its key
+// points are indexed too.
 func (idx *Index) IndexEngram(ws [8]byte, id [16]byte, concept, createdBy, content string, tags []string) error {
+	return idx.IndexDocument(ws, id, Document{Concept: concept, CreatedBy: createdBy, Content: content, Tags: tags})
+}
+
+// IndexDocument writes FTS posting list entries for one engram's document.
+// ws is the 8-byte workspace prefix. id is the ULID.
+func (idx *Index) IndexDocument(ws [8]byte, id [16]byte, d Document) error {
 	// Collect all (term, field, docLen) tuples
-	termCounts, docLen := docTermCounts(concept, createdBy, content, tags)
+	termCounts, docLen := docTermCounts(d)
 
 	// Acquire lock BEFORE reading current DF values to prevent lost-update races
 	// under concurrent IndexEngram calls.
@@ -268,7 +321,7 @@ func (idx *Index) IndexEngram(ws [8]byte, id [16]byte, concept, createdBy, conte
 			pv := PostingValue{
 				TF:     float32(count),
 				Field:  field,
-				DocLen: docLen,
+				DocLen: postingDocLen(field, docLen),
 			}
 			key := keys.FTSPostingKey(ws, term, field, id)
 			val := encodePosting(pv)
@@ -314,8 +367,15 @@ func (idx *Index) IndexEngram(ws [8]byte, id [16]byte, concept, createdBy, conte
 // Called from SoftDelete to prevent soft-deleted engrams from appearing in search results.
 // Does NOT update global stats (stats are approximate; no need to recount on soft delete).
 func (idx *Index) DeleteEngram(ws [8]byte, id [16]byte, concept, createdBy, content string, tags []string) error {
+	return idx.DeleteDocument(ws, id, Document{Concept: concept, CreatedBy: createdBy, Content: content, Tags: tags})
+}
+
+// DeleteDocument is DeleteEngram for a full document, key points included.
+// Pass the engram's key points: a key-point-only term is otherwise left with a
+// posting that keeps a deleted engram reachable from a search.
+func (idx *Index) DeleteDocument(ws [8]byte, id [16]byte, d Document) error {
 	// Collect all unique terms that were indexed for this engram.
-	termSet := docTermSet(concept, createdBy, content, tags)
+	termSet := docTermSet(d)
 
 	if len(termSet) == 0 {
 		return nil
@@ -327,7 +387,7 @@ func (idx *Index) DeleteEngram(ws [8]byte, id [16]byte, concept, createdBy, cont
 	for term := range termSet {
 		// Delete posting-list keys for this engram across all fields.
 		// Deleting a non-existent key is a no-op in Pebble.
-		for _, field := range []uint8{FieldConcept, FieldContent, FieldTags, FieldCreatedBy} {
+		for _, field := range allFields {
 			key := keys.FTSPostingKey(ws, term, field, id)
 			batch.Delete(key, nil)
 		}
@@ -411,8 +471,8 @@ func (idx *Index) DeleteEngram(ws [8]byte, id [16]byte, concept, createdBy, cont
 // to avoid; a correct AvgDocLen maintenance would need a delta-aware stats update
 // (deferred, #720).
 func (idx *Index) ReindexEngram(ws [8]byte, id [16]byte, prev, next Document) error {
-	oldTerms := docTermSet(prev.Concept, prev.CreatedBy, prev.Content, prev.Tags)
-	newCounts, docLen := docTermCounts(next.Concept, next.CreatedBy, next.Content, next.Tags)
+	oldTerms := docTermSet(prev)
+	newCounts, docLen := docTermCounts(next)
 
 	if len(oldTerms) == 0 && len(newCounts) == 0 {
 		return nil
@@ -426,7 +486,7 @@ func (idx *Index) ReindexEngram(ws [8]byte, id [16]byte, prev, next Document) er
 
 	// Drop everything the OLD document put in the index first.
 	for term := range oldTerms {
-		for _, field := range []uint8{FieldConcept, FieldContent, FieldTags, FieldCreatedBy} {
+		for _, field := range allFields {
 			batch.Delete(keys.FTSPostingKey(ws, term, field, id), nil)
 		}
 		for _, tri := range Trigrams(term) {
@@ -441,7 +501,7 @@ func (idx *Index) ReindexEngram(ws [8]byte, id [16]byte, prev, next Document) er
 			pv := PostingValue{
 				TF:     float32(count),
 				Field:  field,
-				DocLen: docLen,
+				DocLen: postingDocLen(field, docLen),
 			}
 			batch.Set(keys.FTSPostingKey(ws, term, field, id), encodePosting(pv), nil)
 		}
@@ -746,6 +806,17 @@ func siftDownScoredIDs(h []ScoredID, i int) {
 // within that doc — one term's field-weighted tf can't exceed a coverage of
 // 1.0, so stuffing a single word cannot substitute for covering the query
 // (the coverage this contributes is presence/prominence, not raw frequency).
+//
+// Key points (FieldKeyPoints, G2) are the one exception to the sum: a term's
+// raw coverage is max(Σ other fields, key-point side), never their sum. Key
+// points are the enricher's restatement of the content, so summing would credit
+// an enriched engram twice for every word it already contains — every enriched
+// engram would outscore an identical unenriched one on any query. With max, a
+// key point lifts a term only where it is the stronger evidence: a word the
+// content lacks (paraphrase vocabulary) or one buried in a long body whose
+// length normalisation depresses it. Pinned by
+// TestKeyPoints_DoNotInflateTermsContentAlreadyCovers and
+// TestKeyPoints_LiftLongBodyMatch.
 func (idx *Index) searchTokenCoverage(ws [8]byte, term string, numer map[[16]byte]float64, idf, avgdl float64) error {
 	// Prefix scan for this term across all fields.
 	// Key format: 0x05 | ws[8] | term | 0x00 | field[1] | id[16]
@@ -771,6 +842,7 @@ func (idx *Index) searchTokenCoverage(ws [8]byte, term string, numer map[[16]byt
 	// this term (summed across every field the term appears in within that
 	// doc) so the cap is applied ONCE per (term, doc), not per field.
 	covRaw := make(map[[16]byte]float64, 32)
+	covKP := make(map[[16]byte]float64)
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		key := iter.Key()
@@ -794,7 +866,16 @@ func (idx *Index) searchTokenCoverage(ws [8]byte, term string, numer map[[16]byt
 		if math.IsNaN(weighted) || math.IsInf(weighted, 0) {
 			continue
 		}
+		if pv.Field == FieldKeyPoints {
+			covKP[engramID] += weighted
+			continue
+		}
 		covRaw[engramID] += weighted
+	}
+	for id, kp := range covKP {
+		if kp > covRaw[id] {
+			covRaw[id] = kp
+		}
 	}
 
 	for id, raw := range covRaw {
@@ -805,6 +886,71 @@ func (idx *Index) searchTokenCoverage(ws [8]byte, term string, numer map[[16]byt
 		numer[id] += idf * cov
 	}
 	return nil
+}
+
+// keyPointMatchFloor is the share of a query's IDF mass a key point must cover
+// to be presented as the matched snippet. One half is a majority rule over the
+// query's own weight, derived per query from this vault's own IDF statistics —
+// not a constant tuned on any corpus. Below it, a key point that shares a word
+// or two with the query would be shown as "the" match while not stating it.
+const keyPointMatchFloor = 0.5
+
+// BestKeyPoint returns the key point that best matches query, or "" when none
+// covers at least keyPointMatchFloor of the query's IDF-weighted terms.
+//
+// Coverage is the IDF-weighted fraction of the query's distinct (stemmed) terms
+// that occur in the key point, with the same denominator rule as Search: a term
+// this vault has never seen is charged idfMax, so a query about something the
+// vault does not hold cannot be "matched" by a key point sharing its one common
+// word. Ties go to the earlier key point (the enricher's order). Read-only and
+// presentation-only: it never changes a score or a rank.
+func (idx *Index) BestKeyPoint(ws [8]byte, query string, keyPoints []string) string {
+	if len(keyPoints) == 0 {
+		return ""
+	}
+	qTerms := Tokenize(query)
+	if len(qTerms) == 0 {
+		return ""
+	}
+	stats := idx.readStats(ws)
+	N := float64(stats.TotalEngrams)
+	idfMax := math.Log((N+0.5)/0.5 + 1)
+	weights := make(map[string]float64, len(qTerms))
+	var denom float64
+	for _, t := range qTerms {
+		if _, dup := weights[t]; dup {
+			continue
+		}
+		w := idx.getIDF(ws, t, N)
+		if w <= 0 {
+			w = idfMax
+		}
+		weights[t] = w
+		denom += w
+	}
+	if denom <= 0 {
+		return ""
+	}
+	best, bestCov := "", 0.0
+	for _, kp := range keyPoints {
+		have := make(map[string]struct{})
+		for _, t := range Tokenize(kp) {
+			have[t] = struct{}{}
+		}
+		var num float64
+		for t, w := range weights {
+			if _, ok := have[t]; ok {
+				num += w
+			}
+		}
+		if cov := num / denom; cov > bestCov {
+			best, bestCov = kp, cov
+		}
+	}
+	if bestCov < keyPointMatchFloor {
+		return ""
+	}
+	return best
 }
 
 // scoredIDLess reports whether a ranks BELOW b: lower score first, and on an
