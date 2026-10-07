@@ -148,23 +148,39 @@ The second stage (`internal/consolidation/dedup_identity.go`) refuses a merge wh
 side carries a name-shaped token absent from the other side (a swap; a one-sided addition is
 an elaboration and still merges), or when a word unique to one side is a morphological
 negation of a word unique to the other. Name shape is structural: an identifier shape, a
-capital in a non-initial position, or a sentence-initial capital the vault's own text
-capitalizes mid-sentence by majority. Without that per-vault evidence a sentence-initial
-word is never a name, so "Use uv" / "Prefer uv" keeps merging. No word list, no tuned
-threshold. Not gated by plasticity: the existing guard is unconditional, and refusing a merge
+capital in a non-initial position, or a sentence-initial capital (including after a
+"Label:" colon) unless the vault's own live text writes that word mostly lowercase
+mid-sentence. A word the vault has never written mid-sentence has no evidence, and missing
+evidence resolves toward keeping both. The earlier draft read it as "not a name", which let
+"Owner: Priya" / "Owner: Marcus" merge, and the adversarial pass caught that. On real vaults
+the change moved one blocked pair out of 125, because ordinary words ("use", "prefer") always
+have lowercase mid-sentence evidence. No word list, no tuned threshold. Not gated by plasticity: the existing guard is unconditional, and refusing a merge
 only leaves a duplicate in place.
 
 Measured offline on three production vault clones (bge-m3 vectors; aggregates only). In
 **steady state** the old guard already refuses 1,596 of the 1,618 live candidate pairs. Long
 captured turns nearly always differ in some number, so nightly dedup there is close to a
-no-op. The new stage refuses 9 more, and 13 still merge. **Retrospectively**, of 720
+no-op. The new stage refuses 8 more, and 14 still merge. **Retrospectively**, of 720
 already-archived engrams paired with their nearest live neighbour, the new stage would have
-kept 117 apart. On a blind two-judge sample of 40 of those 117, the identity rule held up
+kept 117 apart. On a blind two-judge sample of 40 blocked pairs (forward and retrospective),
+the identity rule held up
 on short atomic facts (both judges "different fact" on 9/13) and was weak on long texts
 (5/25 strict, 12/25 counting information loss). The polarity rule fired 8 times in total, and
 neither sampled pair was judged distinct, so its value on real data is unproven. Controls
 behaved: number-guard anchors were 8/8 "different", and pairs both guards let merge were
 judged same with no loss on 9/12.
+
+Known residuals are listed in the file header, and each one still merges:
+- a name the vault also writes as an ordinary lowercase word ("Will"/"will");
+- single-letter names;
+- role and polarity reversals with identical token sets (a set comparison cannot see order);
+- antonyms that share no morphology.
+
+The polarity prefixes are example-picked and misfire on real-word pairs (cover/discover,
+less/unless), but those misfires only keep a duplicate. Also out of scope: the representative
+election (Relevance*Confidence) ignores information content, so a one-sided elaboration loses
+its extra detail whenever the shorter side wins. That is pre-existing behaviour and a
+follow-up.
 
 **Principle: a separation guard is only as good as the shapes it can see. Each blind spot a
 guard documents should be RED-tested against the live mechanism, because a documented gap

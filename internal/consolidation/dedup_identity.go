@@ -23,14 +23,17 @@ import (
 //     API, iOS), or an underscore / internal dot / slash joining letters
 //     (muninn_recall, engine.go, internal/engine);
 //   - a capitalized word in a non-sentence-initial position;
-//   - a capitalized word in sentence-initial position ONLY when the vault's own
-//     text says that word is a name: the vault profile (built per dedup pass
-//     from every live engram in the vault) has seen it mid-sentence, and capitalized
-//     in the majority of those mid-sentence occurrences. Without a profile, a
-//     sentence-initial word is never treated as a name ("Use uv" vs "Prefer uv"
-//     must stay mergeable). The majority rule is a decision boundary, not a
-//     tuned constant: it asks "does this vault usually capitalize this word
-//     where capitalization is not forced?".
+//   - a capitalized word in sentence-initial position (including after a
+//     "Label:" colon) when the vault's own text does not contradict it: the
+//     vault profile (built per dedup pass from every LIVE engram) capitalizes
+//     it in the majority of its mid-sentence occurrences, or has never seen it
+//     mid-sentence at all (no evidence resolves toward keeping both). Ordinary
+//     words ("Use uv" vs "Prefer uv") have lowercase mid-sentence evidence in
+//     any real vault and stay mergeable. The majority rule is a decision
+//     boundary, not a tuned constant: it asks "does this vault usually
+//     capitalize this word where capitalization is not forced?".
+// Possessives are folded ("Jake's" is "Jake"), and a sentence end is read past
+// closing markup ("**Status:**").
 // Only Content is read: Concept is a short label that two true duplicates often
 // word differently, and a label swap is not a fact swap.
 // Comparison is case-insensitive and against EVERY token of the other side, so
@@ -48,9 +51,23 @@ import (
 // kind of fixed grammar as the negation-marker set, not vocabulary fitted to a
 // sample.
 //
-// Known blind spots, not claimed here: names that differ only in a lowercase
-// token ("the office is in boston" vs "... in nyc"), antonyms with no shared
-// morphology (true/false, on/off, increase/decrease), and spelled-out numbers.
+// The prefix and substitution sets are picked from common English examples;
+// several real-word pairs match them without being negations (cover/discover,
+// less/unless, intend/extend). Those misfires only keep a duplicate alive.
+//
+// Known blind spots, not claimed here (each still merges):
+//   - names written lowercase ("the office is in boston" vs "... in nyc");
+//   - a name that is also an ordinary word the vault writes lowercase
+//     ("Ask Will" vs "Ask Mark" when "will" is common mid-sentence);
+//   - single-letter names ("Plan A" vs "Plan B", "written in C" vs "in R");
+//   - role and polarity REVERSALS with identical token sets ("owned by A,
+//     reviewed by B" vs "owned by B, reviewed by A"; "X enabled, Y disabled"
+//     vs "X disabled, Y enabled") — a set comparison cannot see order;
+//   - antonyms with no shared morphology (true/false, on/off), spelled-out
+//     numbers;
+//   - a one-sided elaboration merges whichever side wins the
+//     Relevance*Confidence election, so the extra detail is lost when the
+//     shorter side survives (pre-existing election behaviour, not changed here).
 
 // caseProfile records, per lowercased word, how the vault writes it where
 // capitalization is not forced by sentence position.
@@ -77,13 +94,20 @@ func (p *caseProfile) add(e *storage.Engram) {
 	}
 }
 
-// isName reports whether the vault usually capitalizes lw mid-sentence.
+// isName reports whether a capitalized sentence-initial word should be read
+// as a name. The vault's mid-sentence usage decides by majority. A word the
+// vault has NEVER written mid-sentence has no evidence either way, and missing
+// evidence is resolved toward keeping both memories (refuse-to-merge over
+// destroy): it counts as a name. On a cold vault that refuses some genuine
+// restatements that differ only in their first word; on any vault with real
+// text, ordinary words ("use", "prefer") have mid-sentence evidence and pass.
+// A nil profile is treated as an empty one.
 func (p *caseProfile) isName(lw string) bool {
 	if p == nil {
-		return false
+		return true
 	}
 	total := p.midTotal[lw]
-	return total > 0 && 2*p.midCap[lw] > total
+	return total == 0 || 2*p.midCap[lw] > total
 }
 
 type identityToken struct {
@@ -103,13 +127,21 @@ func identityTokens(s string) []identityToken {
 			raw := strings.TrimFunc(f, func(r rune) bool {
 				return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'
 			})
+			// A possessive names the same entity: "Jake's" is "Jake".
+			raw = strings.TrimSuffix(strings.TrimSuffix(raw, "'s"), "’s")
 			if raw == "" || !hasLetter(raw) {
 				// Bullets, headings, list numbers: position unchanged.
 				continue
 			}
 			out = append(out, identityToken{raw: raw, initial: initial})
-			last := f[len(f)-1]
-			initial = last == '.' || last == '!' || last == '?' || last == ':' || last == ';'
+			// Sentence end is read past closing markup, so "**Status:**",
+			// "(done.)" and "`x`." end a sentence like a bare "x." does.
+			end := strings.TrimRight(f, "*_`\"')]>’”")
+			initial = false
+			if end != "" {
+				last := end[len(end)-1]
+				initial = last == '.' || last == '!' || last == '?' || last == ':' || last == ';'
+			}
 		}
 	}
 	return out
@@ -213,14 +245,21 @@ func polarityPair(pos, neg string) bool {
 	return false
 }
 
-// wordSet tokenizes lowercased text into words of letters and hyphens, with
-// the hyphens removed, so "non-blocking" is seen as "nonblocking" and pairs
-// with "blocking" the same way the unhyphenated spelling does.
+// wordSet tokenizes lowercased text into letter words. A hyphenated "non-"
+// compound is joined ("non-blocking" -> "nonblocking", pairing with
+// "blocking"); every other hyphenated compound is split into its parts.
 func wordSet(s string) map[string]bool {
 	out := map[string]bool{}
 	for _, w := range strings.FieldsFunc(s, func(r rune) bool { return !unicode.IsLetter(r) && r != '-' }) {
-		if w = strings.ReplaceAll(w, "-", ""); w != "" {
-			out[w] = true
+		parts := strings.FieldsFunc(w, func(r rune) bool { return r == '-' })
+		if len(parts) > 1 && parts[0] == "non" {
+			// Only "non-" negates when hyphenated; "in-memory", "in-place",
+			// "un-" compounds in code text are locative or idiomatic.
+			out[strings.Join(parts, "")] = true
+			continue
+		}
+		for _, p := range parts {
+			out[p] = true
 		}
 	}
 	return out
