@@ -327,6 +327,11 @@ func (w *RESTEngineWrapper) GetProcessorStats() []plugin.RetroactiveStats {
 	return w.engine.GetProcessorStats()
 }
 
+// EmbedHealth returns the embed backend's health (G4).
+func (w *RESTEngineWrapper) EmbedHealth() plugin.EmbedHealthSnapshot {
+	return w.engine.EmbedHealth()
+}
+
 func (w *RESTEngineWrapper) EmbedStats() plugin.RetroactiveStats {
 	return w.engine.EmbedStats()
 }

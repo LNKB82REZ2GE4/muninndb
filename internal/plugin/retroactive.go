@@ -58,6 +58,7 @@ type RetroactiveProcessor struct {
 	cancelFn context.CancelFunc
 	wg       sync.WaitGroup
 	notifyCh chan struct{} // buffered(1); non-blocking send from Notify()
+	health   *EmbedHealth  // optional; counts zero-vector refusals (G4)
 
 	// vaultGuards establish a clear boundary. Plugin calls hold a per-vault
 	// admission through persistence; ClearVault invalidates the generation,
@@ -97,6 +98,12 @@ func NewRetroactiveProcessor(store PluginStore, p Plugin, flagBit uint16) *Retro
 		flagBit:  flagBit,
 		notifyCh: make(chan struct{}, 1),
 	}
+}
+
+// SetEmbedHealth attaches the process-wide embed-health tracker so store-time
+// refusals of unusable vectors are visible on the health surfaces.
+func (rp *RetroactiveProcessor) SetEmbedHealth(h *EmbedHealth) {
+	rp.health = h
 }
 
 // Notify wakes the processor to run a scan immediately, without waiting for
@@ -456,6 +463,10 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 	microTexts := make([]string, 0, microBatchSize)
 	microVaults := make([][8]byte, 0, microBatchSize)
 	passInvalidated := false
+	// providerDown: a micro-batch found the provider down (error, no vectors,
+	// or all-zero vectors). The pass stops without self-notifying, so the
+	// idle ticker backs off instead of re-scanning the same pending block.
+	providerDown := false
 
 	// storeEmbedded persists one successfully-embedded engram's vector. Split
 	// out of flushMicroBatch so it can be driven by embedBisect's per-engram
@@ -464,6 +475,21 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 	// that yielded it — passed through rather than re-derived (see
 	// PluginStore.UpdateEmbedding's doc for why).
 	storeEmbedded := func(eng *Engram, ws [8]byte, vec []float32) {
+		// Never persist an all-zero vector as if it were a real embedding
+		// (G4). A normalized embedder cannot produce one for real text, so it
+		// means the provider answered without embedding anything. Stored, it
+		// would be flagged DigestEmbed and never retried, while scoring 0
+		// against every query. Left pending instead, it embeds normally once
+		// the provider recovers; the refusal is counted on EmbedHealth.
+		if IsZeroVector(vec) {
+			slog.Warn("retroactive processor: provider returned an all-zero vector, refusing to store it — engram left pending",
+				"plugin", rp.plugin.Name(), "engram_id", eng.ID.String(), "dim", len(vec))
+			rp.statsMu.Lock()
+			rp.stats.Errors++
+			rp.statsMu.Unlock()
+			rp.health.RecordZeroVectorRefused()
+			return
+		}
 		if storeErr := rp.store.UpdateEmbedding(ctx, ws, eng.ID, vec); storeErr != nil {
 			var dimErr *hnswpkg.DimMismatchError
 			if errors.As(storeErr, &dimErr) {
@@ -610,7 +636,9 @@ func (rp *RetroactiveProcessor) processBatch(ctx context.Context) bool {
 		// and never stamped — the two fixes compose: the fence decides WHICH
 		// engrams are still real, the bisect decides which of those are actually
 		// bad content.
-		rp.embedBisect(ctx, embedPlugin, microEngrams, microTexts, microVaults, storeEmbedded, markBadContent)
+		if rp.embedBisect(ctx, embedPlugin, microEngrams, microTexts, microVaults, storeEmbedded, markBadContent) {
+			providerDown = true
+		}
 		microEngrams = microEngrams[:0]
 		microTexts = microTexts[:0]
 		microVaults = microVaults[:0]
@@ -666,7 +694,9 @@ engramLoop:
 		// Cap per-pass work to bound iterator lifetime during bulk imports.
 		if batchCount >= maxBatchSize {
 			flushMicroBatch()
-			rp.Notify()
+			if !providerDown {
+				rp.Notify()
+			}
 			break
 		}
 
@@ -704,6 +734,9 @@ engramLoop:
 			batchCount++
 			if len(microEngrams) >= microBatchSize {
 				flushMicroBatch()
+				if providerDown {
+					break
+				}
 				if passInvalidated {
 					// No self-notify: the clear that invalidated this pass owns
 					// the wake-up (its finish closure and cancellation arm both
@@ -910,9 +943,9 @@ func (rp *RetroactiveProcessor) embedBisect(
 	wsList [][8]byte,
 	onSuccess func(eng *Engram, ws [8]byte, vec []float32),
 	onBadContent func(eng *Engram, err error),
-) {
+) (providerDown bool) {
 	if len(engrams) == 0 {
-		return
+		return false
 	}
 
 	vecs, err := embedPlugin.Embed(ctx, texts)
@@ -924,38 +957,78 @@ func (rp *RetroactiveProcessor) embedBisect(
 			// pending rather than guess which engrams are actually bad.
 			slog.Warn("retroactive processor: embed call succeeded but returned no vectors, leaving batch pending",
 				"plugin", rp.plugin.Name(), "batch_size", len(engrams))
-			return
+			return true
+		}
+		zero := 0
+		for i := range engrams {
+			if IsZeroVector(vecs[i*dim : (i+1)*dim]) {
+				zero++
+			}
+		}
+		if zero == len(engrams) && !rp.providerEmbedsProbe(ctx, embedPlugin) {
+			// Every vector is zero AND a known probe text also comes back
+			// zero (or fails): the provider is answering without embedding
+			// anything (G4). Same class as an outage: leave the batch pending
+			// and stop the pass so the processor backs off instead of
+			// re-scanning a cap-sized block of refusals in a hot loop.
+			slog.Warn("retroactive processor: embed provider returned all-zero vectors (probe too), treating it as down and leaving batch pending",
+				"plugin", rp.plugin.Name(), "batch_size", len(engrams))
+			for range engrams {
+				rp.health.RecordZeroVectorRefused()
+			}
+			return true
 		}
 		for i, eng := range engrams {
-			onSuccess(eng, wsList[i], vecs[i*dim:(i+1)*dim])
+			v := vecs[i*dim : (i+1)*dim]
+			if zero > 0 && IsZeroVector(v) {
+				// The provider embeds other text fine, so this zero vector is
+				// about this engram's content: never store it as a real
+				// embedding (it would be flagged and score 0 against every
+				// query forever). Latch it like any other content-specific
+				// embed failure so it neither loops nor blocks the queue.
+				rp.health.RecordZeroVectorRefused()
+				onBadContent(eng, ErrZeroVector)
+				continue
+			}
+			onSuccess(eng, wsList[i], v)
 		}
-		return
+		return false
 	}
 
 	if isEmbedderDownError(err) {
 		slog.Warn("retroactive processor: embed provider looks down, leaving batch pending for retry",
 			"plugin", rp.plugin.Name(), "batch_size", len(engrams), "error", err)
-		return
+		return true
 	}
 
 	if len(engrams) <= embedBisectFloor {
 		if isContentSpecificEmbedError(err) {
 			onBadContent(engrams[0], err)
-			return
+			return false
 		}
 		// Ambiguous failure on a single engram: still not positively
 		// attributable to its content, so err on the side of NOT stranding it
 		// permanently. Left pending, it retries next pass.
 		slog.Warn("retroactive processor: embed failed for a single engram with an unclassified error, leaving pending rather than guessing",
 			"plugin", rp.plugin.Name(), "engram_id", engrams[0].ID.String(), "error", err)
-		return
+		return false
 	}
 
 	slog.Debug("retroactive processor: embed batch failed, bisecting to isolate cause",
 		"plugin", rp.plugin.Name(), "batch_size", len(engrams), "error", err)
 	mid := len(engrams) / 2
-	rp.embedBisect(ctx, embedPlugin, engrams[:mid], texts[:mid], wsList[:mid], onSuccess, onBadContent)
-	rp.embedBisect(ctx, embedPlugin, engrams[mid:], texts[mid:], wsList[mid:], onSuccess, onBadContent)
+	downLeft := rp.embedBisect(ctx, embedPlugin, engrams[:mid], texts[:mid], wsList[:mid], onSuccess, onBadContent)
+	downRight := rp.embedBisect(ctx, embedPlugin, engrams[mid:], texts[mid:], wsList[mid:], onSuccess, onBadContent)
+	return downLeft || downRight
+}
+
+// providerEmbedsProbe reports whether the provider returns a usable (non-zero)
+// vector for a fixed probe text. Used only after a batch came back entirely
+// zero, to tell "this content embeds to zero" from "the provider embeds
+// nothing".
+func (rp *RetroactiveProcessor) providerEmbedsProbe(ctx context.Context, embedPlugin EmbedPlugin) bool {
+	v, err := embedPlugin.Embed(ctx, []string{"embed health probe"})
+	return err == nil && len(v) > 0 && !IsZeroVector(v)
 }
 
 // isContentSpecificEmbedError reports whether err is unambiguously about the
@@ -978,6 +1051,11 @@ func (rp *RetroactiveProcessor) embedBisect(
 // every engram in the vault: strictly worse than the wholesale-blacklisting
 // bug this bisection was built to fix. See isEmbedderDownError, which routes
 // 404 there instead.
+// IsContentSpecificEmbedError is the exported form of
+// isContentSpecificEmbedError, for callers outside this package that must not
+// mistake a per-request content rejection for a backend outage (EmbedHealth).
+func IsContentSpecificEmbedError(err error) bool { return isContentSpecificEmbedError(err) }
+
 func isContentSpecificEmbedError(err error) bool {
 	var provErr *ProviderError
 	if !errors.As(err, &provErr) || provErr.Retryable {

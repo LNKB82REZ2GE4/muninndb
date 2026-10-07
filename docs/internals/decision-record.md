@@ -1387,3 +1387,63 @@ coalescer's latest-value-wins ordering among concurrent writers' submits.
 
 **Principle: a lazily-initialised aggregate and the delta applied to it must be ordered
 against the same commit. If the seed can observe the write, the delta must not also apply it.**
+
+### "Loud" has to reach a reader: the BM25 fall-back was flagged and still invisible (G4, 2026-10-07)
+
+**The decision.** #578's degradation doctrine (embedder down → BM25-only recall, WARN, keep
+serving) stands unchanged. What changed is who can see it. The engine now keeps one
+process-wide embed-health record, fed by every `EmbedService.Embed` outcome (recall-time
+query embeds, the background retroactive embedder, and an idle probe every 20s), and serves
+it as `embed_backend` on `GET /api/health`, `GET /api/admin/embed/status` and `muninn_status`
+(which also stops reporting a hard-coded `health: "good"`). A state transition into
+`degraded` logs one ERROR line. A requested provider that fails at startup is `disabled`, not
+"no embedder configured".
+
+**Why it was needed, measured on an isolated instance.** With the embedder unreachable or
+answering 401, every recall carried `semantic_degraded: true` and the server logged a WARN
+per call — the doctrine was working as designed. A client that renders the flag still showed
+nothing: `ActivateMulti` built a fresh response and dropped `SemanticDegraded`, and the
+multi-vault path is the one a project-scoped recall client uses. The same failing-embedder
+recall that showed the flag single-vault returned an unannotated list multi-vault. Separately,
+nothing in `/api/health` or `muninn_status` changed during an outage; the plugin registry kept
+reporting the embedder healthy, because the plugin health checker that would update it is
+never started; and an embedder rejected at startup by a bad key was reported as "No embedder
+configured", sending the operator to configure something that was already configured.
+
+**What a write during an outage stores (checked, not assumed).** Nothing wrong. The write path
+embeds nothing itself (only a client-supplied vector is stored inline); the retroactive
+embedder classifies connection-refused, 401/403/404 and 5xx as provider-down and leaves the
+batch unflagged, so the engram is retried and embedded on recovery (observed: 1/1 after a
+startup-noop window, 1/1 after a runtime outage). A provider that *succeeds* with an all-zero
+vector was the one hole: the retroactive path would have stored it and set `DigestEmbed`, so
+it was never retried and scored 0 against every query. Now: if a whole batch comes back zero
+and a probe text does too, the provider is treated as down (batch left pending, pass stopped
+without self-notify so the processor backs off); if the provider embeds other text fine, the
+zero is about that engram's content and it is latched like any content-specific failure. The
+first version of this guard left every zero-vector engram pending; adversarial review showed
+that a cap-sized block of them at the head of the scan, plus the cap's self-`Notify`, made a
+hot loop (~3,500 provider calls in 2s) that starved every engram behind it. Refusals are
+counted (`zero_vectors_refused`). Refusing zero vectors at the transport (a client-supplied
+embedding) was not added: that is the caller's explicit input and out of this change's scope.
+
+**Measured alert latency** (isolated instance, poller at 15s, no recall traffic during the
+outage): embedder killed → alert 22s; embedder answering 401 at runtime → 32s; wrong key at
+startup → alert 13s after launch. Worst case by construction ≈ probe interval (20s) + probe
+timeout (15s, only for a hung backend) + poll interval (15s) ≈ 50s.
+
+**Also closed: #582 for env-configured providers.** A provider requested only through an env
+var that failed at startup was still silently replaced by the bundled local model when that
+was available — then, with this change's first version, reported `ok`. The bundled fallback
+now applies only when no provider was requested at all.
+
+**Residuals, named.** (1) A provider that fails at startup stays `disabled` for the life of the
+process; fixing the key needs a restart (the state says so). (2) A 400/413/422 content
+rejection is not counted as a backend failure, so a backend rejecting *everything* as
+content-specific would read `ok` (recall still flags `semantic_degraded`). (3) gRPC still does not map
+`SemanticDegraded` (pre-existing deferral). (4) `degraded_recalls` counts per-vault
+activations, so one multi-vault recall counts once per vault. (5) Multi-vault responses still
+drop the per-vault `abstained`/`conflict` blocks; only the degradation flag is propagated.
+
+**Principle: a degradation signal is only loud if every path a reader actually uses carries it.
+Flagging the response is not enough when the response a client sees is rebuilt elsewhere —
+trace the flag to the rendered output, and give operators a pollable state, not a log line.**

@@ -105,6 +105,12 @@ func (e *Engine) ActivateMulti(ctx context.Context, reqs []*mbp.ActivateRequest,
 
 	runs := make([]vaultRun, len(reqs))
 	var totalFound int
+	// semanticDegraded is the OR over every per-vault run (G4): the vaults of
+	// one recall share one embedder, and a merged response that drops the
+	// flag reports BM25-only results as if they were semantically ranked —
+	// the multi-vault path is what project-scoped hook recall uses, so this
+	// was the only recall agents saw.
+	var semanticDegraded bool
 	for i, req := range reqs {
 		callReq := *req
 		callReq.BFSBudget = perVaultBudget
@@ -123,15 +129,17 @@ func (e *Engine) ActivateMulti(ctx context.Context, reqs []*mbp.ActivateRequest,
 		}
 		runs[i] = vaultRun{vault: req.Vault, resp: resp}
 		totalFound += resp.TotalFound
+		semanticDegraded = semanticDegraded || resp.SemanticDegraded
 	}
 
 	merged := mergeRRF(runs, weights, limit, rrfK)
 
 	resp := &mbp.ActivateResponse{
-		QueryID:        e.fastQueryID(),
-		TotalFound:     totalFound,
-		Activations:    merged,
-		DegradedVaults: degradedVaults,
+		QueryID:          e.fastQueryID(),
+		TotalFound:       totalFound,
+		Activations:      merged,
+		DegradedVaults:   degradedVaults,
+		SemanticDegraded: semanticDegraded,
 	}
 
 	// Recompute the brief over the merged set, reusing the top-weighted

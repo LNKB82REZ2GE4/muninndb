@@ -25,7 +25,7 @@ var appendAdditive = map[string]bool{
 // data-mutation path (workers, plugins, the store handle, lifecycle).
 var appendInfra = map[string]bool{
 	"ClearCognitiveWorkers": true, "SetCognitiveWorkers": true, "SetCoordinator": true,
-	"SetEnrichPlugin": true, "SetLatencyTracker": true, "SetOnWrite": true,
+	"SetEnrichPlugin": true, "SetEmbedHealth": true, "SetLatencyTracker": true, "SetOnWrite": true,
 	"SetReplayEnrichTimeout": true, "SetRetroactiveProcessors": true, "SetTransitionWorker": true,
 	// SetReplicaProbe installs the cluster-role probe the COG-29 debt scan
 	// cache consults; server wiring only, no credential-reachable path, no
@@ -56,7 +56,7 @@ var appendInfra = map[string]bool{
 // appendReadOnly: read/query methods, safe for append.
 var appendReadOnly = map[string]bool{
 	"Activate": true, "ActivateMulti": true, "ActivateWithStructuredFilter": true, "ActivityCounts": true,
-	"CheckIdempotency": true, "CountChildren": true, "CountEmbedded": true, "CountEmbeddableTotal": true, "EmbedStats": true,
+	"CheckIdempotency": true, "CountChildren": true, "CountEmbedded": true, "CountEmbeddableTotal": true, "EmbedStats": true, "EmbedHealth": true,
 	"Explain": true, "ExportGraph": true, "ExportVault": true, "FindByEntity": true,
 	"FindSimilarEntities": true, "GetAnnotations": true, "GetAssociations": true,
 	"GetAssociationsBatch": true, "GetContradictions": true, "GetContradictionReport": true,

@@ -1181,7 +1181,7 @@ func TestRetroactiveProcessor_EmbedBatchBisectsOnlyStampsBadContent(t *testing.T
 					return nil, &ProviderError{Provider: "openai", StatusCode: http.StatusBadRequest, Retryable: false}
 				}
 			}
-			return make([]float32, len(texts)*3), nil
+			return nonZeroVecs(len(texts), 3), nil
 		},
 	}
 

@@ -378,11 +378,28 @@ export interface GuideResponse {
 // Health
 // ---------------------------------------------------------------------------
 
+export interface EmbedHealth {
+  /** ok | degraded | disabled | unknown | unconfigured. degraded/disabled = recall is keyword-only. */
+  state: string;
+  provider?: string;
+  reason?: string;
+  degraded_since?: string;
+  consecutive_failures: number;
+  total_failures: number;
+  last_ok?: string;
+  last_failure?: string;
+  last_error?: string;
+  degraded_recalls: number;
+  zero_vectors_refused: number;
+}
+
 export interface HealthResponse {
   status: string;
   version: string;
   uptime_seconds: number;
   db_writable: boolean;
+  /** Present on servers that track embed backend health. */
+  embed_backend?: EmbedHealth;
 }
 
 // ---------------------------------------------------------------------------
