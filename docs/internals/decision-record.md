@@ -1553,3 +1553,54 @@ client built on MCP recall would not.)
 
 **Principle: a presentation cut is acceptable; an unmarked one is a silently-wrong answer.
 Bound the default, say exactly what was withheld and how to get it, and offer the opt-in.**
+
+### An adversary pass on the hindsight integration: two new defects, three old ones, all closed RED-first (2026-10-07)
+
+A REFUTE pass over the integrated G2/G4/G9/G11 branch reproduced five defects. Two were new on
+the branch and three were older: each of those three reproduced unchanged on an export of
+the pre-branch tree. Each one now has a regression test that failed before its fix.
+
+- **F1 (G11): the preview marker could not be followed on a multi-vault recall.** The marker
+  said `muninn_read <id>`, but `muninn_read` resolves an id in the caller's default vault and
+  the row named no vault, so every long row from another vault led to "engram not found".
+  The hook recall is multi-vault, so this was ordinary use. Multi-vault rows now carry `vault`
+  and the marker reads `muninn_read <id> vault=<name>`. Single-vault output is unchanged.
+- **F2 (G2): a hard forget racing an enrichment digest left key-point postings.** Forget(hard)
+  de-indexed an unlocked pre-read. A digest (or a retag, which was the older half of this
+  defect) that held the stripe lock between that read and the delete had already indexed
+  terms the cleanup never saw: 26/200 forced races. The code comment claiming Forget closed
+  the race was true only for soft forget. `storage.DeleteEngramReturning` now hands back the
+  record read under the stripe lock, and Forget plus both PruneVault arms de-index that. The
+  regression test is deterministic: a nil-by-default seam lands the rewrite inside the old
+  window.
+- **P1: two concurrent hard deletes of one engram decremented the counter twice.**
+  `DeleteEngram` evicted L1 after releasing the stripe lock, so the second deleter read the
+  stale cached record and took the full-delete path. It now evicts under the lock, both
+  before its read and before unlocking.
+- **P2: ClearVault panicked while any other vault was being written.** The provenance worker
+  counted in-flight appends in one process-wide `sync.WaitGroup`. ClearVault called Wait on it
+  while writers elsewhere called Add(1) from zero, and the WaitGroup contract forbids that:
+  it panicked within 0–27 clears. In-flight appends are now counted per vault, and ClearVault
+  drains only its own vault, so a busy vault can no longer starve an unrelated clear either.
+- **P3: writes racing a same-vault ClearVault left the counter drifted.** This had two
+  causes, and fixing either one alone still drifted. (1) `getOrInitCounter`'s Load-hit fast
+  path returned a counter that another goroutine was still seeding. (2) Writes interleaved
+  with the clear. Every caller now passes through `once.Do`, and a per-vault RWMutex
+  (`vaultClearGate`) excludes counter-mutating writes for the whole clear. Before the fix the
+  test drifted from round 0 (counter 25 over 0 keys). After it: 0/600 rounds. With the gate
+  but without the seed fix: 26/300.
+
+**Considered and rejected for P3: refusing writes to a vault being cleared.** That would turn
+a race into a client-visible error, and waiting costs the writer one clear's latency. The
+gate's cost is one uncontended `RLock` per write.
+
+**Residual (STO-6a).** `CloneVault`, `MergeVaultData` and import still call `Store` on the
+counter outside the gate. Also, a counter-coalescer flush that is still in flight at the
+instant of ClearVault's post-tombstone re-delete can persist one pre-clear count. A restart
+seeds from that count until migration v10 or the next recount. Both need a clear to race a
+rare admin path or a 100 ms flush landing on one Pebble `Set`. Neither was reproduced.
+
+**Principle: a lock that guards a read must also guard whatever the read decides.** P1
+(evict after unlock), F2 (de-index from an unlocked read) and P3 (seed visible before it is
+complete) are the same defect three times: the decision and the state it was based on were
+not held together.
