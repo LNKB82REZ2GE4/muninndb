@@ -357,15 +357,6 @@ func openAIEmbedLogAttrs(providerURL string) []any {
 	return []any{"model", provCfg.Model, "custom_base_url", provCfg.BaseURL != "https://api.openai.com"}
 }
 
-// buildEmbedder constructs an embedder. Priority (highest → lowest):
-//  1. Environment variables (MUNINN_OLLAMA_URL, MUNINN_OPENAI_KEY (+ optional MUNINN_OPENAI_URL), MUNINN_VOYAGE_KEY, MUNINN_COHERE_KEY, MUNINN_GOOGLE_KEY, MUNINN_JINA_KEY, MUNINN_MISTRAL_KEY)
-//  2. Saved plugin_config.json (cfg parameter)
-//  3. Bundled local ONNX model — enabled by default when the binary was built
-//     with embedded assets. Disable with MUNINN_LOCAL_EMBED=0.
-//  4. Noop
-//
-// Returns both the activation.Embedder (for query embedding) and the underlying
-// plugin.EmbedPlugin (for the RetroactiveProcessor), or nil for the plugin if noop.
 // embedEnvProviderVars are the environment variables that each request a
 // specific embed provider, in buildEmbedder's precedence order.
 var embedEnvProviderVars = []string{
@@ -444,6 +435,15 @@ func embedHealthProbeInterval() time.Duration {
 	return d
 }
 
+// buildEmbedder constructs an embedder. Priority (highest → lowest):
+//  1. Environment variables (MUNINN_OLLAMA_URL, MUNINN_OPENAI_KEY (+ optional MUNINN_OPENAI_URL), MUNINN_VOYAGE_KEY, MUNINN_COHERE_KEY, MUNINN_GOOGLE_KEY, MUNINN_JINA_KEY, MUNINN_MISTRAL_KEY)
+//  2. Saved plugin_config.json (cfg parameter)
+//  3. Bundled local ONNX model — enabled by default when the binary was built
+//     with embedded assets. Disable with MUNINN_LOCAL_EMBED=0.
+//  4. Noop
+//
+// Returns both the activation.Embedder (for query embedding) and the underlying
+// plugin.EmbedPlugin (for the RetroactiveProcessor), or nil for the plugin if noop.
 func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir string) (activation.Embedder, plugin.EmbedPlugin, error) {
 	const (
 		ollamaURL  = "MUNINN_OLLAMA_URL"

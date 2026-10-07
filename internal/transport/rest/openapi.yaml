@@ -481,8 +481,8 @@ components:
             calibration.
             semantic_degraded: the semantic weight was redistributed onto the
             lexical channel and the ceiling shifted. not_scored: the row was
-            injected by a post-pipeline phase (entity-boost spread activation,
-            supersession head promotion) and its aboutness against this query
+            injected by a post-pipeline phase (supersession head promotion;
+            entity boost no longer injects rows) and its aboutness against this query
             was never MEASURED — which is different from measured and low.
         matched_key_point:
           type: string
