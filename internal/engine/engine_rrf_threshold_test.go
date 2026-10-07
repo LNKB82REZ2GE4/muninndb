@@ -175,18 +175,18 @@ func TestActivate_ACTRDefaultThreshold_Unaffected(t *testing.T) {
 // relevance to the query, outrank every genuine content match.
 //
 // The ACT-R leg (reqACTR below) is the positive control proving the fixture
-// really does clear the injection threshold when the skip is absent -- i.e.
-// the RRF leg's empty injection is because of the explicit skip, not because
-// the evidence was too weak to qualify.
+// really does produce a boost when the skip is absent -- i.e. the RRF leg's
+// zero boost is because of the explicit skip, not because the evidence was
+// too weak to qualify.
 //
 // RED CHECK (documented, verified manually — see PR description): removing
 // the
 //
 //	if req.Weights != nil && req.Weights.UseRRFFusion { return results }
 //
-// guard from applyEntityBoost makes the RRF leg of this test fail (it starts
-// injecting the target engram, same as the ACT-R leg) -- i.e. an injected
-// engram outranks/enters alongside genuine content matches under RRF.
+// guard from applyEntityBoost makes the RRF leg of this test fail (the target
+// is boosted, same as the ACT-R leg) -- i.e. a +0.30-scale boost lands on
+// ~0.05-scale rrf finals.
 func TestApplyEntityBoost_SkippedUnderRRFFusion(t *testing.T) {
 	t.Parallel()
 	eng, cleanup := testEnv(t)
@@ -206,27 +206,34 @@ func TestApplyEntityBoost_SkippedUnderRRFFusion(t *testing.T) {
 
 	fullSeed, err := eng.store.GetEngram(ctx, ws, seed)
 	require.NoError(t, err)
-	seedResults := []activation.ScoredEngram{{Engram: fullSeed, Score: 0.8}}
+	fullTarget, err := eng.store.GetEngram(ctx, ws, target)
+	require.NoError(t, err)
+	rows := func() []activation.ScoredEngram {
+		return []activation.ScoredEngram{{Engram: fullSeed, Score: 0.8}, {Engram: fullTarget, Score: 0.01}}
+	}
+	targetBoost := func(rs []activation.ScoredEngram) float64 {
+		for _, r := range rs {
+			if r.Engram.ID == target {
+				return r.Components.EntityBoost
+			}
+		}
+		t.Fatalf("target missing from results")
+		return 0
+	}
 
 	// RRF leg: the skip must fire, leaving results untouched.
 	reqRRF := &activation.ActivateRequest{Threshold: 0.05, Weights: &activation.Weights{UseRRFFusion: true}}
-	boostedRRF := eng.applyEntityBoost(ctx, ws, 100, seedResults, reqRRF)
-	require.Len(t, boostedRRF, 1, "entity boost must be a no-op under rrf fusion -- no injection")
-	require.Equal(t, seed, boostedRRF[0].Engram.ID)
-	require.Zero(t, boostedRRF[0].Components.EntityBoost, "no boost may be applied to the seed under rrf fusion")
+	boostedRRF := eng.applyEntityBoost(ctx, ws, 100, rows(), reqRRF)
+	require.Len(t, boostedRRF, 2)
+	require.Zero(t, targetBoost(boostedRRF), "entity boost must be a no-op under rrf fusion")
+	for _, r := range boostedRRF {
+		require.Zero(t, r.Components.EntityBoost, "no boost may be applied under rrf fusion")
+	}
 
 	// ACT-R (positive) control: identical evidence, no UseRRFFusion -- the
-	// target must be injected, proving the RRF leg's silence above is the
+	// target must be boosted, proving the RRF leg's silence above is the
 	// explicit skip at work, not weak evidence.
 	reqACTR := &activation.ActivateRequest{Threshold: 0.05}
-	boostedACTR := eng.applyEntityBoost(ctx, ws, 100, seedResults, reqACTR)
-	require.Len(t, boostedACTR, 2, "ACT-R control: entity evidence alone should inject the target")
-	found := false
-	for _, r := range boostedACTR {
-		if r.Engram.ID == target {
-			found = true
-			require.Greater(t, r.Components.EntityBoost, 0.0)
-		}
-	}
-	require.True(t, found, "ACT-R control: target must be injected via entity boost")
+	require.Greater(t, targetBoost(eng.applyEntityBoost(ctx, ws, 100, rows(), reqACTR)), 0.0,
+		"ACT-R control: entity evidence must boost the returned target")
 }

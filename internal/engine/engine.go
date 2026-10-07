@@ -2921,7 +2921,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	actReq.ExcludeTags = resolved.ExcludeTags
 
 	// Valid-time gate (COG-19): as_of / include_invalid flow into phase-6
-	// filtering; the final gate below re-applies them to entity-boost injections.
+	// filtering; the final gate below re-applies them to engine-layer injections.
 	actReq.AsOf = req.AsOf
 	actReq.IncludeInvalid = req.IncludeInvalid
 
@@ -3170,18 +3170,14 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	}
 
 	// Entity boost phase: spread activation through shared named entities.
-	// After BFS produces a scored set, any engram sharing a named entity with a
-	// top-N result receives a small boost. This surfaces entity-linked engrams
-	// that have no direct association edge to the query-matching engrams.
-	preBoost := len(result.Activations)
+	// After BFS produces a scored set, a returned row sharing a named entity
+	// with a top-N result receives a small boost, held strictly below that
+	// source result. It re-scores returned rows only — it never adds one,
+	// so TotalFound is unaffected. Known imprecision for the injector below
+	// (scoped follow-up, PR #570 review): an engram that scored above
+	// threshold in the pipeline but was truncated past MaxResults inside Run()
+	// and then re-injected by supersession is counted twice.
 	result.Activations = e.applyEntityBoost(ctx, wsPrefix, vaultSize, result.Activations, actReq)
-	// Injected engrams count as found: on the boost path, total <
-	// len(activations) was the #569 bypass fingerprint. Known imprecision, for
-	// BOTH injectors here and below (scoped follow-up, PR #570 review): an
-	// engram that scored above threshold in the pipeline but was truncated
-	// past MaxResults inside Run() and then re-injected by boost or
-	// supersession is counted twice.
-	result.TotalFound += len(result.Activations) - preBoost
 
 	// Supersedes-aware ranking: promote the current fact over any superseded one
 	// it replaces (injecting it if the query didn't retrieve it), so recall never
@@ -3189,8 +3185,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// truncation so an injected head is not cut. Chains resolve under the
 	// caller's view through the shared visibility gate (hidden nodes are
 	// traversable but unnameable; no admitted successor → the substitution
-	// abstains whole), and admitted injections count as found, same rule as
-	// boost. injectorNow is shared with the final COG-19 cut below so a
+	// abstains whole), and admitted injections count as found. injectorNow is shared with the final COG-19 cut below so a
 	// validity boundary cannot fall between the gate's admission and that cut.
 	injectorNow := time.Now()
 	// One visibility gate and ONE nameable cache shared by both post-pipeline
@@ -3217,13 +3212,13 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	result.TotalFound += supInjected
 
 	// Final valid-time gate (COG-19: default recall never returns an engram whose
-	// ValidUntil <= now). Phase-6 gated scored candidates and both injectors
-	// gate their entrants. For supersession this cut is defense in depth at
-	// the same instant (injectorNow); it remains LOAD-BEARING for two paths:
-	// boost runs on its own earlier clock, so a boost injection (or phase-6
-	// survivor) whose validity boundary falls inside that window is admitted,
-	// counted at line ~2340, then swept here — a documented overcount sliver —
-	// and it backstops any future result-set mutation that forgets the gate.
+	// ValidUntil <= now). Phase-6 gated scored candidates and the injectors
+	// gate their entrants (the entity boost adds none). For supersession
+	// this cut is defense in depth at the same instant (injectorNow); it
+	// remains LOAD-BEARING for two paths: a phase-6 survivor whose validity
+	// boundary falls between phase 6's clock and this one is swept here — a
+	// documented overcount sliver — and it backstops any future result-set
+	// mutation that forgets the gate.
 	// Runs AFTER supersession
 	// on purpose: a manual supersede's now-expired predecessor is dropped only once
 	// its current head has been promoted/injected, so a query matching only the

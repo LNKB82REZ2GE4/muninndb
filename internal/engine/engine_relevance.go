@@ -189,9 +189,10 @@ func applyRelevanceBands(
 			bands[i], bases[i] = activation.RelevanceFilterMatch, activation.BasisTagFilterBypass
 		case row.Admission == activation.AdmissionInjected:
 			// Appended by an engine-layer injector with no phase-6
-			// measurement: entity-boost spread activation
-			// (engine_entity_boost.go pass 2b) or supersession head promotion
-			// (engine_supersession.go phase 2a). Its ScoreComponents are the
+			// measurement: supersession head promotion
+			// (engine_supersession.go phase 2a). (Entity-boost spread
+			// activation injected such rows before its source bound; it now only re-scores
+			// returned rows.) Its ScoreComponents are the
 			// ZERO VALUE — AbsoluteScore 0 means "not measured", which is a
 			// different statement from "measured and low". Banding it "weak"
 			// off a zero it never earned would be inventing a number

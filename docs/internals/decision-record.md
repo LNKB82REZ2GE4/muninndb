@@ -35,6 +35,33 @@ recall via uncapped, threshold-bypassing injection. Fix: rarity-weight the boost
 accumulation, gate on threshold, keep the factor (0.15) below typical BFS weights.
 **Principle: fix the flood with a cap and a gate; don't amputate the feature.**
 
+**Entity boost bounded by its source; injection retired (2026-10).** Measured on a real
+907-fact vault (LLM-extracted facts, free-text entity lists, 2.4 entities/fact, top entity on
+11% of engrams) with 60 paraphrased single-fact questions and blind judges: adding entities
+cost **0.17 MRR** (0.867 → 0.695; 21 questions lost, 2 won; Hit@10 unchanged — the answer was
+still retrieved, just ranked lower). Per-question attribution killed the working hypothesis
+that hub entities flood recall — idf already crushed them (the commonest entity contributed
+0.048). In **20 of 21** losses the answer was a *seed*, overtaken by non-seed rows that gained
+up to +0.30 by sharing **that seed's** entities: seeds are never boosted, so the pass promoted
+a seed's neighbours over the seed that justified them. Only 1 of 21 involved injection. On
+30 off-topic queries, 130 of 169 returned rows were entity-only injections (unscored, banded
+`uncalibrated`/`not_scored`), and for 8 queries they were the entire top 5 — the
+"everything scores 0.3, `entity_boost` 0.3" shape seen in production. Ten variants were
+run paired on the same vault: idf-squared, a df > sqrt(n) cut, requiring two shared
+entities, capping the boost at half the row's content match, seeding only from non-weak
+rows, and no-injection alone each recovered **at most 55%** of the loss (best +0.095);
+**holding each boosted row strictly below its strongest contributing seed** recovered all
+of it (−0.008 vs entity-free, CI [−0.022, +0.004]; +0.164 vs before). Shipped: that source
+bound plus no injection (the bound alone left 58 unscored rows in off-topic top-5s). Honest
+negative recorded alongside: on this question set the boost has **no measurable benefit**
+— disabling it entirely scored 0.867, level with the bounded version. It is kept, bounded,
+per the #569 principle (don't amputate a feature on one corpus; its value case —
+associative recall across entity-linked engrams — is not what single-fact paraphrase
+questions measure). Re-validation on enricher-typed entities is outstanding.
+**Principle: a propagated signal must not outrank its source — bound spread activation by
+the activation that caused it; and a row with no measured aboutness must not fill a
+response.**
+
 **RRF preserves explicit thresholds (#590).** RRF fusion was clobbering a caller's explicit
 threshold; the fix distinguishes "caller set a threshold" from "engine default applied."
 **Principle: an explicit caller value survives internal re-scoring.**
