@@ -1306,8 +1306,17 @@ seed exposed a second dependency: the seed used to persist its scan with a direc
 was harmless only while the scan included the write. Seeded pre-commit, that durable write
 would sit ahead of the write's in-memory increment, and a crash inside the coalescer's 100 ms
 window would leave a short count that no later start rescans — `TestCrashRecoveryPreservesIndexes`
-failed on exactly this. The seed now queues its value on the coalescer, so a crash before any
-flush leaves the key absent and the next start rescans. Existing
+failed on exactly this. An adversarial pass then refuted the first repair, which had queued the
+seed on the coalescer: that queued value won the next flush over `DeleteEngram`'s direct write
+(and a delete straight after writes already lost to its writes' queued count before this
+change). Holding the counter from before the commit also let a delete that straddled a
+`ClearVault` write the evicted, pre-clear count back. `MergeVaultData` turned out to have
+G9 itself, seeding the target after its copy (2 existing + 4 merged reported 10). The final
+shape: the seed persists nothing (until the first mutation the key is simply absent, and a
+restart rescans), and the two direct writers go through `persistCounterNow`, which writes only
+while the counter is still live and replaces any queued coalescer value. Each counter test
+closes and reopens the store before asserting, because an in-memory count can be right while
+the persisted one is wrong. Existing
 drift is corrected by fork migration v10 (`RecountVaultCounters`), a one-shot recount of every
 persisted counter against its vault's 0x01 key count — the same definition the lazy seed uses.
 
@@ -1320,7 +1329,9 @@ that silently skips is indistinguishable from one that ran.
 **Not fixed here.** Replication followers apply raw batches without touching the counter, so a
 follower's counter is whatever its first read seeded and does not track later writes; that is
 a separate defect, untouched by this change. The delete path's not-found fallback deletes the
-0x01 key without decrementing; also unchanged.
+0x01 key without decrementing; also unchanged. Unproven and pre-existing: a coalescer flush
+racing `ClearVault`'s pending-entry delete (its load→set→delete is not atomic), and the
+coalescer's latest-value-wins ordering among concurrent writers' submits.
 
 **Principle: a lazily-initialised aggregate and the delta applied to it must be ordered
 against the same commit. If the seed can observe the write, the delta must not also apply it.**
