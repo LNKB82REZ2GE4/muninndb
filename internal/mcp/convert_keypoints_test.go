@@ -49,7 +49,7 @@ func TestActivationToMemory_MapsMatchedKeyPoint(t *testing.T) {
 func TestActivationToMemory_MatchedKeyPointSurvivesPreviewCut(t *testing.T) {
 	kp := strings.Repeat("The nightly backup job verifies every archive checksum. ", 20)
 	content := strings.Repeat("Unrelated long engram body text that must be cut. ", 40)
-	m := activationToMemoryContent(&mbp.ActivationItem{ID: "x", Content: content, MatchedKeyPoint: kp}, false)
+	m := activationToMemoryContent(&mbp.ActivationItem{ID: "x", Content: content, MatchedKeyPoint: kp}, false, false)
 	if !m.ContentTruncated {
 		t.Fatalf("content of %d chars was not cut; fixture no longer exercises the preview", len(content))
 	}

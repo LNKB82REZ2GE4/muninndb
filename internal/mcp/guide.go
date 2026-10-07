@@ -251,6 +251,7 @@ func generateGuide(vaultName string, resolved auth.ResolvedPlasticity, stats eng
 	b.WriteString("does not pretend otherwise.\n\n")
 	b.WriteString("A recall row's `content` is a PREVIEW when the memory is longer than 500 characters: it ends with a marker like ")
 	b.WriteString("`…[+5,312 chars, muninn_read <id>]` and the row carries `content_truncated: true` and `content_chars` (the full length). ")
+	b.WriteString("On a multi-vault recall each row also carries its `vault`, and the marker names it (`muninn_read <id> vault=<name>`): pass that vault to `muninn_read`. ")
 	b.WriteString("Do not answer from a truncated preview as if it were the whole memory — `muninn_read` the id, or pass `full_content: true` to recall.\n")
 
 	// Valid-time (the two time axes)

@@ -73,7 +73,11 @@ type WriteResult struct {
 }
 
 type Memory struct {
-	ID      string `json:"id"`
+	ID string `json:"id"`
+	// Vault is the row's source vault, set only on a multi-vault
+	// muninn_recall, where the id alone does not say which vault to
+	// muninn_read it from (the preview marker names it too).
+	Vault   string `json:"vault,omitempty"`
 	Concept string `json:"concept"`
 	Content string `json:"content"` // recall: real content (preview unless full_content); read: full content
 	// ContentTruncated / ContentChars are G11's structured twins of the visible

@@ -27,11 +27,12 @@ const previewBoundaryWindow = 80
 // characters. Otherwise it cuts at the last line break, else the last
 // whitespace, within previewBoundaryWindow characters of the bound (else at
 // the bound) and appends a VISIBLE marker naming the hidden length and the
-// call that recovers it: "…[+5,312 chars, muninn_read <id>]". The old bare
+// call that recovers it: "…[+5,312 chars, muninn_read <ref>]", where ref is
+// the id, plus " vault=<name>" on a multi-vault recall row. The old bare
 // "..." left an agent unable to tell a 6 KB page from a 500-char note
 // (principle #2). Returns the shown text, whether it was cut, and the full
 // length in characters.
-func previewContent(content, id string) (string, bool, int) {
+func previewContent(content, ref string) (string, bool, int) {
 	total := utf8.RuneCountInString(content)
 	if total <= contentPreviewLen {
 		return content, false, 0
@@ -62,7 +63,7 @@ func previewContent(content, id string) (string, bool, int) {
 		head = content[:cut]
 	}
 	hidden := total - utf8.RuneCountInString(head)
-	return head + " …[+" + commaInt(hidden) + " chars, muninn_read " + id + "]", true, total
+	return head + " …[+" + commaInt(hidden) + " chars, muninn_read " + ref + "]", true, total
 }
 
 // commaInt renders a non-negative count with thousands separators (5312 →
@@ -116,19 +117,35 @@ func knownLastAccess(ns int64) *time.Time {
 // carries the real engram content (truncated to a preview). The summary is never copied
 // into Content, so the same string is not serialized twice (#502).
 func activationToMemory(item *mbp.ActivationItem) Memory {
-	return activationToMemoryContent(item, false)
+	return activationToMemoryContent(item, false, false)
 }
 
 // activationToMemoryContent is activationToMemory with the G11 opt-in:
 // fullContent=true (muninn_recall's full_content argument) returns the whole
 // engram content; false returns the bounded, visibly-marked preview.
-func activationToMemoryContent(item *mbp.ActivationItem, fullContent bool) Memory {
+//
+// multiVault is true for a muninn_recall over several vaults. Each row then
+// carries its source vault, and the preview marker names it
+// ("muninn_read <id> vault=<name>"): muninn_read resolves an id in ONE vault,
+// the caller's default unless told otherwise, so a bare-id marker on a row from
+// any other vault pointed at "engram not found". A single-vault recall keeps
+// the bare-id marker and no vault field: the id resolves in the vault the
+// caller just recalled from.
+func activationToMemoryContent(item *mbp.ActivationItem, fullContent, multiVault bool) Memory {
 	// Content is the real engram content, as a marked preview unless the caller
 	// opted into full content. The summary stays in its own field; recall never
 	// overwrites Content with Summary.
 	shown, truncated, totalChars := item.Content, false, 0
+	rowVault := ""
+	if multiVault {
+		rowVault = item.Vault
+	}
 	if !fullContent {
-		shown, truncated, totalChars = previewContent(item.Content, item.ID)
+		ref := item.ID
+		if rowVault != "" {
+			ref += " vault=" + rowVault
+		}
+		shown, truncated, totalChars = previewContent(item.Content, ref)
 	}
 	// Supersession annotation is ALWAYS surfaced (no annotate flag) so an agent is
 	// never handed a stale fact without being told the current one — the "was 8 in
@@ -171,6 +188,7 @@ func activationToMemoryContent(item *mbp.ActivationItem, fullContent bool) Memor
 	m := Memory{
 		Annotations:      annotations,
 		ID:               item.ID,
+		Vault:            rowVault,
 		Concept:          item.Concept,
 		Content:          shown,
 		ContentTruncated: truncated,

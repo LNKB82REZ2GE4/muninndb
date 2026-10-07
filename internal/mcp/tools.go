@@ -318,7 +318,7 @@ func allToolDefinitions() []ToolDefinition {
 					},
 					"full_content": map[string]any{
 						"type":        "boolean",
-						"description": "When true, each result's content is the memory's full text. Default false: content longer than 500 characters is a preview cut on a word or line boundary and ends with a marker like \"…[+5,312 chars, muninn_read <id>]\", and the row carries content_truncated=true and content_chars (the full length). Use it when you need long memories (documents, knowledge pages) in full; for one or two long rows, muninn_read on the marked id is cheaper.",
+						"description": "When true, each result's content is the memory's full text. Default false: content longer than 500 characters is a preview cut on a word or line boundary and ends with a marker like \"…[+5,312 chars, muninn_read <id>]\" (on a multi-vault recall \"muninn_read <id> vault=<name>\", and the row carries its vault), and the row carries content_truncated=true and content_chars (the full length). Use it when you need long memories (documents, knowledge pages) in full; for one or two long rows, muninn_read on the marked id is cheaper.",
 					},
 					"caller": map[string]any{
 						"type":        "string",

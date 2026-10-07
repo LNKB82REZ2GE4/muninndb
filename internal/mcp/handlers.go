@@ -722,7 +722,7 @@ func (s *MCPServer) handleRecall(ctx context.Context, w http.ResponseWriter, id 
 
 	var memories []Memory
 	for i := range resp.Activations {
-		memories = append(memories, activationToMemoryContent(&resp.Activations[i], fullContent))
+		memories = append(memories, activationToMemoryContent(&resp.Activations[i], fullContent, isMulti))
 	}
 
 	if annotate {

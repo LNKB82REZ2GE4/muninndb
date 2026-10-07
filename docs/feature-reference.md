@@ -105,6 +105,8 @@ bounded number of tokens: content longer than 500 characters is cut on a line or
 (at most 80 characters early) and ends with a visible marker — `…[+5,312 chars, muninn_read <id>]`
 — and the row carries `content_truncated: true` and `content_chars` (the full length in
 characters). Pass `full_content: true` to get every row's whole text; `muninn_read` fetches one.
+On a multi-vault recall each row also carries its `vault` and the marker names it —
+`muninn_read <id> vault=<name>` — since `muninn_read` otherwise looks in the caller's default vault.
 
 #### Scoring Models
 - **ACT-R** (default, production) — `ContentMatch × softplus(BaseLevel + HebbianScale × HebbianBoost + TransitionBoost)`. Power-law temporal decay based on access count and recency. This is the only production scorer
