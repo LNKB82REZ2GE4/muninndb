@@ -206,9 +206,10 @@ type ScoreComponents struct {
 	HebbianBoost    float64
 	TransitionBoost float64
 	// EntityBoost is the post-pipeline spread-activation adjustment added by
-	// the entity boost phase (rarity-weighted, capped). Zero when the result
-	// received no entity boost; for engrams injected by that phase it equals
-	// the full Score (issue #569).
+	// the entity boost phase (rarity-weighted, capped, held below its source
+	// seed): the boost actually APPLIED to this row's Score. Zero when the
+	// result received no entity boost. That phase never adds rows, so a
+	// non-zero value always sits on a row the pipeline scored.
 	EntityBoost     float64
 	AccessFrequency float64
 	Recency         float64

@@ -29,9 +29,10 @@ import (
 // contract is enforced here at birth rather than injector-by-injector.
 //
 // The gate covers visibility only. Whether an injector's evidence is strong
-// enough to enter at all (entity boost's threshold comparison) and at what
-// rank (supersession's corrective substitution) remain the injector's own
-// semantics.
+// enough to enter at all and at what rank (supersession's corrective
+// substitution) remain the injector's own semantics. (The entity boost was an
+// injector until it was bounded to re-scoring returned rows; it no longer
+// submits candidates here.)
 type visibilityGate struct {
 	req *activation.ActivateRequest
 	now time.Time

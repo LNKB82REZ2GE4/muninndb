@@ -165,9 +165,9 @@ func (e *Engine) applySupersessionWithGate(ctx context.Context, ws [8]byte, resu
 
 	// Existence decisions, cached per chain node: several stales can share a
 	// chain, and the gate's lease check reads the store. A node already in the
-	// result pool cleared its own admission (phase 6, or the entity-boost gate
-	// for boost injections, which runs before this phase) — nameable by
-	// construction, no store read.
+	// result pool cleared its own admission (phase 6 — the entity boost, which
+	// runs before this phase, adds no rows) — nameable by construction, no
+	// store read.
 	nameable := func(eng *storage.Engram) bool {
 		if _, inPool := seen[eng.ID]; inPool {
 			return true

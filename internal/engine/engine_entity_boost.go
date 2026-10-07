@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"math"
 	"sort"
-	"time"
 
 	"github.com/scrypster/muninndb/internal/engine/activation"
 	"github.com/scrypster/muninndb/internal/storage"
@@ -52,6 +51,15 @@ const (
 	// a score, and hub entities are exactly the ones with the largest scan
 	// fan-out.
 	entityBoostNoiseFloor = 0.001
+
+	// entityBoostSourceMargin is how far below its source seed a boosted
+	// neighbour is held (see the source bound in applyEntityBoost). It is a
+	// REPRESENTATION margin, not a tuned weight: it must exceed the coarsest
+	// precision Score is carried at (MCP rounds to 1e-6; float32 on MBP is
+	// finer) so the bound survives the wire as a strict inequality, and stay
+	// below entityBoostNoiseFloor so it never removes a boost worth applying.
+	// Pinned by TestEntityBoost_SourceMarginSurvivesTheWire.
+	entityBoostSourceMargin = 1e-5
 )
 
 // entityIDF returns the inverse-document-frequency weight for an entity:
@@ -82,26 +90,38 @@ func entityIDF(df, n int64) float64 {
 // applyEntityBoost performs a post-BFS spread-activation pass using named
 // entities. It takes the top-N results from the BFS activation, collects
 // every entity linked to those engrams via the 0x20 forward index, then
-// finds all other engrams in the same vault that mention those entities via
+// finds the other engrams in the result set that mention those entities via
 // the 0x23 reverse index.
 //
 // Each distinct shared entity contributes entityBoostFactor × idf(entity)
 // exactly once per target engram (regardless of how many seeds carry it —
 // the evidence is the shared entity, not the seed count), and the total
-// boost per engram is capped at entityBoostCap. Engrams already in the
-// result set have the boost added to their score; engrams outside it are
-// injected only when their accumulated entity evidence alone clears the
-// caller's threshold AND they pass the rest of phase 6's result contract:
-// meta filters, the ExcludeUntrusted trust filter, lease visibility (#548),
-// and the valid-time gate. The pipeline applies all of these in phase 6, so
-// anything appended afterwards must honor the same contract — otherwise a
-// tags_all query returns records without the required tags, an
-// ExcludeUntrusted vault gets flagged-unreliable memory re-injected through
-// any shared rare entity, and a work-queue engram checked out by another
-// agent leaks back into recall (issue #569). Boosted and injected results
-// both carry the boost in Components.EntityBoost so the adjustment is
-// auditable — injected results never appear with an empty component trace
-// (issue #569).
+// boost per engram is capped at entityBoostCap.
+//
+// Two structural bounds, both measured: on a 907-fact vault with
+// free-text entities, adding entities cost 0.17 MRR over 60 paraphrased
+// questions (21 lost, 2 won), and these bounds recover it to within noise of
+// the entity-free baseline while removing every entity-only row from
+// off-topic queries:
+//
+//  1. SOURCE BOUND. A boosted row is held strictly below the strongest seed
+//     that contributed an entity to it (by entityBoostSourceMargin). Seeds are
+//     never boosted themselves, so without this bound the pass promoted a
+//     seed's neighbours OVER the seed that justified them — in 20 of the 21
+//     losses the right answer was that seed. Spread activation cannot exceed
+//     its source. The bound only ever withholds boost: a row is never lowered.
+//
+//  2. NO INJECTION. Only rows the pipeline returned are re-scored; an engram
+//     phase 6 did not return is never appended. An entity-only row has no
+//     measured aboutness for the query (zero content components, banded
+//     "uncalibrated"/"not_scored"), and on off-topic queries such rows were
+//     the entire response — every result at the boost value, burying the
+//     weak genuine match and defeating abstention. This also retires the
+//     side door #569 had to gate (meta filters, trust, lease visibility,
+//     valid time): a row phase 6 admitted already passed that contract.
+//
+// Boosted rows carry the APPLIED boost in Components.EntityBoost (and Final
+// tracks Score) so the adjustment is auditable.
 //
 // Results are re-sorted by score descending.
 //
@@ -157,10 +177,22 @@ func (e *Engine) applyEntityBoost(ctx context.Context, ws [8]byte, vaultSize int
 
 	n := vaultSize
 
+	// Only rows the pipeline returned can be boosted (no injection), so the
+	// reverse-index walk credits nothing outside this set.
+	seenInResults := make(map[storage.ULID]int, len(results))
+	for i, r := range results {
+		seenInResults[r.Engram.ID] = i
+	}
+
 	// Pass 1: accumulate rarity-weighted boosts per target engram.
 	type boostAcc struct {
 		total   float64
 		counted map[string]struct{} // entities already credited to this target
+		// bound is the Score of the strongest seed that contributed to this
+		// target. Seeds are visited in descending score order and each target's
+		// accumulator is created on its first credit, so the first seed to
+		// credit a target is its strongest source.
+		bound float64
 	}
 	boosts := make(map[storage.ULID]*boostAcc)
 	idfCache := make(map[string]float64, 8)
@@ -194,9 +226,12 @@ func (e *Engine) applyEntityBoost(ctx context.Context, ws [8]byte, vaultSize int
 				if _, isSeed := seedIDs[engramID]; isSeed {
 					return nil // seeds keep their BFS scores
 				}
+				if _, inResults := seenInResults[engramID]; !inResults {
+					return nil // never injected — see the doc comment
+				}
 				acc := boosts[engramID]
 				if acc == nil {
-					acc = &boostAcc{counted: make(map[string]struct{}, 2)}
+					acc = &boostAcc{counted: make(map[string]struct{}, 2), bound: seed.Score}
 					boosts[engramID] = acc
 				}
 				if _, done := acc.counted[entityName]; done {
@@ -213,59 +248,32 @@ func (e *Engine) applyEntityBoost(ctx context.Context, ws [8]byte, vaultSize int
 		return results
 	}
 
-	// Pass 2a: boost engrams already in the result set.
-	seenInResults := make(map[storage.ULID]int, len(results))
-	for i, r := range results {
-		seenInResults[r.Engram.ID] = i
-	}
-	for id, acc := range boosts {
-		if idx, found := seenInResults[id]; found {
-			results[idx].Score += acc.total
-			results[idx].Components.EntityBoost = acc.total
-			// Keep the reported Final consistent with the adjusted Score.
-			results[idx].Components.Final = results[idx].Score
-			delete(boosts, id)
-		}
-	}
+	// Copy before mutating: results is the slice activation.Run returned, and
+	// Run's async log-drain goroutine may still be reading that backing array
+	// (the same reason activateCore's validity gate filters into a new slice).
+	// Re-scoring and re-sorting in place is a data race; -race caught it once
+	// this pass started re-scoring rows on the Activate path.
+	results = append([]activation.ScoredEngram(nil), results...)
 
-	// Pass 2b: inject engrams the pipeline did not retrieve, iff their
-	// entity evidence alone clears the caller's threshold AND the visibility
-	// gate admits them. A result below threshold stays below threshold
-	// regardless of how it was found (the threshold comparison is boost
-	// semantics, so it stays here), and an engram phase 6 would have hidden
-	// (filters, trust, lease, validity) must not ride in through the boost
-	// side door — that decision is the gate's, shared with every other
-	// injector. Injection-side only: pass 2a boosts engrams the pipeline
-	// already returned, which cleared the full contract in phase 6 —
-	// re-gating those would be a no-op. Injections are typically few, so the
-	// gate's per-candidate lease read costs less than batching would save.
-	gate := newVisibilityGate(req, time.Now())
+	// Pass 2: boost each credited row, held strictly below its source seed.
 	for id, acc := range boosts {
-		if acc.total < req.Threshold {
-			continue
+		idx := seenInResults[id]
+		room := acc.bound - entityBoostSourceMargin - results[idx].Score
+		applied := math.Min(acc.total, room)
+		if applied <= 0 {
+			continue // no room below the source seed: leave the row untouched
 		}
-		eng, err := e.store.GetEngram(ctx, ws, id)
-		if err != nil || eng == nil {
-			continue
-		}
-		if !gate.Admits(ctx, e.store, ws, eng) {
-			continue
-		}
-		results = append(results, activation.ScoredEngram{
-			Engram: eng,
-			Score:  acc.total,
-			Components: activation.ScoreComponents{
-				EntityBoost: acc.total,
-				Confidence:  float64(eng.Confidence),
-				Final:       acc.total,
-			},
-		})
+		results[idx].Score += applied
+		results[idx].Components.EntityBoost = applied
+		// Keep the reported Final consistent with the adjusted Score.
+		results[idx].Components.Final = results[idx].Score
 	}
 
 	// Deterministic order (#698): SliceStable on Score alone is NOT enough here —
-	// pass 2b appends injections in Go map-iteration order, so tied boost totals
-	// (equal EntityBoost·idf) would survive MaxResults truncation in an arbitrary
-	// subset. Break ties by ULID so the output is independent of map order.
+	// boosted rows can land on equal scores (equal entityBoostFactor·idf, or two
+	// neighbours held at the same source bound), and their relative order would
+	// then depend on the input order. Break ties by ULID so the output is
+	// independent of it.
 	// Mirrors applySupersession's tiebreak (engine_supersession.go).
 	sort.SliceStable(results, func(i, j int) bool {
 		if results[i].Score != results[j].Score {
