@@ -1283,3 +1283,44 @@ the shape; finding an instance of the shape is still per-subsystem work.
 one day is itself the evidence that "a claim that reads the same when false" is a species,
 not an incident — and the falsifier that catches most of a species does not catch all of
 it. State which half a general check reaches before treating it as coverage.**
+
+### A lazy seed must run before the write it would otherwise count (G9 vault counter, 2026-10-07)
+
+**What happened.** The per-vault engram counter (0x15) is seeded lazily: the first time a
+process touches a vault with no persisted count, `getOrInitCounter` scans the vault's 0x01
+keys. All four counter-mutating paths (`WriteEngram`, `WriteEngramBatch`,
+`pebbleStoreBatch.Commit`, `DeleteEngram`) fetched the counter only AFTER their Pebble commit,
+so on a first touch the seed scan already contained the write and the post-commit `Add`
+applied it a second time. A fresh vault whose first write was a batch of 50 reported 100; a
+first single write reported 2; a status read before the first write masked it entirely
+(which is exactly how the pre-existing `TestWriteEngramBatch_VaultCountIncrement` was written,
+so it could never see the bug). The seeded value is persisted and never re-derived, so the
+excess is permanent. On a production data dir, the counter exceeded every engram a small vault
+could account for (listable + archived + soft-deleted) in 45 of 49 vaults, never below, four of
+them by exactly 50; a 904-engram vault loaded with a first batch of 50 reported 954.
+
+**Decision.** Load the counter BEFORE the commit on every path. `sync.Once` makes concurrent
+first-touch callers wait for the seed, so every counter-aware commit lands after the scan and
+is counted exactly once (pinned by a concurrent first-writers test under `-race`). Moving the
+seed exposed a second dependency: the seed used to persist its scan with a direct `Set`, which
+was harmless only while the scan included the write. Seeded pre-commit, that durable write
+would sit ahead of the write's in-memory increment, and a crash inside the coalescer's 100 ms
+window would leave a short count that no later start rescans — `TestCrashRecoveryPreservesIndexes`
+failed on exactly this. The seed now queues its value on the coalescer, so a crash before any
+flush leaves the key absent and the next start rescans. Existing
+drift is corrected by fork migration v10 (`RecountVaultCounters`), a one-shot recount of every
+persisted counter against its vault's 0x01 key count — the same definition the lazy seed uses.
+
+**Why a migration, not a lazy reconcile on status.** A reconcile on read either rescans a
+vault per status call (a 140k-engram vault makes that a real cost on a hot path) or needs a
+"reconciled" marker, which is a migration with extra steps. A migration that fails refuses
+startup and leaves the version unstamped — loud, retried on the next start — while a reconcile
+that silently skips is indistinguishable from one that ran.
+
+**Not fixed here.** Replication followers apply raw batches without touching the counter, so a
+follower's counter is whatever its first read seeded and does not track later writes; that is
+a separate defect, untouched by this change. The delete path's not-found fallback deletes the
+0x01 key without decrementing; also unchanged.
+
+**Principle: a lazily-initialised aggregate and the delta applied to it must be ordered
+against the same commit. If the seed can observe the write, the delta must not also apply it.**
