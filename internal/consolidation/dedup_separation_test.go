@@ -155,18 +155,20 @@ func TestDivergesOnLoadBearingToken(t *testing.T) {
 		// deliberate change to these expectations, not a silent one.
 		{"BLIND: same number different currency", eng("price", "It costs $99"),
 			eng("price", "It costs 99 euros"), false},
-		{"BLIND: entity swap", eng("office", "The office is in Boston"),
-			eng("office", "The office is in NYC"), false},
+		// Formerly a blind spot; the identity guard (dedup_identity.go) now
+		// keeps a capitalized entity swap apart.
+		{"entity swap", eng("office", "The office is in Boston"),
+			eng("office", "The office is in NYC"), true},
 		{"BLIND: spelled-out numbers", eng("runway", "Runway is eight months"),
 			eng("runway", "Runway is nine months"), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := divergesOnLoadBearingToken(tc.a, tc.b); got != tc.wantDiverge {
+			if got := divergesOnLoadBearingToken(tc.a, tc.b, nil); got != tc.wantDiverge {
 				t.Errorf("diverge(%q | %q) = %v, want %v", tc.a.Content, tc.b.Content, got, tc.wantDiverge)
 			}
 			// Symmetry: the guard must not depend on argument order.
-			if got := divergesOnLoadBearingToken(tc.b, tc.a); got != tc.wantDiverge {
+			if got := divergesOnLoadBearingToken(tc.b, tc.a, nil); got != tc.wantDiverge {
 				t.Errorf("diverge is asymmetric for %q | %q", tc.a.Content, tc.b.Content)
 			}
 		})
