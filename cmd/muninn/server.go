@@ -713,9 +713,11 @@ func buildEmbedder(ctx context.Context, cfg plugincfg.PluginConfig, dataDir stri
 	// 3. Bundled local ONNX model — on by default when embedded at build time.
 	// Skip if the user explicitly opts out (MUNINN_LOCAL_EMBED=0), chose "none"
 	// as their provider, or explicitly configured a different provider that
-	// failed to initialize above (explicitExternalProvider) — substituting a
-	// different embedding model for one the user configured is never safe.
-	if !explicitExternalProvider && cfg.EmbedProvider != "none" && os.Getenv(localEmbed) != "0" && embedpkg.LocalAvailable() {
+	// failed to initialize above, whether in saved config
+	// (explicitExternalProvider) or via an env var (G4: the env case used to be
+	// substituted silently, then reported healthy) — substituting a different
+	// embedding model for one the user configured is never safe.
+	if !explicitExternalProvider && envEmbedProviderRequested() == "" && cfg.EmbedProvider != "none" && os.Getenv(localEmbed) != "0" && embedpkg.LocalAvailable() {
 		slog.Info("initializing bundled local ONNX embedder", "data_dir", dataDir)
 		if svc := tryEmbedService("local://bge-small-en-v1.5", plugin.PluginConfig{DataDir: dataDir}); svc != nil {
 			return embedpkg.NewEmbedServiceAdapter(svc), svc, nil

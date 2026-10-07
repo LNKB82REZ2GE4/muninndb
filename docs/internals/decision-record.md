@@ -1312,21 +1312,30 @@ embedder classifies connection-refused, 401/403/404 and 5xx as provider-down and
 batch unflagged, so the engram is retried and embedded on recovery (observed: 1/1 after a
 startup-noop window, 1/1 after a runtime outage). A provider that *succeeds* with an all-zero
 vector was the one hole: the retroactive path would have stored it and set `DigestEmbed`, so
-it was never retried and scored 0 against every query. That vector is now refused, the engram
-left pending, and the refusal counted (`zero_vectors_refused`). Refusing zero vectors at the
-transport (a client-supplied embedding) was not added: that is the caller's explicit input and
-is out of this change's scope.
+it was never retried and scored 0 against every query. Now: if a whole batch comes back zero
+and a probe text does too, the provider is treated as down (batch left pending, pass stopped
+without self-notify so the processor backs off); if the provider embeds other text fine, the
+zero is about that engram's content and it is latched like any content-specific failure. The
+first version of this guard left every zero-vector engram pending; adversarial review showed
+that a cap-sized block of them at the head of the scan, plus the cap's self-`Notify`, made a
+hot loop (~3,500 provider calls in 2s) that starved every engram behind it. Refusals are
+counted (`zero_vectors_refused`). Refusing zero vectors at the transport (a client-supplied
+embedding) was not added: that is the caller's explicit input and out of this change's scope.
 
 **Measured alert latency** (isolated instance, poller at 15s, no recall traffic during the
 outage): embedder killed → alert 22s; embedder answering 401 at runtime → 32s; wrong key at
 startup → alert 13s after launch. Worst case by construction ≈ probe interval (20s) + probe
 timeout (15s, only for a hung backend) + poll interval (15s) ≈ 50s.
 
+**Also closed: #582 for env-configured providers.** A provider requested only through an env
+var that failed at startup was still silently replaced by the bundled local model when that
+was available — then, with this change's first version, reported `ok`. The bundled fallback
+now applies only when no provider was requested at all.
+
 **Residuals, named.** (1) A provider that fails at startup stays `disabled` for the life of the
-process; fixing the key needs a restart (the state says so). (2) A provider configured only
-through environment variables, with the bundled local model available and not opted out, is
-still substituted by the bundled model when it fails at startup — the #582 class, unfixed here
-because changing startup provider selection is its own increment. (3) gRPC still does not map
+process; fixing the key needs a restart (the state says so). (2) A 400/413/422 content
+rejection is not counted as a backend failure, so a backend rejecting *everything* as
+content-specific would read `ok` (recall still flags `semantic_degraded`). (3) gRPC still does not map
 `SemanticDegraded` (pre-existing deferral). (4) `degraded_recalls` counts per-vault
 activations, so one multi-vault recall counts once per vault. (5) Multi-vault responses still
 drop the per-vault `abstained`/`conflict` blocks; only the degradation flag is propagated.

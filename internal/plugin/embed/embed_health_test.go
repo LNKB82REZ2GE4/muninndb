@@ -72,3 +72,21 @@ func TestEmbedService_RecordsHealth(t *testing.T) {
 		t.Fatalf("after recovery: state %q, want ok", got)
 	}
 }
+
+// TestEmbedService_ContentRejectionIsNotDegradation: a healthy backend that
+// rejects one request's content (413) must not flip embed_backend to
+// degraded (adversarial-review finding D3).
+func TestEmbedService_ContentRejectionIsNotDegradation(t *testing.T) {
+	prov := &switchableProvider{}
+	svc := &EmbedService{provider: prov, dim: 2}
+	svc.batcher = NewBatchEmbedder(prov, nil, &svc.stats)
+	h := plugin.NewEmbedHealth("embed-switchable")
+	svc.SetHealth(h)
+	ctx := context.Background()
+	_, _ = svc.Embed(ctx, []string{"ok"})
+	prov.err = &plugin.ProviderError{Provider: "switchable", StatusCode: 413, Retryable: false}
+	_, _ = svc.Embed(ctx, []string{"oversized"})
+	if s := h.Snapshot(); s.State != plugin.EmbedHealthOK || s.TotalFailures != 0 {
+		t.Fatalf("after a content rejection: %+v, want ok with no failures", s)
+	}
+}

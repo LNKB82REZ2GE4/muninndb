@@ -220,6 +220,10 @@ func (s *EmbedService) Embed(ctx context.Context, texts []string) ([]float32, er
 
 	vec, err := batcher.Embed(ctx, texts)
 	switch {
+	case err != nil && plugin.IsContentSpecificEmbedError(err):
+		// A 400/413/422 rejects this request's content; the backend answered,
+		// so it is not a degradation of recall (the bisect path isolates the
+		// engram). Recording it would flap embed_backend to "degraded".
 	case err != nil:
 		health.RecordFailure(err)
 	case len(texts) > 0 && !plugin.AllBlank(texts) && plugin.IsZeroVector(vec):

@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -117,31 +118,46 @@ func TestRunEmbedHealthProbe_ProbesWhenIdle(t *testing.T) {
 	}
 }
 
-// TestRetroactiveProcessor_RefusesZeroVector pins G4's store-path guard: a
-// provider that "succeeds" with an all-zero vector for an engram must not
-// have that vector persisted and flagged as embedded (it would never be
-// retried and would score 0 against every query). The engram stays pending,
-// the refusal is counted, and its batch-mate with a real vector is stored.
+// zeroForContentEmbedder returns an all-zero vector for any text containing
+// "zero-me" and a real vector otherwise (including the probe text). With
+// allZero set it returns zeros for everything: a provider that embeds nothing.
+type zeroForContentEmbedder struct {
+	embedMockForRetro
+	allZero bool
+	calls   int
+}
+
+func (m *zeroForContentEmbedder) Embed(_ context.Context, texts []string) ([]float32, error) {
+	m.calls++
+	out := make([]float32, 0, 3*len(texts))
+	for _, tx := range texts {
+		if m.allZero || strings.Contains(tx, "zero-me") {
+			out = append(out, 0, 0, 0)
+		} else {
+			out = append(out, 0.6, 0.8, 0)
+		}
+	}
+	return out, nil
+}
+
+func zeroTestEngrams(nZero int) (zeros []*Engram, good *Engram) {
+	for i := 0; i < nZero; i++ {
+		id := ULID{}
+		id[0], id[1] = byte(i>>8), byte(i)
+		zeros = append(zeros, &Engram{ID: id, Concept: "z", Content: "zero-me"})
+	}
+	good = &Engram{ID: ULID{0xff}, Concept: "real", Content: "fine"}
+	return zeros, good
+}
+
+// TestRetroactiveProcessor_RefusesZeroVector pins G4's store-path guard: an
+// all-zero vector is never persisted as a real embedding. When the provider
+// embeds other text fine, the zero is about the engram's content, so it is
+// latched like any content-specific failure; batch-mates still embed.
 func TestRetroactiveProcessor_RefusesZeroVector(t *testing.T) {
-	engrams := []*Engram{
-		{ID: ULID{1}, Concept: "zero", Content: "zero-me"},
-		{ID: ULID{2}, Concept: "real", Content: "fine"},
-	}
-	store := &mockPluginStore{countResult: 2, scanResult: &mockIterator{engrams: engrams}}
-	p := &embedMockForRetro{
-		mockPlugin: mockPlugin{name: "embed-retro", tier: TierEmbed},
-		embedFunc: func(texts []string) ([]float32, error) {
-			out := make([]float32, 0, 3*len(texts))
-			for _, tx := range texts {
-				if tx == "zero-me" || tx == "zero zero-me" {
-					out = append(out, 0, 0, 0)
-				} else {
-					out = append(out, 0.6, 0.8, 0)
-				}
-			}
-			return out, nil
-		},
-	}
+	zeros, good := zeroTestEngrams(1)
+	store := newFlagAwareStore(append(zeros, good)...)
+	p := &zeroForContentEmbedder{embedMockForRetro: embedMockForRetro{mockPlugin: mockPlugin{name: "embed-retro", tier: TierEmbed}}}
 	rp := NewRetroactiveProcessor(store, p, DigestEmbed)
 	h := NewEmbedHealth("embed-retro")
 	rp.SetEmbedHealth(h)
@@ -152,11 +168,65 @@ func TestRetroactiveProcessor_RefusesZeroVector(t *testing.T) {
 	if store.updateEmbedCalls != 1 {
 		t.Fatalf("UpdateEmbedding calls = %d, want 1 (the zero vector must not be persisted)", store.updateEmbedCalls)
 	}
-	if store.setFlagCalls != 1 {
-		t.Fatalf("SetDigestFlag calls = %d, want 1 (the zero-vector engram must stay pending, unflagged)", store.setFlagCalls)
+	if f := store.flags[zeros[0].ID]; f&DigestEmbed != 0 || f&DigestEmbedFailed == 0 {
+		t.Fatalf("zero-vector engram flags = %#x, want DigestEmbedFailed and not DigestEmbed", f)
+	}
+	if f := store.flags[good.ID]; f&DigestEmbed == 0 {
+		t.Fatalf("batch-mate flags = %#x, want DigestEmbed", f)
 	}
 	if got := h.Snapshot().ZeroVectorsRefused; got != 1 {
 		t.Fatalf("ZeroVectorsRefused = %d, want 1", got)
+	}
+}
+
+// TestRetroactiveProcessor_ZeroContentBlockDoesNotLoopOrStarve: a cap-sized
+// block of engrams whose content embeds to zero, sorted ahead of a normal
+// engram, must drain in bounded passes and must not starve the follower
+// (adversarial-review finding: refused-and-pending engrams at the head plus
+// the cap's self-Notify made a hot loop).
+func TestRetroactiveProcessor_ZeroContentBlockDoesNotLoopOrStarve(t *testing.T) {
+	zeros, good := zeroTestEngrams(maxBatchSize + 50)
+	store := newFlagAwareStore(append(zeros, good)...)
+	p := &zeroForContentEmbedder{embedMockForRetro: embedMockForRetro{mockPlugin: mockPlugin{name: "embed-retro", tier: TierEmbed}}}
+	rp := NewRetroactiveProcessor(store, p, DigestEmbed)
+	ctx := context.Background()
+	for pass := 0; pass < 3 && store.flags[good.ID]&DigestEmbed == 0; pass++ {
+		rp.processBatch(ctx)
+	}
+	if store.flags[good.ID]&DigestEmbed == 0 {
+		t.Fatal("engram behind a block of zero-vector engrams was never embedded (starved)")
+	}
+	if n := len(store.pending(DigestEmbed, DigestEmbedFailed)); n != 0 {
+		t.Fatalf("%d engrams still pending after the block drained, want 0", n)
+	}
+}
+
+// TestRetroactiveProcessor_AllZeroProviderStopsPass: a provider that returns
+// zeros for everything (probe included) is treated as down: nothing is
+// stored or latched, the pass stops after one micro-batch, and the processor
+// does not self-notify into a hot loop.
+func TestRetroactiveProcessor_AllZeroProviderStopsPass(t *testing.T) {
+	zeros, good := zeroTestEngrams(maxBatchSize + 50)
+	store := newFlagAwareStore(append(zeros, good)...)
+	p := &zeroForContentEmbedder{allZero: true, embedMockForRetro: embedMockForRetro{mockPlugin: mockPlugin{name: "embed-retro", tier: TierEmbed}}}
+	rp := NewRetroactiveProcessor(store, p, DigestEmbed)
+	h := NewEmbedHealth("embed-retro")
+	rp.SetEmbedHealth(h)
+
+	rp.processBatch(context.Background())
+	if p.calls > 2 {
+		t.Fatalf("provider called %d times in one pass, want <= 2 (one batch + one probe)", p.calls)
+	}
+	select {
+	case <-rp.notifyCh:
+		t.Fatal("processor self-notified after finding the provider down (hot loop)")
+	default:
+	}
+	if len(store.flags) != 0 {
+		t.Fatalf("flags written while the provider embeds nothing: %d engrams, want 0", len(store.flags))
+	}
+	if h.Snapshot().ZeroVectorsRefused == 0 {
+		t.Fatal("refusals not counted")
 	}
 }
 
