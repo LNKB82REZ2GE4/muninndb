@@ -32,7 +32,7 @@ import (
 //     any real vault and stay mergeable. The majority rule is a decision
 //     boundary, not a tuned constant: it asks "does this vault usually
 //     capitalize this word where capitalization is not forced?".
-// Possessives are folded ("Jake's" is "Jake"), and a sentence end is read past
+// Possessives are folded ("Priya's" is "Priya"), and a sentence end is read past
 // closing markup ("**Status:**").
 // Only Content is read: Concept is a short label that two true duplicates often
 // word differently, and a label swap is not a fact swap.
@@ -127,7 +127,7 @@ func identityTokens(s string) []identityToken {
 			raw := strings.TrimFunc(f, func(r rune) bool {
 				return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_'
 			})
-			// A possessive names the same entity: "Jake's" is "Jake".
+			// A possessive names the same entity: "Priya's" is "Priya".
 			raw = strings.TrimSuffix(strings.TrimSuffix(raw, "'s"), "’s")
 			if raw == "" || !hasLetter(raw) {
 				// Bullets, headings, list numbers: position unchanged.

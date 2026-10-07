@@ -62,8 +62,8 @@ func TestDedup_DistinctFactPairsSurviveEndToEnd(t *testing.T) {
 			"The deploy pipeline is owned by Priya, with Marcus as backup", nil, true},
 		{"control: markdown bold label restatement", "**Status:** Merged into develop",
 			"**Status:** Landed in develop", []string{"it merged into develop and landed today"}, true},
-		{"control: possessive restatement", "Config on Jake's laptop runs Arch",
-			"Config on the laptop of Jake runs Arch", nil, true},
+		{"control: possessive restatement", "Config on Priya's laptop runs Arch",
+			"Config on the laptop of Priya runs Arch", nil, true},
 		{"control: name only lowercased on one side", "Restart Muninn after the upgrade lands",
 			"restart muninn after the upgrade lands", nil, true},
 	}
