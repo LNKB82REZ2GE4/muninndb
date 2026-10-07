@@ -3173,8 +3173,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// truncation so an injected head is not cut. Chains resolve under the
 	// caller's view through the shared visibility gate (hidden nodes are
 	// traversable but unnameable; no admitted successor → the substitution
-	// abstains whole), and admitted injections count as found, same rule as
-	// boost. injectorNow is shared with the final COG-19 cut below so a
+	// abstains whole), and admitted injections count as found. injectorNow is shared with the final COG-19 cut below so a
 	// validity boundary cannot fall between the gate's admission and that cut.
 	injectorNow := time.Now()
 	// One visibility gate and ONE nameable cache shared by both post-pipeline

@@ -110,6 +110,12 @@ func entityIDF(df, n int64) float64 {
 //     seed's neighbours OVER the seed that justified them — in 20 of the 21
 //     losses the right answer was that seed. Spread activation cannot exceed
 //     its source. The bound only ever withholds boost: a row is never lowered.
+//     SCOPE: the bound holds on this pass's output. A later phase that
+//     DEMOTES a seed — COG-29 contradiction honesty lowers a seed with a
+//     declared unresolved contradiction — can drop the seed below a
+//     neighbour that was bounded against its pre-demotion score. Not fixed
+//     here (coupling the two phases is its own increment): the neighbour
+//     then ranks on borrowed evidence from a disputed seed.
 //
 //  2. NO INJECTION. Only rows the pipeline returned are re-scored; an engram
 //     phase 6 did not return is never appended. An entity-only row has no
