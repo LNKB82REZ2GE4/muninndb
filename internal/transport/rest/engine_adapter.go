@@ -327,6 +327,11 @@ func (w *RESTEngineWrapper) GetProcessorStats() []plugin.RetroactiveStats {
 	return w.engine.GetProcessorStats()
 }
 
+// EmbedHealth returns the embed backend's health (G4).
+func (w *RESTEngineWrapper) EmbedHealth() plugin.EmbedHealthSnapshot {
+	return w.engine.EmbedHealth()
+}
+
 func (w *RESTEngineWrapper) EmbedStats() plugin.RetroactiveStats {
 	return w.engine.EmbedStats()
 }
@@ -479,7 +484,7 @@ func (w *RESTEngineWrapper) RetryEnrich(ctx context.Context, vault, engramID str
 		return nil, fmt.Errorf("enrich returned nil result")
 	}
 
-	pStore := plugin.NewStoreAdapter(w.engine.Store(), w.hnswReg)
+	pStore := plugin.NewIndexedStoreAdapter(w.engine.Store(), w.hnswReg, w.engine.UpdateDigestIndexed)
 	if err := plugin.PersistEnrichmentResult(ctx, pStore, plugin.ULID(ulid), result); err != nil {
 		return nil, err
 	}

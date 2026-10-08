@@ -20,15 +20,14 @@ import (
 // update or a contradiction — and both are kept (recall's supersedes-aware ranking
 // and contradiction surfacing handle them). Bias: refuse-to-merge over destroy.
 //
-// SCOPE — this guard catches divergence on NUMBERS, DATES, and NEGATION only.
-// Known blind spots (a merge here can still destroy a distinct fact), all documented
-// follow-ups, none of which this increment claims to solve:
-//   - Entity/noun swaps: "office in Boston" vs "…NYC", "we use Postgres" vs "…Mongo".
+// SCOPE — this file catches divergence on NUMBERS, DATES, and explicit NEGATION.
+// dedup_identity.go adds a second stage for capitalized/identifier NAME swaps and
+// MORPHOLOGICAL negation (supported/unsupported, enabled/disabled).
+// Remaining blind spots (a merge here can still destroy a distinct fact):
+//   - Lowercase noun swaps: "we use postgres" vs "we use mongo" (no name shape).
 //   - Same-magnitude currency/unit swaps: "$99" vs "99 euros" (symbols are dropped;
 //     only the number 99 is compared). Adjacent to the headline example, so called out.
 //   - Spelled-out numbers: "eight months" vs "nine months" (words, not digits).
-// Broadening to content-word/entity divergence needs NER or a token-set diff and is a
-// separate increment.
 
 var (
 	// numbers: digit runs with optional thousands separators / decimals, so
@@ -65,8 +64,9 @@ var monthMarkers = map[string]bool{
 // divergesOnLoadBearingToken reports whether two engrams differ in a way that
 // makes them distinct facts despite high embedding similarity: a differing set of
 // numbers, of dates (years/months), or an asymmetric negation. When true, dedup
-// must NOT merge/archive them.
-func divergesOnLoadBearingToken(a, b *storage.Engram) bool {
+// must NOT merge/archive them. It also refuses a name swap or a morphological
+// negation (dedup_identity.go); prof is the vault's case profile and may be nil.
+func divergesOnLoadBearingToken(a, b *storage.Engram, prof *caseProfile) bool {
 	ta := loadBearingText(a)
 	tb := loadBearingText(b)
 
@@ -79,7 +79,10 @@ func divergesOnLoadBearingToken(a, b *storage.Engram) bool {
 	if !equalStringSet(negationSet(ta), negationSet(tb)) {
 		return true
 	}
-	return false
+	if divergesOnPolarity(a, b) {
+		return true
+	}
+	return divergesOnIdentity(a, b, prof)
 }
 
 func loadBearingText(e *storage.Engram) string {

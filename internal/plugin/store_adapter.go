@@ -13,11 +13,26 @@ import (
 type pluginStoreAdapter struct {
 	store *storage.PebbleStore
 	hnsw  *hnswpkg.Registry
+	// digest, when set, replaces store.UpdateDigest so enrichment output also
+	// reaches the FTS key-point postings (G2). Wired to
+	// engine.Engine.UpdateDigestIndexed by the server; nil only in callers that
+	// have no engine (tests), where the raw store write is the whole job.
+	digest DigestWriter
 }
+
+// DigestWriter persists an enrichment digest. engine.Engine.UpdateDigestIndexed
+// is the production implementation.
+type DigestWriter func(ctx context.Context, id storage.ULID, summary string, keyPoints []string, memoryType, typeLabel string) error
 
 // NewStoreAdapter returns a PluginStore backed by the given PebbleStore and HNSW registry.
 func NewStoreAdapter(store *storage.PebbleStore, hnsw *hnswpkg.Registry) PluginStore {
 	return &pluginStoreAdapter{store: store, hnsw: hnsw}
+}
+
+// NewIndexedStoreAdapter is NewStoreAdapter whose UpdateDigest goes through
+// digest, so key points written by the in-process enrich pipeline are indexed.
+func NewIndexedStoreAdapter(store *storage.PebbleStore, hnsw *hnswpkg.Registry, digest DigestWriter) PluginStore {
+	return &pluginStoreAdapter{store: store, hnsw: hnsw, digest: digest}
 }
 
 func (a *pluginStoreAdapter) CountWithoutFlag(ctx context.Context, flag, skipFlags uint16) (int64, error) {
@@ -75,6 +90,9 @@ func (a *pluginStoreAdapter) checkVaultDim(ws [8]byte, dim int) error {
 func (a *pluginStoreAdapter) UpdateDigest(ctx context.Context, id ULID, result *EnrichmentResult) error {
 	if result == nil {
 		return fmt.Errorf("UpdateDigest: nil enrichment result")
+	}
+	if a.digest != nil {
+		return a.digest(ctx, storage.ULID(id), result.Summary, result.KeyPoints, result.MemoryType, result.TypeLabel)
 	}
 	return a.store.UpdateDigest(ctx, storage.ULID(id), result.Summary, result.KeyPoints, result.MemoryType, result.TypeLabel)
 }

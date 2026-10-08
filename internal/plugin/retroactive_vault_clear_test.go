@@ -54,7 +54,7 @@ func (p *blockingVaultClearEmbedder) Embed(_ context.Context, texts []string) ([
 		close(p.firstStarted)
 		<-p.releaseFirst
 	}
-	return make([]float32, len(texts)*4), nil
+	return nonZeroVecs(len(texts), 4), nil
 }
 
 func (p *blockingVaultClearEmbedder) Dimension() int    { return 4 }

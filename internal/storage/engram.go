@@ -3,7 +3,6 @@ package storage
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -513,6 +512,17 @@ func (ps *PebbleStore) StampValidUntil(ctx context.Context, wsPrefix [8]byte, id
 // DeleteEngram performs a hard delete: removes the engram, all association keys,
 // and all secondary indexes. Reads the engram first to gather index data.
 func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id ULID) error {
+	_, err := ps.DeleteEngramReturning(ctx, wsPrefix, id)
+	return err
+}
+
+// DeleteEngramReturning is DeleteEngram, also returning the record it deleted
+// as read UNDER the per-engram stripe lock (nil when the engram was not
+// found, i.e. the key-only fallback ran). A caller that must clean an index
+// living outside the store (FTS) has to use this record, not an unlocked
+// pre-read: an in-place rewrite holding the stripe lock (UpdateDigestIndexed,
+// UpdateTags) may have indexed terms between that pre-read and this delete.
+func (ps *PebbleStore) DeleteEngramReturning(ctx context.Context, wsPrefix [8]byte, id ULID) (*Engram, error) {
 	// Serialize against CompareAndSet on the same engram: hold the per-engram
 	// stripe lock across the read + delete-batch-commit, mirroring what
 	// CompareAndSet does. Otherwise a concurrent CAS can read the engram, this
@@ -523,10 +533,34 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 	//
 	// The lock only needs to span the read and the batch commit: once the batch
 	// is committed the metadata/lease are gone, so a later CAS reads not-found.
-	// Post-commit cleanup (replication, cache, entity counts) is unlocked to
+	// Post-commit cleanup (replication, entity counts) is unlocked to
 	// keep the stripe free during the O(n) entity work.
+	// Load (and on first touch seed) the vault counter BEFORE the delete commits.
+	// A seed scan run after the commit would already exclude this engram, and
+	// the decrement at the end would subtract it a second time (G9's mirror).
+	// Done ahead of the stripe lock so a one-time seed scan never holds it.
+	//
+	// Held against a concurrent ClearVault of this vault through the counter
+	// decrement (vaultClearGate; STO-6a). Gate before stripe lock, always.
+	defer ps.holdVaultsAgainstClear(wsPrefix)()
+	vc := ps.getOrInitCounter(ctx, wsPrefix)
+
 	mu := ps.casLocks.For(id[:])
 	mu.Lock()
+
+	// Evict the L1 entry BEFORE the locked read, so the read below always
+	// reflects Pebble rather than the cache. Two concurrent hard deletes of
+	// the same engram used to double-decrement the vault counter: the first
+	// deleter released the stripe lock before evicting, so the second one's
+	// GetEngram hit the stale L1 entry, took the full-delete path, and
+	// decremented again. An unlocked reader can also repopulate L1 from a
+	// pre-commit Pebble read after the first delete's eviction, so evicting
+	// here (under the lock, immediately before the read) is what makes the
+	// "exists → decrement" decision authoritative. The post-commit eviction
+	// below also moved inside the lock. Pinned by
+	// TestDeleteEngram_ConcurrentHardDeleteDecrementsOnce and
+	// TestDeleteEngram_StaleL1EntryDoesNotDecrementTwice.
+	ps.cache.Delete(wsPrefix, id)
 
 	// Read engram to collect secondary index data for cleanup.
 	eng, err := ps.GetEngram(ctx, wsPrefix, id)
@@ -539,12 +573,12 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 		batch.Delete(keys.LeaseKey(wsPrefix, [16]byte(id)), nil)
 		if err := batch.Commit(pebble.NoSync); err != nil {
 			mu.Unlock()
-			return err
+			return nil, err
 		}
+		ps.cache.Delete(wsPrefix, id)
 		mu.Unlock()
 		ps.replicateBatch(batch)
-		ps.cache.Delete(wsPrefix, id)
-		return nil
+		return nil, nil
 	}
 
 	batch := ps.db.NewBatch()
@@ -797,12 +831,12 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 
 	if err := batch.Commit(pebble.NoSync); err != nil {
 		mu.Unlock()
-		return fmt.Errorf("delete engram: %w", err)
+		return nil, fmt.Errorf("delete engram: %w", err)
 	}
+	// Evict before releasing the stripe lock (see the eviction above the read).
+	ps.cache.Delete(wsPrefix, id)
 	mu.Unlock()
 	ps.replicateBatch(batch)
-
-	ps.cache.Delete(wsPrefix, id)
 	for _, src := range assocCacheDirty {
 		ps.assocCache.Remove(assocCacheKey(wsPrefix, src))
 	}
@@ -843,20 +877,20 @@ func (ps *PebbleStore) DeleteEngram(ctx context.Context, wsPrefix [8]byte, id UL
 	}
 
 	// Decrement vault count synchronously to avoid a race where callers
-	// observe a stale count after DeleteEngram returns.
-	vc := ps.getOrInitCounter(ctx, wsPrefix)
+	// observe a stale count after DeleteEngram returns. vc was loaded before
+	// the commit, above.
 	newCount := vc.count.Add(-1)
 	if newCount < 0 {
 		vc.count.Store(0)
 		newCount = 0
 	}
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, uint64(newCount))
-	if err := ps.db.Set(keys.VaultCountKey(wsPrefix), buf, pebble.Sync); err != nil {
+	// persistCounterNow skips the write if ClearVault evicted vc meanwhile, and
+	// replaces any count a recent write queued on the coalescer.
+	if _, err := ps.persistCounterNow(wsPrefix, vc, newCount, pebble.Sync); err != nil {
 		slog.Warn("storage: failed to persist vault count", "error", err)
 	}
 
-	return nil
+	return eng, nil
 }
 
 // SoftDelete sets state to StateSoftDeleted and updates the record.

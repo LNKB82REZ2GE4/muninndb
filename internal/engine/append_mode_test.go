@@ -25,7 +25,7 @@ var appendAdditive = map[string]bool{
 // data-mutation path (workers, plugins, the store handle, lifecycle).
 var appendInfra = map[string]bool{
 	"ClearCognitiveWorkers": true, "SetCognitiveWorkers": true, "SetCoordinator": true,
-	"SetEnrichPlugin": true, "SetLatencyTracker": true, "SetOnWrite": true,
+	"SetEnrichPlugin": true, "SetEmbedHealth": true, "SetLatencyTracker": true, "SetOnWrite": true,
 	"SetReplayEnrichTimeout": true, "SetRetroactiveProcessors": true, "SetTransitionWorker": true,
 	// SetReplicaProbe installs the cluster-role probe the COG-29 debt scan
 	// cache consults; server wiring only, no credential-reachable path, no
@@ -56,7 +56,7 @@ var appendInfra = map[string]bool{
 // appendReadOnly: read/query methods, safe for append.
 var appendReadOnly = map[string]bool{
 	"Activate": true, "ActivateMulti": true, "ActivateWithStructuredFilter": true, "ActivityCounts": true,
-	"CheckIdempotency": true, "CountChildren": true, "CountEmbedded": true, "CountEmbeddableTotal": true, "EmbedStats": true,
+	"CheckIdempotency": true, "CountChildren": true, "CountEmbedded": true, "CountEmbeddableTotal": true, "EmbedStats": true, "EmbedHealth": true,
 	"Explain": true, "ExportGraph": true, "ExportVault": true, "FindByEntity": true,
 	"FindSimilarEntities": true, "GetAnnotations": true, "GetAssociations": true,
 	"GetAssociationsBatch": true, "GetContradictions": true, "GetContradictionReport": true,
@@ -151,6 +151,7 @@ func guardedOps(eng *Engine, ap context.Context) map[string]func() error {
 		"MergeEntity":          func() error { _, e := eng.MergeEntity(ap, v, "a", "b", false); return e },
 		"ReplayEnrichment":     func() error { _, e := eng.ReplayEnrichment(ap, v, nil, 10, false); return e },
 		"ApplyEnrichment":      func() error { _, e := eng.ApplyEnrichment(ap, v, &EnrichmentApplyRequest{}); return e },
+		"UpdateDigestIndexed":  func() error { return eng.UpdateDigestIndexed(ap, z, "s", []string{"k"}, "", "") },
 		"Evolve":               func() error { _, e := eng.Evolve(ap, v, id, "new", "r", nil, ""); return e },
 		"EvolveAt":             func() error { _, e := eng.EvolveAt(ap, v, id, "new", "r", nil, "", nil, nil, time.Time{}); return e },
 		"Forget":               func() error { _, e := eng.Forget(ap, &mbp.ForgetRequest{Vault: v, ID: id}); return e },

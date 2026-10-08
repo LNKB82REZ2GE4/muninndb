@@ -146,8 +146,8 @@ func (e *Engine) applyVersionHeadSubstitution(
 		// validity is load-bearing here in a way it is not for a lineage
 		// annotation. resolveSupersessionHead already enforced ValidForView on
 		// what it returned; this is the explicit contract statement at the
-		// injection site, matching how the entity-boost and supersession
-		// injectors each state their own gate call.
+		// injection site, matching how the supersession injector states its
+		// own gate call.
 		if !gate.Admits(ctx, e.store, ws, walk.Head) {
 			blocked = append(blocked, substitutionBlock{PredecessorID: sh.Engram.ID, Reason: supersessionBlockHidden})
 			continue

@@ -366,7 +366,14 @@ type ActivationItem struct {
 	// no_content_channel | no_calibration_gate | not_scored.
 	RelevanceBand      string `msgpack:"relevance_band,omitempty"       json:"relevance_band,omitempty"`
 	RelevanceBandBasis string `msgpack:"relevance_band_basis,omitempty" json:"relevance_band_basis,omitempty"`
-	SourceType         string `msgpack:"source_type,omitempty" json:"source_type,omitempty"`
+	// MatchedKeyPoint is the enricher key point (G2) this query matched: the
+	// one covering the largest share of the query's IDF-weighted terms, and at
+	// least half of them. Empty when the engram has no key points or none
+	// covers half the query. A snippet, never a score input: it is chosen after
+	// ranking and changes no score or rank. The full list is on muninn_read /
+	// ReadResponse.KeyPoints.
+	MatchedKeyPoint string `msgpack:"matched_key_point,omitempty" json:"matched_key_point,omitempty"`
+	SourceType      string `msgpack:"source_type,omitempty" json:"source_type,omitempty"`
 	// State is the LifecycleState uint8, so recall can label engram lifecycle state.
 	State uint8 `msgpack:"state,omitempty" json:"state,omitempty"`
 	// Trust is the TrustLevel uint8. omitempty intentional — see ReadResponse.Trust comment.

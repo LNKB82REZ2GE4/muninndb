@@ -48,6 +48,7 @@ type PebbleStore struct {
 	gc            *wal.GroupCommitter
 	noSyncEngrams bool
 	vaultCounters sync.Map // [8]byte -> *vaultCounter
+	vaultGates    sync.Map // [8]byte -> *sync.RWMutex; see vaultClearGate
 	// contradictsGen counts RelContradicts association writes per vault, so the
 	// COG-29 debt readout can cache the expensive declared-edge scan and know
 	// when it is stale. See contradicts_gen.go for why this lives in the store.
@@ -274,13 +275,23 @@ type vaultCounter struct {
 }
 
 // getOrInitCounter returns the vault counter, initializing it from Pebble on first access.
+//
+// EVERY caller passes through once.Do, including the one that finds the
+// counter already in the map. The fast path used to return a Load hit
+// directly, so a caller could receive a counter another goroutine was still
+// seeding: a writer then committed while the seed scan ran (the scan counted
+// it and so did its Add — high) or Added before the seed's Store overwrote it
+// (low). Reachable on every first touch of a vault, and on every reseed after
+// ClearVault. once.Do on a completed Once is a single atomic load. Pinned by
+// TestClearVault_WritesRacingSameVaultClearKeepCounterExact.
 func (ps *PebbleStore) getOrInitCounter(ctx context.Context, wsPrefix [8]byte) *vaultCounter {
+	var loaded *vaultCounter
 	if v, ok := ps.vaultCounters.Load(wsPrefix); ok {
-		return v.(*vaultCounter)
+		loaded = v.(*vaultCounter)
+	} else {
+		actual, _ := ps.vaultCounters.LoadOrStore(wsPrefix, &vaultCounter{})
+		loaded = actual.(*vaultCounter)
 	}
-	vc := &vaultCounter{}
-	actual, _ := ps.vaultCounters.LoadOrStore(wsPrefix, vc)
-	loaded := actual.(*vaultCounter)
 	loaded.once.Do(func() {
 		// Try to read persisted count from Pebble
 		countKey := keys.VaultCountKey(wsPrefix)
@@ -293,12 +304,44 @@ func (ps *PebbleStore) getOrInitCounter(ctx context.Context, wsPrefix [8]byte) *
 		// Fall back to per-vault scan (one-time cost on first startup)
 		n, _ := ps.countEngramsForVault(ctx, wsPrefix)
 		loaded.count.Store(n)
-		// Persist so next startup avoids the scan
-		buf := make([]byte, 8)
-		binary.BigEndian.PutUint64(buf, uint64(n))
-		_ = ps.db.Set(countKey, buf, pebble.NoSync)
+		// The seed deliberately persists NOTHING. Write paths seed BEFORE their
+		// commit (G9), so n excludes the write in flight. A durable Set of n
+		// here would land ahead of that write's increment, and a crash before
+		// the increment reached disk would leave a short count that no later
+		// start rescans; queueing n on the coalescer instead lets that stale
+		// value overwrite a later direct Set (DeleteEngram, MergeVaultData)
+		// at the next flush. The first mutation persists the counter through
+		// its own path; until then the key stays absent and a restart simply
+		// rescans, which is the truth.
 	})
 	return loaded
+}
+
+// persistCounterNow durably writes n as vault ws's count on behalf of a path
+// that cannot wait for the coalescer (DeleteEngram, MergeVaultData). Two rules
+// it exists to enforce:
+//
+//   - n is written only if vc is still the live counter for ws. ClearVault
+//     evicts the counter and point-deletes the key; a mutation that loaded vc
+//     before the clear must not write its pre-clear count back afterwards.
+//   - n is also queued on the coalescer, replacing whatever value a recent
+//     write had queued. Without that, the next flush overwrites this direct Set
+//     with the older queued count (a write of 3 then a delete persisted 3, not 2).
+//
+// Reports whether it wrote.
+func (ps *PebbleStore) persistCounterNow(ws [8]byte, vc *vaultCounter, n int64, opt *pebble.WriteOptions) (bool, error) {
+	if current, ok := ps.vaultCounters.Load(ws); !ok || current.(*vaultCounter) != vc {
+		return false, nil
+	}
+	if ps.counterFlush != nil {
+		ps.counterFlush.Submit(ws, n)
+	}
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, uint64(n))
+	if err := ps.db.Set(keys.VaultCountKey(ws), buf, opt); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // countEngramsForVault scans the 0x01 prefix for a single vault.
@@ -522,6 +565,17 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	if ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
+	// Vault counter: load it, and on a first touch seed it, BEFORE the commit.
+	// The seed scans the vault's 0x01 keys; run after the commit, that scan
+	// already contains this engram and the Add below counts it a second time
+	// (G9: a fresh vault's first write reported 2). Seeded here, the scan
+	// excludes it and the Add is its only count.
+	//
+	// Held against a concurrent ClearVault of this vault from here through the
+	// provenance Submit (vaultClearGate; STO-6a).
+	defer ps.holdVaultsAgainstClear(wsPrefix)()
+	vc := ps.getOrInitCounter(ctx, wsPrefix)
+
 	releaseMark := ps.holdDeclaredContradictionMark(wsPrefix, markedContradiction)
 	commitErr := batch.Commit(syncOption)
 	releaseMark()
@@ -537,8 +591,7 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	// NOTE: Intentionally NOT caching on write to avoid flooding L1 cache.
 
 	// Vault counter: in-memory atomic; coalescer persists every 100ms.
-	// Load-or-init before the Add so we hold a reference to the live counter.
-	vc := ps.getOrInitCounter(ctx, wsPrefix)
+	// vc was loaded (and seeded, on first touch) before the commit above.
 	newCount := vc.count.Add(1)
 	// Only submit if vc is still the current counter for this vault.
 	// ClearVault may have evicted the counter between Add and Submit; in that
@@ -853,6 +906,27 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 	if ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
+	// Seed every touched vault's counter BEFORE the commit (G9) — see the
+	// matching comment in WriteEngram. Seeded after it, the first batch a
+	// fresh vault ever received was counted twice: 50 written, 100 reported.
+	//
+	// Every touched vault is held against a concurrent ClearVault through the
+	// post-commit counter Adds and provenance Submits (vaultClearGate; STO-6a).
+	gated := make([][8]byte, 0, len(items))
+	for i := range items {
+		if errs[i] == nil {
+			gated = append(gated, items[i].WSPrefix)
+		}
+	}
+	if len(gated) > 0 {
+		defer ps.holdVaultsAgainstClear(gated...)()
+	}
+	for i := range items {
+		if errs[i] == nil {
+			ps.getOrInitCounter(ctx, items[i].WSPrefix)
+		}
+	}
+
 	releaseMarks := ps.holdDeclaredContradictionMarks(markedContradictionWS)
 	commitErr := batch.Commit(syncOption)
 	releaseMarks()

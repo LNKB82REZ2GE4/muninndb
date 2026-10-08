@@ -481,9 +481,17 @@ components:
             calibration.
             semantic_degraded: the semantic weight was redistributed onto the
             lexical channel and the ceiling shifted. not_scored: the row was
-            injected by a post-pipeline phase (entity-boost spread activation,
-            supersession head promotion) and its aboutness against this query
+            injected by a post-pipeline phase (supersession head promotion;
+            entity boost no longer injects rows) and its aboutness against this query
             was never MEASURED — which is different from measured and low.
+        matched_key_point:
+          type: string
+          description: >-
+            The enricher key point this query matched: the one covering the
+            largest share of the query's IDF-weighted terms, and at least half
+            of them. Omitted when the engram has no key points or none covers
+            half the query. A snippet only; it changes no score or rank. The
+            full list is `key_points` on the read endpoint.
         score_components:
           $ref: "#/components/schemas/ScoreComponents"
         why:
@@ -840,6 +848,58 @@ components:
           format: int64
         db_writable:
           type: boolean
+        embed_backend:
+          $ref: '#/components/schemas/EmbedHealth'
+          description: >-
+            Whether semantic recall is available. When state is degraded or
+            disabled, recall silently serves keyword-only (BM25) results.
+            last_error is withheld on this unauthenticated endpoint.
+
+    EmbedHealth:
+      type: object
+      description: Embed backend health (G4). Served by /api/health, /api/admin/embed/status and the muninn_status MCP tool.
+      properties:
+        state:
+          type: string
+          enum: [ok, degraded, disabled, unknown, unconfigured]
+          description: >-
+            ok = last embed call returned a usable vector; degraded = last call
+            failed or returned an all-zero vector (recall is BM25-only until one
+            succeeds); disabled = a requested provider failed to initialize at
+            startup (needs a fix and restart); unknown = no call completed yet;
+            unconfigured = no provider requested.
+        provider:
+          type: string
+        reason:
+          type: string
+          description: Why the state is disabled or unconfigured.
+        degraded_since:
+          type: string
+          format: date-time
+          description: First failure of the current run of consecutive failures.
+        consecutive_failures:
+          type: integer
+          format: int64
+        total_failures:
+          type: integer
+          format: int64
+        last_ok:
+          type: string
+          format: date-time
+        last_failure:
+          type: string
+          format: date-time
+        last_error:
+          type: string
+          description: Most recent provider error. Admin endpoint and MCP only.
+        degraded_recalls:
+          type: integer
+          format: int64
+          description: Per-vault activations served without a semantic signal since startup.
+        zero_vectors_refused:
+          type: integer
+          format: int64
+          description: Embeddings the background embedder refused to store because the provider returned an all-zero vector; those engrams stay pending.
 
     ReadyResponse:
       type: object
@@ -1485,6 +1545,8 @@ components:
           description: "Same scope as embedded_count — the two always share scope, so their ratio is a true coverage measure."
         indexing:
           type: boolean
+        backend:
+          $ref: '#/components/schemas/EmbedHealth'
 
     PluginStatusResponse:
       type: object

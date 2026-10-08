@@ -1023,13 +1023,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if ver == "" {
 		ver = "dev"
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(HealthResponse{
+	resp := HealthResponse{
 		Status:        "ok",
 		Version:       ver,
 		UptimeSeconds: int64(time.Since(s.startTime).Seconds()),
 		DBWritable:    s.dbWritable.Load(),
-	})
+	}
+	if r, ok := s.engine.(embedHealthReporter); ok {
+		snap := r.EmbedHealth().Public()
+		resp.EmbedBackend = &snap
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {

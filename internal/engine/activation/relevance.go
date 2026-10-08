@@ -75,8 +75,9 @@ const (
 	// a zero gate can never silently band everything "moderate".
 	BasisNoCalibrationGate = "no_calibration_gate"
 	// BasisNotScored: this row never went through phase-6 scoring — it was
-	// appended by an engine-layer injector (entity-boost spread activation,
-	// supersession head promotion) whose ScoreComponents are the zero value.
+	// appended by an engine-layer injector (supersession head promotion;
+	// entity-boost spread activation before its source bound) whose ScoreComponents are the
+	// zero value.
 	// Its aboutness against this query was not MEASURED, which is a different
 	// statement from "measured and low". See the Admission plumbing below.
 	BasisNotScored = "not_scored"

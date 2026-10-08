@@ -2,13 +2,90 @@ package mcp
 
 import (
 	"math"
+	"strconv"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/scrypster/muninndb/internal/storage"
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 )
 
+// contentPreviewLen bounds a default muninn_recall row's content, in
+// CHARACTERS (runes), not bytes: a byte bound split multi-byte UTF-8 mid-rune
+// and cut non-ASCII content that fit (G11). full_content=true lifts it.
 const contentPreviewLen = 500
+
+// previewBoundaryWindow is how far (in characters) previewContent may back
+// off from the hard bound to end on a line or word boundary. Past it the cut
+// is made at the bound itself, so a preview never shrinks below
+// contentPreviewLen-previewBoundaryWindow characters.
+const previewBoundaryWindow = 80
+
+// previewContent returns content unchanged when it fits contentPreviewLen
+// characters. Otherwise it cuts at the last line break, else the last
+// whitespace, within previewBoundaryWindow characters of the bound (else at
+// the bound) and appends a VISIBLE marker naming the hidden length and the
+// call that recovers it: "…[+5,312 chars, muninn_read <ref>]", where ref is
+// the id, plus " vault=<name>" on a multi-vault recall row. The old bare
+// "..." left an agent unable to tell a 6 KB page from a 500-char note
+// (principle #2). Returns the shown text, whether it was cut, and the full
+// length in characters.
+func previewContent(content, ref string) (string, bool, int) {
+	total := utf8.RuneCountInString(content)
+	if total <= contentPreviewLen {
+		return content, false, 0
+	}
+	// Byte offset of the rune at index contentPreviewLen.
+	cut, n := len(content), 0
+	for i := range content {
+		if n == contentPreviewLen {
+			cut = i
+			break
+		}
+		n++
+	}
+	head := content[:cut]
+	floor := len(head)
+	// Back off at most previewBoundaryWindow runes for the boundary search.
+	for k := 0; k < previewBoundaryWindow && floor > 0; k++ {
+		_, sz := utf8.DecodeLastRuneInString(head[:floor])
+		floor -= sz
+	}
+	if nl := strings.LastIndexByte(head[floor:], '\n'); nl >= 0 {
+		head = head[:floor+nl]
+	} else if sp := strings.LastIndexFunc(head[floor:], unicode.IsSpace); sp >= 0 {
+		head = head[:floor+sp]
+	}
+	head = strings.TrimRightFunc(head, unicode.IsSpace)
+	if head == "" { // pathological: whitespace-only window at the very start
+		head = content[:cut]
+	}
+	hidden := total - utf8.RuneCountInString(head)
+	return head + " …[+" + commaInt(hidden) + " chars, muninn_read " + ref + "]", true, total
+}
+
+// commaInt renders a non-negative count with thousands separators (5312 →
+// "5,312") for the agent-read truncation marker.
+func commaInt(n int) string {
+	s := strconv.Itoa(n)
+	if n < 0 || len(s) <= 3 {
+		return s
+	}
+	var b strings.Builder
+	pre := len(s) % 3
+	if pre > 0 {
+		b.WriteString(s[:pre])
+	}
+	for i := pre; i < len(s); i += 3 {
+		if b.Len() > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(s[i : i+3])
+	}
+	return b.String()
+}
 
 // roundScore widens a float32 score to float64 while stripping float32 quantization
 // noise (e.g. float64(float32(1.15)) = 1.149999976...). Rounding to 6 decimals keeps
@@ -40,11 +117,35 @@ func knownLastAccess(ns int64) *time.Time {
 // carries the real engram content (truncated to a preview). The summary is never copied
 // into Content, so the same string is not serialized twice (#502).
 func activationToMemory(item *mbp.ActivationItem) Memory {
-	// Content is the real engram content, truncated to a preview length. The summary
-	// stays in its own field; recall never overwrites Content with Summary.
-	previewContent := item.Content
-	if len(previewContent) > contentPreviewLen {
-		previewContent = previewContent[:contentPreviewLen] + "..."
+	return activationToMemoryContent(item, false, false)
+}
+
+// activationToMemoryContent is activationToMemory with the G11 opt-in:
+// fullContent=true (muninn_recall's full_content argument) returns the whole
+// engram content; false returns the bounded, visibly-marked preview.
+//
+// multiVault is true for a muninn_recall over several vaults. Each row then
+// carries its source vault, and the preview marker names it
+// ("muninn_read <id> vault=<name>"): muninn_read resolves an id in ONE vault,
+// the caller's default unless told otherwise, so a bare-id marker on a row from
+// any other vault pointed at "engram not found". A single-vault recall keeps
+// the bare-id marker and no vault field: the id resolves in the vault the
+// caller just recalled from.
+func activationToMemoryContent(item *mbp.ActivationItem, fullContent, multiVault bool) Memory {
+	// Content is the real engram content, as a marked preview unless the caller
+	// opted into full content. The summary stays in its own field; recall never
+	// overwrites Content with Summary.
+	shown, truncated, totalChars := item.Content, false, 0
+	rowVault := ""
+	if multiVault {
+		rowVault = item.Vault
+	}
+	if !fullContent {
+		ref := item.ID
+		if rowVault != "" {
+			ref += " vault=" + rowVault
+		}
+		shown, truncated, totalChars = previewContent(item.Content, ref)
 	}
 	// Supersession annotation is ALWAYS surfaced (no annotate flag) so an agent is
 	// never handed a stale fact without being told the current one — the "was 8 in
@@ -85,15 +186,22 @@ func activationToMemory(item *mbp.ActivationItem) Memory {
 		}
 	}
 	m := Memory{
-		Annotations:    annotations,
-		ID:             item.ID,
-		Concept:        item.Concept,
-		Content:        previewContent,
-		Summary:        item.Summary,
-		Score:          roundScore(item.Score),
-		VectorScore:    roundScore(item.ScoreComponents.SemanticSimilarity),
-		VectorScoreRaw: roundScore(item.ScoreComponents.SemanticSimilarityRaw),
-		EntityBoost:    roundScore(item.ScoreComponents.EntityBoost),
+		Annotations:      annotations,
+		ID:               item.ID,
+		Vault:            rowVault,
+		Concept:          item.Concept,
+		Content:          shown,
+		ContentTruncated: truncated,
+		ContentChars:     totalChars,
+		Summary:          item.Summary,
+		// G2: the matched key point. Top-level for the same reason as
+		// relevance_band: nothing allocation-gated can drop it. It is its own
+		// field, so G11's preview cut and marker (inside Content) never touch it.
+		MatchedKeyPoint: item.MatchedKeyPoint,
+		Score:           roundScore(item.Score),
+		VectorScore:     roundScore(item.ScoreComponents.SemanticSimilarity),
+		VectorScoreRaw:  roundScore(item.ScoreComponents.SemanticSimilarityRaw),
+		EntityBoost:     roundScore(item.ScoreComponents.EntityBoost),
 		// #773: the honest, cross-query-comparable quantities. They were
 		// computed on every row and mapped onto MBP/REST, and this function —
 		// the ONLY path from an activation row to an MCP agent — dropped both.
@@ -141,10 +249,13 @@ func activationToMemory(item *mbp.ActivationItem) Memory {
 // Entities and EntityRelationships are included when populated by the engine.
 func readResponseToMemory(r *mbp.ReadResponse) Memory {
 	m := Memory{
-		ID:          r.ID,
-		Concept:     r.Concept,
-		Content:     r.Content, // full content, no truncation
-		Summary:     r.Summary,
+		ID:      r.ID,
+		Concept: r.Concept,
+		Content: r.Content, // full content, no truncation
+		Summary: r.Summary,
+		// G2: the engine's ReadResponse always carried key points (REST
+		// returned them); this mapping dropped them from muninn_read.
+		KeyPoints:   r.KeyPoints,
 		Confidence:  r.Confidence,
 		Tags:        r.Tags,
 		State:       storage.LifecycleState(r.State).String(),

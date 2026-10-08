@@ -12,16 +12,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestEntityBoost_TiedInjectionsDeterministic guards #698 on the entity-boost
-// injection path. Eight target engrams share one rare entity with the seed, so
-// each receives an identical boost (entityBoostFactor × idf) and ties. Before the
-// ULID tie-break, applyEntityBoost appended injections in Go map-iteration order
-// (pass 2b), so repeated calls on the SAME input produced different orderings and
-// an arbitrary subset survived a MaxResults cutoff. This test runs applyEntityBoost
-// 40× on identical input and requires the tied-injection order to be identical every
-// run and equal to ascending-ULID. It is RED without the tie-break at
-// engine_entity_boost.go's final sort.
-func TestEntityBoost_TiedInjectionsDeterministic(t *testing.T) {
+// TestEntityBoost_TiedBoostsDeterministic guards #698 on the entity-boost path.
+// Eight returned rows start at one score and share one rare entity with the
+// seed, so each receives an identical boost (entityBoostFactor × idf) and they
+// tie. The rows are handed in DESCENDING-ULID order, so the output order is
+// ascending-ULID only if the final sort's ULID tie-break runs (a score-only
+// stable sort would keep the input order). Runs 40× on identical input and
+// requires the tied order to be identical every run and ascending-ULID. It is
+// RED without the tie-break at engine_entity_boost.go's final sort.
+func TestEntityBoost_TiedBoostsDeterministic(t *testing.T) {
 	t.Parallel()
 	eng, cleanup := testEnv(t)
 	defer cleanup()
@@ -55,8 +54,21 @@ func TestEntityBoost_TiedInjectionsDeterministic(t *testing.T) {
 		targetSet[id] = struct{}{}
 	}
 
-	initial := []activation.ScoredEngram{{Engram: fullSeed, Score: 0.8}}
+	targetIDs := make([]storage.ULID, 0, nTargets)
+	for id := range targetSet {
+		targetIDs = append(targetIDs, id)
+	}
+	sort.Slice(targetIDs, func(i, j int) bool { return bytes.Compare(targetIDs[i][:], targetIDs[j][:]) > 0 })
 	req := &activation.ActivateRequest{Threshold: 0.05}
+	initialRows := func() []activation.ScoredEngram {
+		rows := []activation.ScoredEngram{{Engram: fullSeed, Score: 0.8}}
+		for _, id := range targetIDs {
+			full, err := eng.store.GetEngram(ctx, ws, id)
+			require.NoError(t, err)
+			rows = append(rows, activation.ScoredEngram{Engram: full, Score: 0.01})
+		}
+		return rows
+	}
 
 	orderOfTargets := func(res []activation.ScoredEngram) ([]storage.ULID, float64) {
 		var ids []storage.ULID
@@ -72,9 +84,9 @@ func TestEntityBoost_TiedInjectionsDeterministic(t *testing.T) {
 
 	var first []storage.ULID
 	for run := 0; run < 40; run++ {
-		res := eng.applyEntityBoost(ctx, ws, 10, initial, req)
+		res := eng.applyEntityBoost(ctx, ws, 10, initialRows(), req)
 		got, tieScore := orderOfTargets(res)
-		require.Len(t, got, nTargets, "run %d: all %d tied targets should be injected", run, nTargets)
+		require.Len(t, got, nTargets, "run %d: all %d tied targets should be returned", run, nTargets)
 		// Confirm the targets genuinely tie — else this wouldn't exercise the
 		// tie-break (a same-score block is the whole point of #698).
 		for _, r := range res {
@@ -85,12 +97,12 @@ func TestEntityBoost_TiedInjectionsDeterministic(t *testing.T) {
 		if run == 0 {
 			first = got
 		} else {
-			require.Equal(t, first, got, "run %d: tied-injection order changed across identical calls (nondeterministic map-order)", run)
+			require.Equal(t, first, got, "run %d: tied-boost order changed across identical calls", run)
 		}
 	}
 
 	// The deterministic order must be ascending ULID (the tie-break key).
 	want := append([]storage.ULID(nil), first...)
 	sort.Slice(want, func(i, j int) bool { return bytes.Compare(want[i][:], want[j][:]) < 0 })
-	require.Equal(t, want, first, "tied injections must be ordered by ascending ULID")
+	require.Equal(t, want, first, "tied boosted rows must be ordered by ascending ULID")
 }

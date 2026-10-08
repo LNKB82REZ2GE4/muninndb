@@ -35,6 +35,33 @@ recall via uncapped, threshold-bypassing injection. Fix: rarity-weight the boost
 accumulation, gate on threshold, keep the factor (0.15) below typical BFS weights.
 **Principle: fix the flood with a cap and a gate; don't amputate the feature.**
 
+**Entity boost bounded by its source; injection retired (2026-10).** Measured on a real
+907-fact vault (LLM-extracted facts, free-text entity lists, 2.4 entities/fact, top entity on
+11% of engrams) with 60 paraphrased single-fact questions and blind judges: adding entities
+cost **0.17 MRR** (0.867 → 0.695; 21 questions lost, 2 won; Hit@10 unchanged — the answer was
+still retrieved, just ranked lower). Per-question attribution killed the working hypothesis
+that hub entities flood recall — idf already crushed them (the commonest entity contributed
+0.048). In **20 of 21** losses the answer was a *seed*, overtaken by non-seed rows that gained
+up to +0.30 by sharing **that seed's** entities: seeds are never boosted, so the pass promoted
+a seed's neighbours over the seed that justified them. Only 1 of 21 involved injection. On
+30 off-topic queries, 130 of 169 returned rows were entity-only injections (unscored, banded
+`uncalibrated`/`not_scored`), and for 8 queries they were the entire top 5 — the
+"everything scores 0.3, `entity_boost` 0.3" shape seen in production. Ten variants were
+run paired on the same vault: idf-squared, a df > sqrt(n) cut, requiring two shared
+entities, capping the boost at half the row's content match, seeding only from non-weak
+rows, and no-injection alone each recovered **at most 55%** of the loss (best +0.095);
+**holding each boosted row strictly below its strongest contributing seed** recovered all
+of it (−0.008 vs entity-free, CI [−0.022, +0.004]; +0.164 vs before). Shipped: that source
+bound plus no injection (the bound alone left 58 unscored rows in off-topic top-5s). Honest
+negative recorded alongside: on this question set the boost has **no measurable benefit**
+— disabling it entirely scored 0.867, level with the bounded version. It is kept, bounded,
+per the #569 principle (don't amputate a feature on one corpus; its value case —
+associative recall across entity-linked engrams — is not what single-fact paraphrase
+questions measure). Re-validation on enricher-typed entities is outstanding.
+**Principle: a propagated signal must not outrank its source — bound spread activation by
+the activation that caused it; and a row with no measured aboutness must not fill a
+response.**
+
 **RRF preserves explicit thresholds (#590).** RRF fusion was clobbering a caller's explicit
 threshold; the fix distinguishes "caller set a threshold" from "engine default applied."
 **Principle: an explicit caller value survives internal re-scoring.**
@@ -134,6 +161,58 @@ signature every read path already interprets correctly, so doing nothing leaves 
 they behave today instead of half-converted. And the live-support filter is **abandoned rather
 than applied to a partial view** past its scan cap — filtering on a subset of the truth deletes
 real edges, which is strictly worse than reporting a stale one.
+
+### Dedup refuses name swaps and morphological negation, not just numbers
+
+Dream's phase-2 dedup archives the lower-scored member of any pair at cosine >= 0.85. The
+pattern-separation guard (#688) already refused pairs differing by a number, a date or an
+explicit negation word, and documented entity swaps as a blind spot. A RED test showed the
+blind spot is live: "owned by Priya" / "owned by Marcus", "reads from QueueStore" / "reads
+from JobLedger", "supported" / "unsupported" and "enabled" / "disabled" all merged at cosine
+~0.9999, with the loser archived and its access count folded into the survivor.
+
+The second stage (`internal/consolidation/dedup_identity.go`) refuses a merge when **each**
+side carries a name-shaped token absent from the other side (a swap; a one-sided addition is
+an elaboration and still merges), or when a word unique to one side is a morphological
+negation of a word unique to the other. Name shape is structural: an identifier shape, a
+capital in a non-initial position, or a sentence-initial capital (including after a
+"Label:" colon) unless the vault's own live text writes that word mostly lowercase
+mid-sentence. A word the vault has never written mid-sentence has no evidence, and missing
+evidence resolves toward keeping both. The earlier draft read it as "not a name", which let
+"Owner: Priya" / "Owner: Marcus" merge, and the adversarial pass caught that. On real vaults
+the change moved one blocked pair out of 125, because ordinary words ("use", "prefer") always
+have lowercase mid-sentence evidence. No word list, no tuned threshold. Not gated by plasticity: the existing guard is unconditional, and refusing a merge
+only leaves a duplicate in place.
+
+Measured offline on three production vault clones (bge-m3 vectors; aggregates only). In
+**steady state** the old guard already refuses 1,596 of the 1,618 live candidate pairs. Long
+captured turns nearly always differ in some number, so nightly dedup there is close to a
+no-op. The new stage refuses 8 more, and 14 still merge. **Retrospectively**, of 720
+already-archived engrams paired with their nearest live neighbour, the new stage would have
+kept 117 apart. On a blind two-judge sample of 40 blocked pairs (forward and retrospective),
+the identity rule held up
+on short atomic facts (both judges "different fact" on 9/13) and was weak on long texts
+(5/25 strict, 12/25 counting information loss). The polarity rule fired 8 times in total, and
+neither sampled pair was judged distinct, so its value on real data is unproven. Controls
+behaved: number-guard anchors were 8/8 "different", and pairs both guards let merge were
+judged same with no loss on 9/12.
+
+Known residuals are listed in the file header, and each one still merges:
+- a name the vault also writes as an ordinary lowercase word ("Will"/"will");
+- single-letter names;
+- role and polarity reversals with identical token sets (a set comparison cannot see order);
+- antonyms that share no morphology.
+
+The polarity prefixes are example-picked and misfire on real-word pairs (cover/discover,
+less/unless), but those misfires only keep a duplicate. Also out of scope: the representative
+election (Relevance*Confidence) ignores information content, so a one-sided elaboration loses
+its extra detail whenever the shorter side wins. That is pre-existing behaviour and a
+follow-up.
+
+**Principle: a separation guard is only as good as the shapes it can see. Each blind spot a
+guard documents should be RED-tested against the live mechanism, because a documented gap
+is still an open gap. When the measured precision is mixed, say so per text shape rather
+than tuning a length cutoff into the product.**
 
 ## Security & credentials
 
@@ -1283,3 +1362,245 @@ the shape; finding an instance of the shape is still per-subsystem work.
 one day is itself the evidence that "a claim that reads the same when false" is a species,
 not an incident — and the falsifier that catches most of a species does not catch all of
 it. State which half a general check reaches before treating it as coverage.**
+
+### A lazy seed must run before the write it would otherwise count (G9 vault counter, 2026-10-07)
+
+**What happened.** The per-vault engram counter (0x15) is seeded lazily: the first time a
+process touches a vault with no persisted count, `getOrInitCounter` scans the vault's 0x01
+keys. All four counter-mutating paths (`WriteEngram`, `WriteEngramBatch`,
+`pebbleStoreBatch.Commit`, `DeleteEngram`) fetched the counter only AFTER their Pebble commit,
+so on a first touch the seed scan already contained the write and the post-commit `Add`
+applied it a second time. A fresh vault whose first write was a batch of 50 reported 100; a
+first single write reported 2; a status read before the first write masked it entirely
+(which is exactly how the pre-existing `TestWriteEngramBatch_VaultCountIncrement` was written,
+so it could never see the bug). The seeded value is persisted and never re-derived, so the
+excess is permanent. On a production data dir, the counter exceeded every engram a small vault
+could account for (listable + archived + soft-deleted) in 45 of 49 vaults, never below, four of
+them by exactly 50; a 904-engram vault loaded with a first batch of 50 reported 954.
+
+**Decision.** Load the counter BEFORE the commit on every path. `sync.Once` makes concurrent
+first-touch callers wait for the seed, so every counter-aware commit lands after the scan and
+is counted exactly once (pinned by a concurrent first-writers test under `-race`). Moving the
+seed exposed a second dependency: the seed used to persist its scan with a direct `Set`, which
+was harmless only while the scan included the write. Seeded pre-commit, that durable write
+would sit ahead of the write's in-memory increment, and a crash inside the coalescer's 100 ms
+window would leave a short count that no later start rescans — `TestCrashRecoveryPreservesIndexes`
+failed on exactly this. An adversarial pass then refuted the first repair, which had queued the
+seed on the coalescer: that queued value won the next flush over `DeleteEngram`'s direct write
+(and a delete straight after writes already lost to its writes' queued count before this
+change). Holding the counter from before the commit also let a delete that straddled a
+`ClearVault` write the evicted, pre-clear count back. `MergeVaultData` turned out to have
+G9 itself, seeding the target after its copy (2 existing + 4 merged reported 10). The final
+shape: the seed persists nothing (until the first mutation the key is simply absent, and a
+restart rescans), and the two direct writers go through `persistCounterNow`, which writes only
+while the counter is still live and replaces any queued coalescer value. Each counter test
+closes and reopens the store before asserting, because an in-memory count can be right while
+the persisted one is wrong. Existing
+drift is corrected by fork migration v10 (`RecountVaultCounters`), a one-shot recount of every
+persisted counter against its vault's 0x01 key count — the same definition the lazy seed uses.
+
+**Why a migration, not a lazy reconcile on status.** A reconcile on read either rescans a
+vault per status call (a 140k-engram vault makes that a real cost on a hot path) or needs a
+"reconciled" marker, which is a migration with extra steps. A migration that fails refuses
+startup and leaves the version unstamped — loud, retried on the next start — while a reconcile
+that silently skips is indistinguishable from one that ran.
+
+**Not fixed here.** Replication followers apply raw batches without touching the counter, so a
+follower's counter is whatever its first read seeded and does not track later writes; that is
+a separate defect, untouched by this change. The delete path's not-found fallback deletes the
+0x01 key without decrementing; also unchanged. Unproven and pre-existing: a coalescer flush
+racing `ClearVault`'s pending-entry delete (its load→set→delete is not atomic), and the
+coalescer's latest-value-wins ordering among concurrent writers' submits.
+
+**Principle: a lazily-initialised aggregate and the delta applied to it must be ordered
+against the same commit. If the seed can observe the write, the delta must not also apply it.**
+
+### "Loud" has to reach a reader: the BM25 fall-back was flagged and still invisible (G4, 2026-10-07)
+
+**The decision.** #578's degradation doctrine (embedder down → BM25-only recall, WARN, keep
+serving) stands unchanged. What changed is who can see it. The engine now keeps one
+process-wide embed-health record, fed by every `EmbedService.Embed` outcome (recall-time
+query embeds, the background retroactive embedder, and an idle probe every 20s), and serves
+it as `embed_backend` on `GET /api/health`, `GET /api/admin/embed/status` and `muninn_status`
+(which also stops reporting a hard-coded `health: "good"`). A state transition into
+`degraded` logs one ERROR line. A requested provider that fails at startup is `disabled`, not
+"no embedder configured".
+
+**Why it was needed, measured on an isolated instance.** With the embedder unreachable or
+answering 401, every recall carried `semantic_degraded: true` and the server logged a WARN
+per call — the doctrine was working as designed. A client that renders the flag still showed
+nothing: `ActivateMulti` built a fresh response and dropped `SemanticDegraded`, and the
+multi-vault path is the one a project-scoped recall client uses. The same failing-embedder
+recall that showed the flag single-vault returned an unannotated list multi-vault. Separately,
+nothing in `/api/health` or `muninn_status` changed during an outage; the plugin registry kept
+reporting the embedder healthy, because the plugin health checker that would update it is
+never started; and an embedder rejected at startup by a bad key was reported as "No embedder
+configured", sending the operator to configure something that was already configured.
+
+**What a write during an outage stores (checked, not assumed).** Nothing wrong. The write path
+embeds nothing itself (only a client-supplied vector is stored inline); the retroactive
+embedder classifies connection-refused, 401/403/404 and 5xx as provider-down and leaves the
+batch unflagged, so the engram is retried and embedded on recovery (observed: 1/1 after a
+startup-noop window, 1/1 after a runtime outage). A provider that *succeeds* with an all-zero
+vector was the one hole: the retroactive path would have stored it and set `DigestEmbed`, so
+it was never retried and scored 0 against every query. Now: if a whole batch comes back zero
+and a probe text does too, the provider is treated as down (batch left pending, pass stopped
+without self-notify so the processor backs off); if the provider embeds other text fine, the
+zero is about that engram's content and it is latched like any content-specific failure. The
+first version of this guard left every zero-vector engram pending; adversarial review showed
+that a cap-sized block of them at the head of the scan, plus the cap's self-`Notify`, made a
+hot loop (~3,500 provider calls in 2s) that starved every engram behind it. Refusals are
+counted (`zero_vectors_refused`). Refusing zero vectors at the transport (a client-supplied
+embedding) was not added: that is the caller's explicit input and out of this change's scope.
+
+**Measured alert latency** (isolated instance, poller at 15s, no recall traffic during the
+outage): embedder killed → alert 22s; embedder answering 401 at runtime → 32s; wrong key at
+startup → alert 13s after launch. Worst case by construction ≈ probe interval (20s) + probe
+timeout (15s, only for a hung backend) + poll interval (15s) ≈ 50s.
+
+**Also closed: #582 for env-configured providers.** A provider requested only through an env
+var that failed at startup was still silently replaced by the bundled local model when that
+was available — then, with this change's first version, reported `ok`. The bundled fallback
+now applies only when no provider was requested at all.
+
+**Residuals, named.** (1) A provider that fails at startup stays `disabled` for the life of the
+process; fixing the key needs a restart (the state says so). (2) A 400/413/422 content
+rejection is not counted as a backend failure, so a backend rejecting *everything* as
+content-specific would read `ok` (recall still flags `semantic_degraded`). (3) gRPC still does not map
+`SemanticDegraded` (pre-existing deferral). (4) `degraded_recalls` counts per-vault
+activations, so one multi-vault recall counts once per vault. (5) Multi-vault responses still
+drop the per-vault `abstained`/`conflict` blocks; only the degradation flag is propagated.
+
+**Principle: a degradation signal is only loud if every path a reader actually uses carries it.
+Flagging the response is not enough when the response a client sees is rebuilt elsewhere —
+trace the flag to the rendered output, and give operators a pollable state, not a log line.**
+
+### Enricher key points: index them, but never let a restatement count twice (G2, 2026-10-07)
+
+**Context.** The external enricher writes 3-7 self-contained key points per engram through
+`apply_enrichment`. They were persisted on the record (measured on two production vaults:
+548/549 and 54/57 engrams carry them, median 4 and 3) but invisible: `muninn_read`'s MCP
+convert dropped `ReadResponse.KeyPoints`, recall carried nothing, and no index read them. A
+second defect sat underneath: an apply carrying key points and no summary/type was accepted
+and its key points dropped (0/93 stored on the released binary in a reproduction).
+
+**Decision.** Index key points in their own FTS field and surface them, with no new LLM call
+and no migration (`muninn reindex-fts` backfills existing vaults).
+- A term's coverage is `max(content side, key-point side)`, never the sum, and a key-point
+  posting is normalised at the vault's own average document length. A key point is the
+  enricher's restatement of the content; summing would credit every enriched engram twice
+  for every word it already holds. With max + avgdl, a key point lifts an engram only where
+  it is the stronger evidence (paraphrase vocabulary, or a match buried in a longer-than-
+  average body) — self-calibrating per vault, no constant.
+- Recall rows carry `matched_key_point`: the key point covering the largest IDF-weighted share
+  of the query, and at least half of it. Presentation only, chosen after ranking.
+- One document builder (`ftsDocument`) for every path that rewrites an existing engram's
+  postings, so delete and reindex cannot forget the field.
+
+**Measured** (isolated instance, same data, released binary vs branch):
+- Real production vault, 548 engrams, half enriched. Questions written from ONE key point:
+  MRR 0.702 → 0.804, paired +0.103 [+0.031, +0.189], 7 won / 0 lost, top-3 31 → 37 of 40.
+  Content-written questions on unenriched engrams (40) and on enriched engrams (20): paired
+  diff exactly 0.000 — no inflation and no displacement.
+- 93 raw commit-history chunks with an extractor's facts as key points, 60 blind-judged
+  paraphrased questions (final code, second judging pass): MRR 0.235 → 0.354 (+0.119
+  [+0.05, +0.20], 12 won / 1 lost; first pass on the pre-review code +0.129). The same facts
+  as CHILD engrams (`add_child`): 0.892 (+0.658 [+0.55, +0.77], 45/0). Unenriched control
+  vault: identical lists before and after (60/60 tied). Judge drift between the two passes
+  on the identical baseline lists: 0.036 MRR.
+- Adversarial review found four defects before landing, all fixed with RED-shown tests:
+  repeated key-point terms inflating TF (now presence-only), legacy unindexed key points
+  corrupting DF on re-enrich and retag, and Forget racing a key-point write.
+- Audit of 40 enriched engrams (blind Sonnet judges, seeded controls caught 20/20): key-point
+  fidelity 81% supported, 18% partial, 1 unsupported; coverage of Sonnet-written key facts
+  71% (HIGH 82%). Below a raw-text extractor measured at 95% / 96%.
+
+**Honest negative / what was not done.** Key points as a field rescue retrieval for short
+turn engrams, but for long multi-fact sources they recover a fifth of what child engrams do:
+one 2.8k-character document still competes as one unit, and the snippet floor shows the
+matched key point on only 18 of 60 questions there. Children are the right shape for
+documents (that is the extraction worker's job, plan Phase 1b), not for every enriched turn
+(4-5x the engram count). Key points are not embedded; the semantic channel still sees only
+the content. gRPC/proto and non-Go SDKs do not carry `matched_key_point` (REST does, by type
+alias).
+
+### A truncated recall row says it is truncated, and the full text is one flag away (G11, 2026-10-07)
+
+`muninn_recall` cut every row's content at **byte** 500 and appended a bare `...`. Measured on
+a production vault: when an LLM judge saw recall results as MCP delivered them, long
+knowledge pages (~6 KB each) added +0.02 answer coverage; when the same results were expanded
+with one `muninn_read` each, they added +0.40. The pages were being retrieved; their content
+was not reaching the agent, and nothing on the row said so. The byte cut also split multi-byte
+UTF-8 mid-rune and truncated non-ASCII content that fit in 500 characters.
+
+REST, gRPC and MBP were never affected — they return `mbp.ActivationItem.Content` whole; the
+cut lived only in `internal/mcp/convert.go`. So the fix is MCP-only and no SDK changes.
+
+Options weighed: (a) an opt-in flag, (b) full content for rows tagged as pages, (c) a larger
+default preview. (b) bakes one deployment's tag vocabulary into the engine (principle #11)
+and still leaves every other long row silently cut. (c) inflates every default response
+for a need only some calls have. **Chosen: (a)**, as `full_content: bool` — the same shape as
+recall's existing `annotate` / `include_invalid` / `include_leased` presentation flags
+(principle #7) — and a non-bool value falls back to the preview rather than erroring
+(principle #4). The default preview stays 500, now counted in **characters**, cut on a
+line/word boundary within an 80-character window, and ends with a visible marker
+`…[+N chars, muninn_read <id>]` plus `content_truncated` / `content_chars` on the row. The
+marker was the actual defect (principle #2); the flag is the convenience.
+
+A blanket "always full" was ruled out by the prompt-injection hook clients: they recall on
+every prompt. (In practice the reference hook uses REST and truncates on its own side, but a
+client built on MCP recall would not.)
+
+**Principle: a presentation cut is acceptable; an unmarked one is a silently-wrong answer.
+Bound the default, say exactly what was withheld and how to get it, and offer the opt-in.**
+
+### An adversary pass on the hindsight integration: two new defects, three old ones, all closed RED-first (2026-10-07)
+
+A REFUTE pass over the integrated G2/G4/G9/G11 branch reproduced five defects. Two were new on
+the branch and three were older: each of those three reproduced unchanged on an export of
+the pre-branch tree. Each one now has a regression test that failed before its fix.
+
+- **F1 (G11): the preview marker could not be followed on a multi-vault recall.** The marker
+  said `muninn_read <id>`, but `muninn_read` resolves an id in the caller's default vault and
+  the row named no vault, so every long row from another vault led to "engram not found".
+  The hook recall is multi-vault, so this was ordinary use. Multi-vault rows now carry `vault`
+  and the marker reads `muninn_read <id> vault=<name>`. Single-vault output is unchanged.
+- **F2 (G2): a hard forget racing an enrichment digest left key-point postings.** Forget(hard)
+  de-indexed an unlocked pre-read. A digest (or a retag, which was the older half of this
+  defect) that held the stripe lock between that read and the delete had already indexed
+  terms the cleanup never saw: 26/200 forced races. The code comment claiming Forget closed
+  the race was true only for soft forget. `storage.DeleteEngramReturning` now hands back the
+  record read under the stripe lock, and Forget plus both PruneVault arms de-index that. The
+  regression test is deterministic: a nil-by-default seam lands the rewrite inside the old
+  window.
+- **P1: two concurrent hard deletes of one engram decremented the counter twice.**
+  `DeleteEngram` evicted L1 after releasing the stripe lock, so the second deleter read the
+  stale cached record and took the full-delete path. It now evicts under the lock, both
+  before its read and before unlocking.
+- **P2: ClearVault panicked while any other vault was being written.** The provenance worker
+  counted in-flight appends in one process-wide `sync.WaitGroup`. ClearVault called Wait on it
+  while writers elsewhere called Add(1) from zero, and the WaitGroup contract forbids that:
+  it panicked within 0–27 clears. In-flight appends are now counted per vault, and ClearVault
+  drains only its own vault, so a busy vault can no longer starve an unrelated clear either.
+- **P3: writes racing a same-vault ClearVault left the counter drifted.** This had two
+  causes, and fixing either one alone still drifted. (1) `getOrInitCounter`'s Load-hit fast
+  path returned a counter that another goroutine was still seeding. (2) Writes interleaved
+  with the clear. Every caller now passes through `once.Do`, and a per-vault RWMutex
+  (`vaultClearGate`) excludes counter-mutating writes for the whole clear. Before the fix the
+  test drifted from round 0 (counter 25 over 0 keys). After it: 0/600 rounds. With the gate
+  but without the seed fix: 26/300.
+
+**Considered and rejected for P3: refusing writes to a vault being cleared.** That would turn
+a race into a client-visible error, and waiting costs the writer one clear's latency. The
+gate's cost is one uncontended `RLock` per write.
+
+**Residual (STO-6a).** `CloneVault`, `MergeVaultData` and import still call `Store` on the
+counter outside the gate. Also, a counter-coalescer flush that is still in flight at the
+instant of ClearVault's post-tombstone re-delete can persist one pre-clear count. A restart
+seeds from that count until migration v10 or the next recount. Both need a clear to race a
+rare admin path or a 100 ms flush landing on one Pebble `Set`. Neither was reproduced.
+
+**Principle: a lock that guards a read must also guard whatever the read decides.** P1
+(evict after unlock), F2 (de-index from an unlocked read) and P3 (seed visible before it is
+complete) are the same defect three times: the decision and the state it was based on were
+not held together.

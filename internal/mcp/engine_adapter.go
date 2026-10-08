@@ -23,6 +23,11 @@ type mcpEngineAdapter struct {
 	pStore   plugin.PluginStore // needed by RetryEnrich to persist entities/relationships
 }
 
+// EmbedHealth returns the embed backend's health (G4).
+func (a *mcpEngineAdapter) EmbedHealth() plugin.EmbedHealthSnapshot {
+	return a.eng.EmbedHealth()
+}
+
 // RegisterVaultName registers a vault name (idempotent 2-key write).
 // Delegates to engine.Engine.RegisterVaultName (RFC #597: muninn_create_workflow_vault).
 func (a *mcpEngineAdapter) RegisterVaultName(name string) error {

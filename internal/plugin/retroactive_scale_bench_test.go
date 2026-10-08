@@ -20,7 +20,7 @@ type noopScaleEmbedPlugin struct {
 }
 
 func (p *noopScaleEmbedPlugin) Embed(ctx context.Context, texts []string) ([]float32, error) {
-	return make([]float32, len(texts)*p.dim), nil
+	return nonZeroVecs(len(texts), p.dim), nil
 }
 func (p *noopScaleEmbedPlugin) Dimension() int    { return p.dim }
 func (p *noopScaleEmbedPlugin) MaxBatchSize() int { return p.maxBatch }

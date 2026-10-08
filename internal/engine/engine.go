@@ -56,6 +56,9 @@ type CognitiveForwarder interface {
 
 // Engine is the cognitive database engine implementing mbp.EngineAPI.
 type Engine struct {
+	// embedHealth is the process-wide embed backend health record (G4). nil
+	// until SetEmbedHealth; every EmbedHealth method is nil-safe.
+	embedHealth *plugin.EmbedHealth
 	store       *storage.PebbleStore
 	authStore   *auth.Store // nil = use Plasticity defaults (e.g. in tests)
 	fts         *fts.Index
@@ -466,6 +469,14 @@ func (e *Engine) GetProcessorStats() []plugin.RetroactiveStats {
 	}
 	return stats
 }
+
+// SetEmbedHealth attaches the process-wide embed-health tracker. Call before
+// serving traffic.
+func (e *Engine) SetEmbedHealth(h *plugin.EmbedHealth) { e.embedHealth = h }
+
+// EmbedHealth returns the embed backend's current health. Without a tracker
+// attached it reports "unknown" rather than claiming the backend is fine.
+func (e *Engine) EmbedHealth() plugin.EmbedHealthSnapshot { return e.embedHealth.Snapshot() }
 
 // EmbedStats returns the current stats for the first embed retroactive processor.
 // Returns a zero-value RetroactiveStats when no embed processor is registered.
@@ -1212,12 +1223,10 @@ func (e *Engine) UpdateTags(ctx context.Context, vault string, id storage.ULID, 
 	prev, prevErr := e.store.GetEngram(ctx, wsPrefix, id)
 	var prevDoc fts.Document
 	if prevErr == nil && prev != nil {
-		prevDoc = fts.Document{
-			Concept:   prev.Concept,
-			CreatedBy: prev.CreatedBy,
-			Content:   prev.Content,
-			Tags:      append([]string(nil), prev.Tags...),
-		}
+		// Key points included: they are part of the indexed document, and a
+		// reindex whose prev and next both omit them would delete the
+		// key-point posting of every term they share with the content.
+		prevDoc = e.indexedPrevDocument(wsPrefix, prev)
 	}
 
 	if err := e.store.UpdateTagsLocked(ctx, wsPrefix, id, tags); err != nil {
@@ -1246,8 +1255,7 @@ func (e *Engine) UpdateTags(ctx context.Context, vault string, id storage.ULID, 
 		// record away rather than superseding it, and Forget already de-indexed
 		// it. Drop whatever postings remain and write nothing back, so a retag
 		// cannot put a discarded document into the candidate pool.
-		if err := e.fts.DeleteEngram(wsPrefix, [16]byte(id),
-			prevDoc.Concept, prevDoc.CreatedBy, prevDoc.Content, prevDoc.Tags); err != nil {
+		if err := e.fts.DeleteDocument(wsPrefix, [16]byte(id), prevDoc); err != nil {
 			slog.Warn("engine: update_tags: fts delete failed", "id", id.String(), "err", err)
 		}
 		return nil
@@ -2910,7 +2918,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	actReq.ExcludeTags = resolved.ExcludeTags
 
 	// Valid-time gate (COG-19): as_of / include_invalid flow into phase-6
-	// filtering; the final gate below re-applies them to entity-boost injections.
+	// filtering; the final gate below re-applies them to engine-layer injections.
 	actReq.AsOf = req.AsOf
 	actReq.IncludeInvalid = req.IncludeInvalid
 
@@ -3155,21 +3163,18 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// degraded call.
 	if result.SemanticDegraded {
 		metrics.RecallEmbedFallbackTotal.WithLabelValues(req.Vault).Inc()
+		e.embedHealth.RecordDegradedRecall()
 	}
 
 	// Entity boost phase: spread activation through shared named entities.
-	// After BFS produces a scored set, any engram sharing a named entity with a
-	// top-N result receives a small boost. This surfaces entity-linked engrams
-	// that have no direct association edge to the query-matching engrams.
-	preBoost := len(result.Activations)
+	// After BFS produces a scored set, a returned row sharing a named entity
+	// with a top-N result receives a small boost, held strictly below that
+	// source result. It re-scores returned rows only — it never adds one,
+	// so TotalFound is unaffected. Known imprecision for the injector below
+	// (scoped follow-up, PR #570 review): an engram that scored above
+	// threshold in the pipeline but was truncated past MaxResults inside Run()
+	// and then re-injected by supersession is counted twice.
 	result.Activations = e.applyEntityBoost(ctx, wsPrefix, vaultSize, result.Activations, actReq)
-	// Injected engrams count as found: on the boost path, total <
-	// len(activations) was the #569 bypass fingerprint. Known imprecision, for
-	// BOTH injectors here and below (scoped follow-up, PR #570 review): an
-	// engram that scored above threshold in the pipeline but was truncated
-	// past MaxResults inside Run() and then re-injected by boost or
-	// supersession is counted twice.
-	result.TotalFound += len(result.Activations) - preBoost
 
 	// Supersedes-aware ranking: promote the current fact over any superseded one
 	// it replaces (injecting it if the query didn't retrieve it), so recall never
@@ -3177,8 +3182,7 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	// truncation so an injected head is not cut. Chains resolve under the
 	// caller's view through the shared visibility gate (hidden nodes are
 	// traversable but unnameable; no admitted successor → the substitution
-	// abstains whole), and admitted injections count as found, same rule as
-	// boost. injectorNow is shared with the final COG-19 cut below so a
+	// abstains whole), and admitted injections count as found. injectorNow is shared with the final COG-19 cut below so a
 	// validity boundary cannot fall between the gate's admission and that cut.
 	injectorNow := time.Now()
 	// One visibility gate and ONE nameable cache shared by both post-pipeline
@@ -3205,13 +3209,13 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 	result.TotalFound += supInjected
 
 	// Final valid-time gate (COG-19: default recall never returns an engram whose
-	// ValidUntil <= now). Phase-6 gated scored candidates and both injectors
-	// gate their entrants. For supersession this cut is defense in depth at
-	// the same instant (injectorNow); it remains LOAD-BEARING for two paths:
-	// boost runs on its own earlier clock, so a boost injection (or phase-6
-	// survivor) whose validity boundary falls inside that window is admitted,
-	// counted at line ~2340, then swept here — a documented overcount sliver —
-	// and it backstops any future result-set mutation that forgets the gate.
+	// ValidUntil <= now). Phase-6 gated scored candidates and the injectors
+	// gate their entrants (the entity boost adds none). For supersession
+	// this cut is defense in depth at the same instant (injectorNow); it
+	// remains LOAD-BEARING for two paths: a phase-6 survivor whose validity
+	// boundary falls between phase 6's clock and this one is swept here — a
+	// documented overcount sliver — and it backstops any future result-set
+	// mutation that forgets the gate.
 	// Runs AFTER supersession
 	// on purpose: a manual supersede's now-expired predecessor is dropped only once
 	// its current head has been promoted/injected, so a query matching only the
@@ -3341,6 +3345,9 @@ func (e *Engine) activateCore(ctx context.Context, req *mbp.ActivateRequest, str
 			// uncalibrated, why.
 			RelevanceBand:      relevanceBands[i],
 			RelevanceBandBasis: relevanceBases[i],
+			// G2: the enricher key point this query matched, if any.
+			// Presentation only — computed after every scoring phase.
+			MatchedKeyPoint: e.matchedKeyPoint(wsPrefix, req.Context, scored.Engram),
 		}
 
 		// Supersession annotation from the supersedes-aware ranking phase (always-on
@@ -3936,11 +3943,19 @@ func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.Forge
 	}
 
 	if req.Hard {
-		// Read the engram before hard-deleting so we can clean up the
-		// content-hash mapping (the record is gone after DeleteEngram).
-		eng, _ := e.store.GetEngram(ctx, wsPrefix, id)
-
-		if err := e.store.DeleteEngram(ctx, wsPrefix, id); err != nil {
+		// The record used for the content-hash and FTS cleanup below is the one
+		// DeleteEngramReturning read UNDER the stripe lock — the lock
+		// UpdateDigestIndexed and UpdateTags hold for their in-place FTS
+		// rewrites. This used to be an unlocked pre-read, so a digest (or
+		// retag) landing between it and the delete indexed key points (or
+		// tags) the cleanup never saw: they outlived the engram in the FTS
+		// index (26/200 forced races). A rewrite that takes the lock after the
+		// delete finds no record and indexes nothing.
+		if forgetHardBeforeDelete != nil {
+			forgetHardBeforeDelete(id)
+		}
+		eng, err := e.store.DeleteEngramReturning(ctx, wsPrefix, id)
+		if err != nil {
 			if errors.Is(err, storage.ErrNotFound) {
 				return nil, ErrEngramNotFound
 			}
@@ -3984,14 +3999,33 @@ func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.Forge
 		}
 		// Remove FTS posting-list entries so soft-deleted engrams do not appear in search.
 		if readErr == nil && eng != nil && e.fts != nil {
-			if ftErr := e.fts.DeleteEngram(wsPrefix, [16]byte(id), eng.Concept, eng.CreatedBy, eng.Content, eng.Tags); ftErr != nil {
+			if ftErr := e.fts.DeleteDocument(wsPrefix, [16]byte(id), ftsDocument(eng)); ftErr != nil {
 				slog.Warn("engine: fts cleanup failed after soft delete", "id", req.ID, "error", ftErr)
+			}
+		}
+		// The pre-read above is unlocked, so an in-place rewrite that held the
+		// stripe lock while SoftDelete waited (UpdateDigestIndexed adding key
+		// points, UpdateTags adding tags) may have indexed terms it does not
+		// contain. Re-read the committed record and delete its document too.
+		// Deletes are idempotent and move no statistics. A rewrite that starts
+		// after SoftDelete sees the soft-deleted state and indexes nothing.
+		if e.fts != nil {
+			if post, err := e.store.GetEngram(ctx, wsPrefix, id); err == nil && post != nil {
+				if ftErr := e.fts.DeleteDocument(wsPrefix, [16]byte(id), ftsDocument(post)); ftErr != nil {
+					slog.Warn("engine: fts cleanup (post-read) failed after soft delete", "id", req.ID, "error", ftErr)
+				}
 			}
 		}
 	}
 
 	return &mbp.ForgetResponse{OK: true}, nil
 }
+
+// forgetHardBeforeDelete is a test seam: when non-nil, Forget(hard) calls it
+// immediately before its delete, so a test can land a concurrent in-place
+// rewrite in exactly the window the old unlocked pre-read left open. Always
+// nil in production.
+var forgetHardBeforeDelete func(id storage.ULID)
 
 // cleanSearchIndexesAfterHardDelete removes a hard-deleted engram from the FTS
 // posting lists and tombstones it in the HNSW vector index.
@@ -4006,7 +4040,7 @@ func (e *Engine) Forget(ctx context.Context, req *mbp.ForgetRequest) (*mbp.Forge
 // the HNSW tombstone does not, so they are gated separately.
 func (e *Engine) cleanSearchIndexesAfterHardDelete(wsPrefix [8]byte, id [16]byte, eng *storage.Engram) {
 	if e.fts != nil && eng != nil {
-		if err := e.fts.DeleteEngram(wsPrefix, id, eng.Concept, eng.CreatedBy, eng.Content, eng.Tags); err != nil {
+		if err := e.fts.DeleteDocument(wsPrefix, id, ftsDocument(eng)); err != nil {
 			slog.Warn("engine: fts cleanup failed after hard delete",
 				"id", storage.ULID(id).String(), "error", err)
 		}
@@ -5206,10 +5240,11 @@ func (e *Engine) PruneVault(ctx context.Context, vaultName string) (int64, error
 			}
 			for i := 0; i < toDelete; i++ {
 				id := scored[i].id
-				// Read before deleting: FTS cleanup needs the indexed fields,
-				// which are gone once the 0x01 record is.
-				victim, _ := e.store.GetEngram(opCtx, ws, id)
-				if err := e.store.DeleteEngram(opCtx, ws, id); err != nil {
+				// FTS cleanup needs the indexed fields, which are gone once the
+				// 0x01 record is: use the record the delete read under the
+				// stripe lock, not an unlocked pre-read (see Forget's hard arm).
+				victim, err := e.store.DeleteEngramReturning(opCtx, ws, id)
+				if err != nil {
 					slog.Debug("prune vault: hard-delete failed", "vault", vaultName, "id", id, "err", err)
 					continue
 				}
@@ -5253,8 +5288,8 @@ func (e *Engine) PruneVault(ctx context.Context, vaultName string) (int64, error
 			return pruned, fmt.Errorf("prune vault %s (retention scan): %w", vaultName, err)
 		}
 		for _, id := range ids {
-			victim, _ := e.store.GetEngram(opCtx, ws, id)
-			if err := e.store.DeleteEngram(opCtx, ws, id); err != nil {
+			victim, err := e.store.DeleteEngramReturning(opCtx, ws, id)
+			if err != nil {
 				slog.Debug("prune vault: retention hard-delete failed", "vault", vaultName, "id", id, "err", err)
 				continue
 			}

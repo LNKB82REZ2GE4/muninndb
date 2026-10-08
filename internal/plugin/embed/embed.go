@@ -68,6 +68,17 @@ type EmbedService struct {
 	verboseLogsFlag *bool
 	mu              sync.Mutex
 	closed          bool
+	// health, when set, records the outcome of every Embed call (G4: make
+	// the BM25 fallback visible). nil-safe: an unset tracker is a no-op.
+	health *plugin.EmbedHealth
+}
+
+// SetHealth attaches an embed-health tracker that records every Embed
+// call's outcome. Call before serving traffic.
+func (s *EmbedService) SetHealth(h *plugin.EmbedHealth) {
+	s.mu.Lock()
+	s.health = h
+	s.mu.Unlock()
 }
 
 // NewEmbedService creates an EmbedService from a parsed provider URL.
@@ -200,13 +211,30 @@ func (s *EmbedService) Embed(ctx context.Context, texts []string) ([]float32, er
 		return nil, fmt.Errorf("embed service is closed")
 	}
 	batcher := s.batcher
+	health := s.health
 	s.mu.Unlock()
 
 	if batcher == nil {
 		return nil, fmt.Errorf("embed service not initialized")
 	}
 
-	return batcher.Embed(ctx, texts)
+	vec, err := batcher.Embed(ctx, texts)
+	switch {
+	case err != nil && plugin.IsContentSpecificEmbedError(err):
+		// A 400/413/422 rejects this request's content; the backend answered,
+		// so it is not a degradation of recall (the bisect path isolates the
+		// engram). Recording it would flap embed_backend to "degraded".
+	case err != nil:
+		health.RecordFailure(err)
+	case len(texts) > 0 && !plugin.AllBlank(texts) && plugin.IsZeroVector(vec):
+		// Success with no usable vector is the same failure class as an
+		// unreachable backend; callers already treat it so (phase1's
+		// zero-vector check, the retroactive no-vectors branch).
+		health.RecordFailure(plugin.ErrZeroVector)
+	default:
+		health.RecordSuccess()
+	}
+	return vec, err
 }
 
 // Dimension returns the embedding vector dimension.

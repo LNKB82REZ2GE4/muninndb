@@ -248,7 +248,11 @@ func generateGuide(vaultName string, resolved auth.ResolvedPlasticity, stats eng
 	b.WriteString("A response whose rows are ALL `weak` matched nothing strongly — treat those as related memories to verify, not as answers. ")
 	b.WriteString("Note the converse is not true: a `moderate` row can still fail to answer you. The band reports how much EVIDENCE a memory has ")
 	b.WriteString("against your query, which is not the same question as whether it answers it — that one is not computable here, and MuninnDB ")
-	b.WriteString("does not pretend otherwise.\n")
+	b.WriteString("does not pretend otherwise.\n\n")
+	b.WriteString("A recall row's `content` is a PREVIEW when the memory is longer than 500 characters: it ends with a marker like ")
+	b.WriteString("`…[+5,312 chars, muninn_read <id>]` and the row carries `content_truncated: true` and `content_chars` (the full length). ")
+	b.WriteString("On a multi-vault recall each row also carries its `vault`, and the marker names it (`muninn_read <id> vault=<name>`): pass that vault to `muninn_read`. ")
+	b.WriteString("Do not answer from a truncated preview as if it were the whole memory — `muninn_read` the id, or pass `full_content: true` to recall.\n")
 
 	// Valid-time (the two time axes)
 	b.WriteString("\n## Time: two axes\n\n")
