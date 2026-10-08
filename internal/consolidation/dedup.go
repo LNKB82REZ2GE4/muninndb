@@ -10,6 +10,11 @@ import (
 	"github.com/scrypster/muninndb/internal/storage"
 )
 
+// KnowledgePageTag marks an engram written by an external knowledge-page
+// writer: a standing summary of other engrams in the same vault, citing them as
+// its sources. Dedup exempts such an engram entirely (see runPhase2Dedup).
+const KnowledgePageTag = "kind:knowledge-page"
+
 // runPhase2Dedup scans all engrams with embeddings and merges semantically similar ones
 // (cosine similarity >= 0.95). The higher-confidence engram is kept as the representative,
 // and the other is archived. In DryRun mode, no mutations occur.
@@ -43,6 +48,7 @@ func (w *Worker) runPhase2Dedup(ctx context.Context, store *storage.PebbleStore,
 		embedding []float32
 	}
 	withEmbed := make([]engramWithEmbed, 0)
+	exemptPages := 0
 	for _, eng := range allEngrams {
 		if eng == nil {
 			continue
@@ -68,6 +74,20 @@ func (w *Worker) runPhase2Dedup(ctx context.Context, store *storage.PebbleStore,
 		if eng.State == storage.StateArchived || eng.State == storage.StateSoftDeleted {
 			continue
 		}
+		// A knowledge page restates its cited sources, so it can embed at or
+		// above the dream threshold to one of them with the very same numbers
+		// and names — which neither the separation guard nor the identity guard
+		// can tell apart from a duplicate. Electing between them is wrong either
+		// way: archiving the canonical source in favour of an LLM-written summary
+		// is silently-wrong recall, and archiving the page (or folding its tag
+		// into the source) breaks the page writer's bookkeeping. So a page never
+		// enters a candidate pair: never a loser, never a survivor that absorbs.
+		// Fail direction is refuse-to-merge: hand-tagging any engram with this
+		// tag only exempts it from dedup. Duplicates among the sources still merge.
+		if isKnowledgePage(eng) {
+			exemptPages++
+			continue
+		}
 		embed := eng.Embedding
 		if len(embed) == 0 {
 			if loaded, err := store.GetEmbedding(ctx, wsPrefix, eng.ID); err == nil && len(loaded) > 0 {
@@ -77,6 +97,10 @@ func (w *Worker) runPhase2Dedup(ctx context.Context, store *storage.PebbleStore,
 		if len(embed) > 0 {
 			withEmbed = append(withEmbed, engramWithEmbed{engram: eng, embedding: embed})
 		}
+	}
+
+	if exemptPages > 0 {
+		slog.Debug("consolidation phase 2 (dedup): knowledge pages exempt", "vault", vault, "pages", exemptPages)
 	}
 
 	if len(withEmbed) < 2 {
@@ -276,6 +300,16 @@ func (w *Worker) runPhase2Dedup(ctx context.Context, store *storage.PebbleStore,
 
 	slog.Debug("consolidation phase 2 (dedup) completed", "clusters", report.DedupClusters, "merged", report.MergedEngrams)
 	return nil
+}
+
+// isKnowledgePage reports whether eng carries the exact KnowledgePageTag.
+func isKnowledgePage(eng *storage.Engram) bool {
+	for _, tag := range eng.Tags {
+		if tag == KnowledgePageTag {
+			return true
+		}
+	}
+	return false
 }
 
 // cosineSimilarity computes the cosine similarity between two float32 vectors
