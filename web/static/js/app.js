@@ -1101,8 +1101,9 @@ document.addEventListener('alpine:init', () => {
     },
 
     async openMemory(m) {
-      // Session entries only have id/concept/createdAt — fetch full engram if content is missing.
-      if (!m.content && m.id) {
+      // Session entries only have id/concept/createdAt, and /api/activate search
+      // results carry no embed_dim or tags — fetch the full engram for either.
+      if ((!m.content || m.embed_dim === undefined) && m.id) {
         try {
           const resp = await fetch('/api/engrams/' + encodeURIComponent(m.id) + '?vault=' + encodeURIComponent(this.vault));
           if (resp.ok) {
