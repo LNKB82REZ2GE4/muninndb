@@ -1,19 +1,23 @@
 package fts
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"log/slog"
 	"math"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/kljensen/snowball"
 	"github.com/scrypster/muninndb/internal/metrics"
+	"github.com/scrypster/muninndb/internal/rankorder"
 	"github.com/scrypster/muninndb/internal/storage/keys"
 )
 
@@ -65,38 +69,52 @@ type PostingValue struct {
 	DocLen uint16
 }
 
-// idfKey is the composite cache key for the IDF value of a term within a vault.
-// Keying by (ws, term) prevents cross-vault IDF contamination.
-type idfKey struct {
-	ws   [8]byte
-	term string
-}
-
 // Index is the FTS inverted index backed by Pebble.
+//
+// It holds no derived scoring state. A search takes one snapshot and works out
+// everything — the corpus size, each word's IDF, each posting list — from that
+// one committed state, so its scores are a function of a state the index was
+// actually in and of the query, and of nothing this process did earlier (see
+// scoreAll for the snapshot and getIDF for why no memo is kept). Writers keep
+// their half of that: a document's postings, document frequencies and corpus
+// statistics commit in one batch.
 type Index struct {
 	db *pebble.DB
+	// mu serializes the read-modify-write of the document-frequency and corpus
+	// stats keys across writers. Searches do not take it
+	// (TestSearch_CompletesWhileAWriterHoldsTheIndexLock).
 	mu sync.RWMutex
-	// In-memory IDF cache: (vault, term) → idf
-	idfCache map[idfKey]float64
 	// versionCache caches the FTS schema version per vault (0=legacy dual-path, 1=stemmed-only).
 	// Populated lazily on first Search() for each vault; FTSVersionKey is write-once.
 	versionCache sync.Map // key: [8]byte wsPrefix, value: byte
+	// statsBehindWarned rate-limits reportStatsBehind's WARN to one per vault per
+	// statsBehindWarnInterval. key: [8]byte wsPrefix, value: *atomic.Int64 (unix nanos).
+	statsBehindWarned sync.Map
+	// unindexedEdit records, per vault, when ReindexEngram last wrote postings
+	// for a document that had none. reportStatsBehind reads it to tell a count
+	// that is behind because an index job has not run yet from one that is
+	// behind for good. It feeds the report only, never a score.
+	// key: [8]byte wsPrefix, value: *atomic.Int64 (unix nanos).
+	unindexedEdit sync.Map
+	// now is time.Now, replaced by tests that need the grace period to pass.
+	now func() time.Time
 }
+
+// statsBehindWarnInterval is how often, per vault, a search may log that a word
+// is counted in more documents than the vault holds. The counter is not
+// rate-limited.
+const statsBehindWarnInterval = 10 * time.Minute
+
+// unindexedEditGrace is how long after an in-place edit of a not-yet-indexed
+// memory a document count that is behind is taken as expected. The memory's
+// index job is queued and normally runs within the worker's 100 ms tick; a
+// minute leaves room for a backlog. It is a patience for a log line, not a
+// scoring constant: past it the same observation is reported, and the report
+// says to act only if it keeps appearing.
+const unindexedEditGrace = time.Minute
 
 func New(db *pebble.DB) *Index {
-	return &Index{
-		db:       db,
-		idfCache: make(map[idfKey]float64, 1024),
-	}
-}
-
-// InvalidateIDFCache clears the in-memory IDF cache, forcing fresh recalculation
-// on the next search. Call this after a vault clear to prevent stale IDF values
-// from influencing BM25 scoring.
-func (idx *Index) InvalidateIDFCache() {
-	idx.mu.Lock()
-	idx.idfCache = make(map[idfKey]float64)
-	idx.mu.Unlock()
+	return &Index{db: db, now: time.Now}
 }
 
 // tokenizeRaw applies lowercase, character normalization, length filtering,
@@ -302,6 +320,31 @@ func docTermSet(d Document) map[string]struct{} {
 	return termSet
 }
 
+// HasPostings reports whether the engram whose document is doc has its
+// keyword postings in the index. One point read: postings are written in one
+// batch per engram, so any one of them stands for all. A document with no
+// indexable terms reports true (there is nothing to be missing).
+func (idx *Index) HasPostings(ws [8]byte, id [16]byte, doc Document) (bool, error) {
+	// Key points are left out of the probe: a vault that predates their
+	// indexing (fork G2) holds them on the record but not in the index, so a
+	// key-point term could report "missing" for a fully indexed engram.
+	counts, _ := docTermCounts(Document{Concept: doc.Concept, CreatedBy: doc.CreatedBy, Content: doc.Content, Tags: doc.Tags})
+	for term, fields := range counts {
+		for field := range fields {
+			_, closer, err := idx.db.Get(keys.FTSPostingKey(ws, term, field, id))
+			if err == pebble.ErrNotFound {
+				return false, nil
+			}
+			if err != nil {
+				return false, err
+			}
+			closer.Close()
+			return true, nil
+		}
+	}
+	return true, nil
+}
+
 // IndexEngram writes FTS posting list entries for an engram that carries no key
 // points: every write path (a write never carries them; the enricher adds them
 // later). A path that indexes an EXISTING engram uses IndexDocument so its key
@@ -325,6 +368,7 @@ func (idx *Index) IndexDocument(ws [8]byte, id [16]byte, d Document) error {
 	// approach (posting batch committed first, DF written separately) could leave
 	// posting lists with stale DF counts.
 	batch := idx.db.NewBatch()
+	defer batch.Close()
 
 	for term, fieldCounts := range termCounts {
 		for field, count := range fieldCounts {
@@ -344,33 +388,35 @@ func (idx *Index) IndexDocument(ws [8]byte, id [16]byte, d Document) error {
 			batch.Set(tkey, nil, nil)
 		}
 
-		// Read current DF and write updated DF into the same batch.
-		tkey := keys.TermStatsKey(ws, term)
-		var currentDF uint32
-		val, closer, err := idx.db.Get(tkey)
-		if err == nil && len(val) >= 4 {
-			currentDF = binary.BigEndian.Uint32(val[0:4])
-			closer.Close()
+		// Read current DF and write updated DF into the same batch. A read
+		// that FAILS is not a count of zero: writing 1 over a count that could
+		// not be read would durably reset the word's frequency.
+		currentDF, _, err := readDF(idx.db, ws, term)
+		if err != nil {
+			idx.mu.Unlock()
+			return err
 		}
-		newDF := currentDF + 1
 		var dfBuf [8]byte
-		binary.BigEndian.PutUint32(dfBuf[:4], newDF)
-		batch.Set(tkey, dfBuf[:], nil)
-
-		// Invalidate IDF cache for this term so it's recalculated on next search.
-		delete(idx.idfCache, idfKey{ws, term})
+		binary.BigEndian.PutUint32(dfBuf[:4], currentDF+1)
+		batch.Set(keys.TermStatsKey(ws, term), dfBuf[:], nil)
 	}
 
-	// Commit single atomic batch: posting lists + DF updates land together.
-	err := batch.Commit(pebble.Sync)
-	idx.mu.Unlock()
-
+	// The corpus statistics (document count, average length) ride in the same
+	// batch. Written separately, as they were, every index left a window — and
+	// every crash in it a permanent state — where a word's frequency counted a
+	// document the corpus size did not.
+	st, err := idx.statsWithDocument(ws, int(docLen))
 	if err != nil {
+		idx.mu.Unlock()
 		return err
 	}
+	batch.Set(keys.FTSStatsKey(ws), encodeStats(st), nil)
 
-	// Update global stats (TotalEngrams, AvgDocLen)
-	return idx.UpdateStats(ws, int(docLen))
+	// Commit single atomic batch: postings, DF updates and corpus statistics
+	// land together.
+	err = batch.Commit(pebble.Sync)
+	idx.mu.Unlock()
+	return err
 }
 
 // DeleteEngram removes FTS posting-list and trigram entries for an engram.
@@ -407,9 +453,6 @@ func (idx *Index) DeleteDocument(ws [8]byte, id [16]byte, d Document) error {
 			tkey := keys.TrigramKey(ws, tri, id)
 			batch.Delete(tkey, nil)
 		}
-
-		// Invalidate IDF cache for this term — DF is now stale.
-		delete(idx.idfCache, idfKey{ws, term})
 	}
 
 	err := batch.Commit(pebble.Sync)
@@ -475,7 +518,7 @@ func (idx *Index) DeleteDocument(ws [8]byte, id [16]byte, d Document) error {
 // The residual: AvgDocLen does not track in-place length changes, so a vault
 // whose engrams grow their tag sets in place has a corpus average that lags low
 // and over-penalizes long documents. Direction is conservative — matches are
-// under-credited, never over-credited — and `muninn reindex-fts` recomputes
+// under-credited, never over-credited — and `muninn vault reindex-fts <name>` recomputes
 // AvgDocLen from scratch. Calling UpdateStats here is NOT the fix: it takes a
 // docLen and increments TotalEngrams, which is the N inflation this method exists
 // to avoid; a correct AvgDocLen maintenance would need a delta-aware stats update
@@ -494,6 +537,16 @@ func (idx *Index) ReindexEngram(ws [8]byte, id [16]byte, prev, next Document) er
 	batch := idx.db.NewBatch()
 	defer batch.Close()
 
+	// Is this an edit of a document with no postings? Its first index has not
+	// run, or was dropped, or it is a forgotten memory being restored. The first
+	// two leave a word's frequency ahead of the document count until the first
+	// index runs (see reportStatsBehind), so the edit is noted for the report.
+	indexed, err := idx.HasPostings(ws, id, prev)
+	if err != nil {
+		idx.mu.Unlock()
+		return fmt.Errorf("fts: read postings: %w", err)
+	}
+
 	// Drop everything the OLD document put in the index first.
 	for term := range oldTerms {
 		for _, field := range allFields {
@@ -502,7 +555,6 @@ func (idx *Index) ReindexEngram(ws [8]byte, id [16]byte, prev, next Document) er
 		for _, tri := range Trigrams(term) {
 			batch.Delete(keys.TrigramKey(ws, tri, id), nil)
 		}
-		delete(idx.idfCache, idfKey{ws, term})
 	}
 
 	// ...then write what the NEW document needs, at the new docLen.
@@ -518,24 +570,53 @@ func (idx *Index) ReindexEngram(ws [8]byte, id [16]byte, prev, next Document) er
 		for _, tri := range Trigrams(term) {
 			batch.Set(keys.TrigramKey(ws, tri, id), nil, nil)
 		}
-		delete(idx.idfCache, idfKey{ws, term})
 	}
 
 	// DF adjustments: membership changes only.
 	for term := range newCounts {
 		if _, retained := oldTerms[term]; !retained {
-			idx.adjustDF(batch, ws, term, 1)
+			if err := idx.adjustDF(batch, ws, term, 1); err != nil {
+				idx.mu.Unlock()
+				return err
+			}
 		}
 	}
 	for term := range oldTerms {
 		if _, retained := newCounts[term]; !retained {
-			idx.adjustDF(batch, ws, term, -1)
+			if err := idx.adjustDF(batch, ws, term, -1); err != nil {
+				idx.mu.Unlock()
+				return err
+			}
 		}
 	}
 
-	err := batch.Commit(pebble.Sync)
+	err = batch.Commit(pebble.Sync)
 	idx.mu.Unlock()
+	if err == nil && !indexed {
+		idx.noteUnindexedEdit(ws)
+	}
 	return err
+}
+
+// readDF returns term's committed document frequency. found is false when the
+// vault holds no record for the term — the only case that means the corpus has
+// never counted it. Any other read failure is returned as an error and never
+// folded into "not found": the search path would report a word the vault holds
+// as absent, and the write paths, which read this to add or subtract one, would
+// commit a count derived from nothing over the real one.
+func readDF(r pebble.Reader, ws [8]byte, term string) (df uint32, found bool, err error) {
+	val, closer, err := r.Get(keys.TermStatsKey(ws, term))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("fts: read document frequency: %w", err)
+	}
+	defer closer.Close()
+	if len(val) < 4 {
+		return 0, false, nil
+	}
+	return binary.BigEndian.Uint32(val[0:4]), true, nil
 }
 
 // adjustDF queues a document-frequency change of delta for term into batch.
@@ -556,6 +637,11 @@ func (idx *Index) ReindexEngram(ws [8]byte, id [16]byte, prev, next Document) er
 // becomes an active penalty against exactly the documents that hold it. Pinned by
 // TestAdjustDF_DecrementClampsAtZero, which asserts both df==0 and idf>0 so a
 // future change that bounds the DF but breaks the sign is still caught.
+//
+// (Those two figures predate getIDF clamping N up to df. With that clamp a
+// wrapped df gives an IDF of about 1e-10, not −20.79: the word would carry no
+// weight rather than be read as absent. Still wrong, still this clamp's job to
+// prevent, and the df==0 half of that test is what pins it now.)
 //
 // There are two distinct ways df_t can be off, and the clamp guards the second:
 //
@@ -581,19 +667,12 @@ func (idx *Index) ReindexEngram(ws [8]byte, id [16]byte, prev, next Document) er
 // this is the path that made it reachable. The residual it leaves is bounded and
 // mild by comparison: floored at 0, one-time per spurious decrement rather than a
 // per-call ratchet, and it INFLATES the IDF of a term for the documents that do
-// hold it rather than omitting them from results. `muninn reindex-fts` recomputes
+// hold it rather than omitting them from results. `muninn vault reindex-fts <name>` recomputes
 // df_t from scratch and clears both directions.
-func (idx *Index) adjustDF(batch *pebble.Batch, ws [8]byte, term string, delta int) {
-	tkey := keys.TermStatsKey(ws, term)
-
-	var currentDF uint32
-	existed := false
-	if val, closer, err := idx.db.Get(tkey); err == nil {
-		if len(val) >= 4 {
-			currentDF = binary.BigEndian.Uint32(val[0:4])
-			existed = true
-		}
-		closer.Close()
+func (idx *Index) adjustDF(batch *pebble.Batch, ws [8]byte, term string, delta int) error {
+	currentDF, existed, err := readDF(idx.db, ws, term)
+	if err != nil {
+		return err
 	}
 
 	switch {
@@ -601,7 +680,7 @@ func (idx *Index) adjustDF(batch *pebble.Batch, ws [8]byte, term string, delta i
 		currentDF += uint32(delta)
 	case delta < 0:
 		if !existed {
-			return // nothing recorded, nothing to decrement
+			return nil // nothing recorded, nothing to decrement
 		}
 		if d := uint32(-delta); currentDF <= d {
 			currentDF = 0
@@ -609,12 +688,13 @@ func (idx *Index) adjustDF(batch *pebble.Batch, ws [8]byte, term string, delta i
 			currentDF -= d
 		}
 	default:
-		return
+		return nil
 	}
 
 	var dfBuf [8]byte
 	binary.BigEndian.PutUint32(dfBuf[:4], currentDF)
-	batch.Set(tkey, dfBuf[:], nil)
+	batch.Set(keys.TermStatsKey(ws, term), dfBuf[:], nil)
+	return nil
 }
 
 // Search performs a calibrated full-text search for the given query string.
@@ -649,13 +729,90 @@ func (idx *Index) Search(ctx context.Context, ws [8]byte, query string, topK int
 	start := time.Now()
 	defer func() { metrics.FTSSearchDuration.Observe(time.Since(start).Seconds()) }()
 
+	results, err := idx.scoreAll(ws, query)
+	if err != nil || results == nil {
+		return results, err
+	}
+	return topKScoredIDs(results, topK), nil
+}
+
+// SearchLive is Search for a vault holding RETIRED documents — superseded
+// versions whose postings are kept on purpose (COG-28: they are the keyword
+// path a query worded like an OLD version still reaches; dropping them, as
+// forget does for trash, would make that wording unable to find the current
+// fact at all). Search cuts the full score-sorted match list at topK, so
+// retired versions that out-score live documents take their slots; SearchLive
+// cuts the LIVE matches at topK and returns the best shadowBudget retired
+// matches separately, on a budget not counted against topK.
+//
+// No over-fetch is needed: BM25 coverage scoring already scores every
+// matching document before the cut, and each document's score is its own
+// (no cross-document normalisation), so skipping retired ones at the cut
+// changes no live score. Corpus statistics (N, df) still include retired
+// documents, exactly as before — a separate question from slot consumption.
+func (idx *Index) SearchLive(ctx context.Context, ws [8]byte, query string, topK int, retired func([16]byte) bool, shadowBudget int) (live, shadows []ScoredID, err error) {
+	start := time.Now()
+	defer func() { metrics.FTSSearchDuration.Observe(time.Since(start).Seconds()) }()
+
+	results, err := idx.scoreAll(ws, query)
+	if err != nil || results == nil {
+		return results, nil, err
+	}
+	// scoreAll returns the matches UNSORTED (the fork's bounded top-k
+	// selection: sorting a corpus-scale match set to keep a handful was the
+	// measured cost of recall on a large vault). Partition first, then select
+	// the best topK live and the best shadowBudget retired, each under the one
+	// total order sortScoredIDs uses — the same two lists the sort-everything-
+	// then-walk form produced, without ranking the whole set.
+	live = results[:0:0]
+	var retiredSet []ScoredID
+	for _, r := range results {
+		if retired != nil && retired(r.ID) {
+			retiredSet = append(retiredSet, r)
+			continue
+		}
+		live = append(live, r)
+	}
+	live = topKScoredIDs(live, topK)
+	if shadowBudget > 0 && len(retiredSet) > 0 {
+		shadows = topKScoredIDs(retiredSet, shadowBudget)
+	}
+	return live, shadows, nil
+}
+
+// scoreAll scores every document matching query and returns them UNSORTED and
+// uncut; callers select with topKScoredIDs. nil when nothing can match.
+func (idx *Index) scoreAll(ws [8]byte, query string) ([]ScoredID, error) {
 	// Dual-path: search both stemmed tokens (new index) and unstemmed tokens (legacy index).
 	// This ensures backward compatibility for vaults not yet re-indexed with stemming.
 	stemmedTokens := Tokenize(query)
 	rawTokens := tokenizeRaw(query)
 
+	if len(stemmedTokens) == 0 {
+		return nil, nil
+	}
+
+	// Every read below goes through ONE snapshot: the document count, every
+	// word's document frequency and every posting list are read as of the same
+	// committed state. Read separately they can straddle a write, and a score
+	// then mixes two states of the index and matches neither (measured before
+	// the snapshot: 339 of 383,404 scores for one document under a concurrent
+	// writer matched no state the store was ever in, the worst 0.9745 against a
+	// highest legitimate 0.9279).
+	//
+	// And every read that FAILS fails the search. A failed read is not "no
+	// match": reporting it as one hands the caller a confident empty result for
+	// a query the vault may well answer, with nothing to tell it apart from a
+	// real miss.
+	snap := idx.db.NewSnapshot()
+	defer snap.Close()
+	var r pebble.Reader = snap
+
 	// Read global stats
-	stats := idx.readStats(ws)
+	stats, err := idx.readStats(r, ws)
+	if err != nil {
+		return nil, err
+	}
 
 	// Determine whether to use raw-token fallback.
 	// Vaults reindexed with ReindexFTSVault have FTSVersionKey=0x01 and skip the fallback.
@@ -663,19 +820,22 @@ func (idx *Index) Search(ctx context.Context, ws [8]byte, query string, topK int
 	if cachedVer, ok := idx.versionCache.Load(ws); ok {
 		useRawFallback = cachedVer.(byte) == 0x00
 	} else {
-		versionKey := keys.FTSVersionKey(ws)
-		if val, closer, err := idx.db.Get(versionKey); err == nil {
-			ver := val[0]
+		val, closer, verr := r.Get(keys.FTSVersionKey(ws))
+		switch {
+		case verr == nil:
+			if len(val) > 0 {
+				ver := val[0]
+				idx.versionCache.Store(ws, ver)
+				useRawFallback = ver == 0x00
+			}
 			closer.Close()
-			idx.versionCache.Store(ws, ver)
-			useRawFallback = ver == 0x00
+		case errors.Is(verr, pebble.ErrNotFound):
+			// legacy vault — useRawFallback stays true
+		default:
+			return nil, fmt.Errorf("fts: read schema version: %w", verr)
 		}
-		// ErrNotFound means legacy vault — useRawFallback stays true
 	}
 
-	if len(stemmedTokens) == 0 {
-		return nil, nil
-	}
 	N := float64(stats.TotalEngrams)
 	avgdl := float64(stats.AvgDocLen)
 	if avgdl <= 0 {
@@ -720,22 +880,31 @@ func (idx *Index) Search(ctx context.Context, ws [8]byte, query string, topK int
 		raw := rawTokens[i]
 		tryRaw := useRawFallback && raw != stemmed
 
-		idfStemmed := idx.getIDF(ws, stemmed, N)
+		idfStemmed, err := idx.getIDF(r, ws, stemmed, N)
+		if err != nil {
+			return nil, err
+		}
 		var idfRaw float64
 		if tryRaw {
-			idfRaw = idx.getIDF(ws, raw, N)
+			if idfRaw, err = idx.getIDF(r, ws, raw, N); err != nil {
+				return nil, err
+			}
 		}
 
 		anyReal := false
 		if idfStemmed > 0 {
 			anyReal = true
 			denom += idfStemmed
-			_ = idx.searchTokenCoverage(ws, stemmed, numer, idfStemmed, avgdl)
+			if err := idx.searchTokenCoverage(r, ws, stemmed, numer, idfStemmed, avgdl); err != nil {
+				return nil, err
+			}
 		}
 		if idfRaw > 0 {
 			anyReal = true
 			denom += idfRaw
-			_ = idx.searchTokenCoverage(ws, raw, numer, idfRaw, avgdl)
+			if err := idx.searchTokenCoverage(r, ws, raw, numer, idfRaw, avgdl); err != nil {
+				return nil, err
+			}
 		}
 		if !anyReal {
 			// Corpus-absent word (neither form has any stats): no postings
@@ -753,7 +922,7 @@ func (idx *Index) Search(ctx context.Context, ws [8]byte, query string, topK int
 	for id, n := range numer {
 		results = append(results, ScoredID{ID: id, Score: n / denom})
 	}
-	return topKScoredIDs(results, topK), nil
+	return results, nil
 }
 
 // topKScoredIDs returns the topK highest-scoring entries in descending order,
@@ -766,7 +935,7 @@ func (idx *Index) Search(ctx context.Context, ws [8]byte, query string, topK int
 // Selection is a bounded min-heap over the candidates (O(n log k)), so cost
 // scales with how many docs matched, not with how expensive it would be to
 // rank all of them. The returned prefix is fully ordered by the SAME total
-// order sortScoredIDs applies — score descending, ID ascending on a tie — so
+// order sortScoredIDs applies — score descending, newest ID first on a tie — so
 // the result is byte-identical to sorting everything and truncating.
 func topKScoredIDs(s []ScoredID, topK int) []ScoredID {
 	if topK <= 0 || len(s) <= topK {
@@ -827,7 +996,7 @@ func siftDownScoredIDs(h []ScoredID, i int) {
 // length normalisation depresses it. Pinned by
 // TestKeyPoints_DoNotInflateTermsContentAlreadyCovers and
 // TestKeyPoints_LiftLongBodyMatch.
-func (idx *Index) searchTokenCoverage(ws [8]byte, term string, numer map[[16]byte]float64, idf, avgdl float64) error {
+func (idx *Index) searchTokenCoverage(r pebble.Reader, ws [8]byte, term string, numer map[[16]byte]float64, idf, avgdl float64) error {
 	// Prefix scan for this term across all fields.
 	// Key format: 0x05 | ws[8] | term | 0x00 | field[1] | id[16]
 	lowerBound := keys.FTSPostingKey(ws, term, 0x00, [16]byte{})
@@ -836,12 +1005,12 @@ func (idx *Index) searchTokenCoverage(ws [8]byte, term string, numer map[[16]byt
 	sepPos := 1 + 8 + len(term)
 	upperBound[sepPos] = 0x01
 
-	iter, err := idx.db.NewIter(&pebble.IterOptions{
+	iter, err := r.NewIter(&pebble.IterOptions{
 		LowerBound: lowerBound,
 		UpperBound: upperBound,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("fts: scan postings: %w", err)
 	}
 	defer iter.Close()
 
@@ -881,6 +1050,12 @@ func (idx *Index) searchTokenCoverage(ws [8]byte, term string, numer map[[16]byt
 			continue
 		}
 		covRaw[engramID] += weighted
+	}
+	// An iterator that stopped on a read error looks exactly like one that ran
+	// out of postings. Check before crediting anything: a partial scan must not
+	// score as if it were the whole posting list.
+	if err := iter.Error(); err != nil {
+		return fmt.Errorf("fts: scan postings: %w", err)
 	}
 	for id, kp := range covKP {
 		if kp > covRaw[id] {
@@ -948,7 +1123,10 @@ func (idx *Index) BestKeyPoint(ws [8]byte, query string, keyPoints []string) str
 	if len(qTerms) == 0 {
 		return ""
 	}
-	stats := idx.readStats(ws)
+	stats, err := idx.readStats(idx.db, ws)
+	if err != nil {
+		return ""
+	}
 	N := float64(stats.TotalEngrams)
 	idfMax := math.Log((N+0.5)/0.5 + 1)
 	weights := make(map[string]float64, len(qTerms))
@@ -957,7 +1135,10 @@ func (idx *Index) BestKeyPoint(ws [8]byte, query string, keyPoints []string) str
 		if _, dup := weights[t]; dup {
 			continue
 		}
-		w := idx.getIDF(ws, t, N)
+		w, err := idx.getIDF(idx.db, ws, t, N)
+		if err != nil {
+			return ""
+		}
 		if w <= 0 {
 			w = idfMax
 		}
@@ -990,22 +1171,25 @@ func (idx *Index) BestKeyPoint(ws [8]byte, query string, keyPoints []string) str
 }
 
 // scoredIDLess reports whether a ranks BELOW b: lower score first, and on an
-// exact score tie the larger ID.
+// exact score tie the OLDER memory (rankorder.Before(b, a): b is newer).
 //
-// The tie-break is not cosmetic. Candidates are drained from a Go map, whose
-// iteration order is randomised per run, so without it two engrams with
-// identical coverage swapped places between identical queries — a
-// nondeterminism that reached the caller whenever a tie straddled the topK
-// cut. Ranking by ID on a tie is arbitrary but STABLE, which is the property
-// recall's downstream phases (and their tests) need.
+// The tie-break is load-bearing twice over. Search builds its input from a Go
+// map, and coverage is capped per term, so many documents routinely tie
+// exactly: ranking on score alone left tied documents in map-iteration order,
+// so which of them survived the topK cut — the recall candidate SET — changed
+// between identical calls. And this cut runs BEFORE recall's final sort, so its
+// direction must be the final sort's: newest-first (rankorder.Before: ULID
+// descending). An oldest-first cut here kept the oldest k of a set of identical
+// memories and the newest never became candidates at all (upstream #918).
 func scoredIDLess(a, b ScoredID) bool {
 	if a.Score != b.Score {
 		return a.Score < b.Score
 	}
-	return bytes.Compare(a.ID[:], b.ID[:]) > 0
+	return rankorder.Before(b.ID, a.ID)
 }
 
-// sortScoredIDs sorts strongest-first under scoredIDLess.
+// sortScoredIDs sorts strongest-first under scoredIDLess: descending score,
+// exact ties newest-first.
 //
 // This was an insertion sort until it was measured as THE cost of recall on a
 // large vault: it is O(n²) in the number of matched docs, and the caller sorts
@@ -1046,66 +1230,181 @@ func decodeStats(buf []byte) FTSStats {
 	}
 }
 
-func (idx *Index) readStats(ws [8]byte) FTSStats {
-	key := keys.FTSStatsKey(ws)
-	val, closer, err := idx.db.Get(key)
+// readStats returns the vault's corpus statistics. A vault with no statistics
+// record yet reads as one document of average length 100, the long-standing
+// placeholder for an empty index. Any other read failure is an error.
+func (idx *Index) readStats(r pebble.Reader, ws [8]byte) (FTSStats, error) {
+	val, closer, err := r.Get(keys.FTSStatsKey(ws))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return FTSStats{TotalEngrams: 1, AvgDocLen: 100}, nil
+	}
 	if err != nil {
-		return FTSStats{TotalEngrams: 1, AvgDocLen: 100}
+		return FTSStats{}, fmt.Errorf("fts: read corpus statistics: %w", err)
 	}
 	defer closer.Close()
-	return decodeStats(val)
+	return decodeStats(val), nil
 }
 
-func (idx *Index) getIDF(ws [8]byte, term string, N float64) float64 {
-	k := idfKey{ws, term}
-	idx.mu.RLock()
-	idf, ok := idx.idfCache[k]
-	idx.mu.RUnlock()
-	if ok {
-		return idf
+// getIDF returns term's IDF in the vault for a corpus of N documents, or 0 when
+// the vault has no document-frequency record for it. scoreAll reads 0 as "the
+// corpus has never counted this word" and charges it at idfMax.
+//
+// That is a statement about the RECORD, not about the word. A word can have
+// postings and no record: a memory whose first index never ran, later restored
+// or retagged, gets its postings from ReindexEngram with no frequency for the
+// words it already had. Such a word returns 0 here and matches nothing although
+// a document holds it. Nothing in this function can tell; the write path has to
+// stop producing that state.
+//
+// The IDF is computed on every call from the committed document frequency. It
+// used to be memoized per (vault, term), and that memo was the bug: an IDF is a
+// function of BOTH N and df, the memo was dropped only when a document holding
+// the term was indexed, and it was filled outside the lock from two unrelated
+// reads. So a value computed while a write was in flight outlived that write,
+// and a value computed in a small corpus was still served in a large one. The
+// memo saved one point read per query word, against a posting scan per word.
+//
+// N is clamped up to df. Every document counted in df is a document of the
+// corpus, so df > N means N is behind. That is never a torn read any more — a
+// search reads N and df from one snapshot, and IndexEngram commits both in one
+// batch — but it is still a state the index can be committed in: an in-place
+// edit of a memory whose first index has not run yet adds to a word's frequency
+// before the memory is counted. reportStatsBehind lists the causes and reports
+// the ones a pending index job does not explain. Unclamped, df = N+1 makes the logarithm negative
+// for a term every document holds, and a non-positive IDF is indistinguishable
+// from "never counted": the term's postings are not scanned and it is charged as
+// absent. With the clamp a term that has a record always has a positive, finite
+// IDF, non-increasing in df and non-decreasing in N
+// (TestGetIDF_PositiveFiniteAndMonotone).
+//
+// The clamp fixes the sign, not the size. With N one behind, a word nearly every
+// document holds has an IDF up to about 3x off and a query made of such words a
+// keyword score up to 0.25 off — 40 documents, two words held by 39 and 40 of
+// them: a document holding only the second scores 0.248 settled and 0.494 with N
+// one behind.
+//
+// Measured on the build that had the memo, from an empty data directory, 40
+// invented memories per vault written over MCP by one to four builders at once,
+// the first 8 sharing a tag: the tag word ended with no full-text match in 12 of
+// 820 vault builds and with a stale positive IDF in 3 more. The on-disk index
+// was complete in every one; the state lasted until a restart, a reindex, or
+// another write holding the word. Independently reproduced with a real writer
+// and a searcher that never pauses: 300 of 300 trials with the memo, 0 of 300
+// without.
+func (idx *Index) getIDF(r pebble.Reader, ws [8]byte, term string, N float64) (float64, error) {
+	rawDF, found, err := readDF(r, ws, term)
+	if err != nil || !found {
+		return 0, err
 	}
 
-	key := keys.TermStatsKey(ws, term)
-	val, closer, err := idx.db.Get(key)
-	if err != nil || len(val) < 8 {
-		return 0
+	df := float64(rawDF)
+	if N < df {
+		idx.reportStatsBehind(ws, rawDF, N)
+		N = df
 	}
-	defer closer.Close()
-
-	df := float64(binary.BigEndian.Uint32(val[0:4]))
-	idf = math.Log((N-df+0.5)/(df+0.5) + 1)
-
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	// Double-check: another goroutine may have populated the cache while we
-	// held no lock (between RUnlock above and this Lock).
-	if cached, ok := idx.idfCache[k]; ok {
-		return cached
-	}
-	idx.idfCache[k] = idf
-	return idf
+	return math.Log((N-df+0.5)/(df+0.5) + 1), nil
 }
 
-// UpdateStats increments the engram count and recalculates avgdl.
-// The read-modify-write on the Pebble stats key is protected by idx.mu to prevent
-// concurrent IndexEngram calls from producing a lost-update race.
-func (idx *Index) UpdateStats(ws [8]byte, docLen int) error {
-	key := keys.FTSStatsKey(ws)
+// reportStatsBehind records that a search found a word counted in more
+// documents than the vault's document count. A search reads both numbers from
+// one snapshot, so this is never a torn read: it is a state the index was
+// committed in. The search still answers, with N clamped (see getIDF); this is
+// what makes the state visible instead of merely survivable.
+//
+// It is NOT always a fault, and one cause is ordinary:
+//
+//   - A memory is edited in place before its first index has run. Write memory
+//     A tagged X and let it index; write memory B; retag B with X before the
+//     index worker reaches B's job. ReindexEngram adds one to df(X) for the tag
+//     entering B and does not touch N, and B's first index — which is what
+//     counts B in N — has not run: df(X) = 2, N = 1. It clears by itself when
+//     the job runs. It becomes permanent only if that job is dropped (queue
+//     full) or the process stops first.
+//
+// The durable causes:
+//
+//   - That same edit when the first index never does run.
+//   - A retag of a memory while `reindex-fts` is rebuilding its vault: the edit
+//     counts the new tag and the rebuild, reading the memory after the retag,
+//     counts it again.
+//   - A store last written by a build that committed the document count in a
+//     separate, unsynced write, and that stopped between the two writes.
+//   - Corruption.
+//
+// Telling them apart: ReindexEngram notes, per vault, when it last wrote
+// postings for a document that had none. An observation within
+// unindexedEditGrace of such an edit is counted as "expected" and not logged.
+// Anything else is counted as "unexplained" and logged once per vault per
+// statsBehindWarnInterval, in words that say what was seen and that a rebuild is
+// needed only if it keeps appearing. The note lives in this process, so after a
+// restart — when no index job can still be pending — the same state is reported
+// at once.
+//
+// The word itself is not logged: it is memory content.
+func (idx *Index) reportStatsBehind(ws [8]byte, df uint32, n float64) {
+	now := idx.now().UnixNano()
+	if v, ok := idx.unindexedEdit.Load(ws); ok {
+		if edited := v.(*atomic.Int64).Load(); now-edited < int64(unindexedEditGrace) {
+			metrics.FTSStatsInconsistent.WithLabelValues("expected").Inc()
+			return
+		}
+	}
+	metrics.FTSStatsInconsistent.WithLabelValues("unexplained").Inc()
 
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
+	v, _ := idx.statsBehindWarned.LoadOrStore(ws, new(atomic.Int64))
+	last := v.(*atomic.Int64)
+	prev := last.Load()
+	if prev != 0 && now-prev < int64(statsBehindWarnInterval) {
+		return
+	}
+	if !last.CompareAndSwap(prev, now) {
+		return // another search just logged it
+	}
+	slog.Warn("fts: a word is counted in more documents than the vault's document count; scores use a clamped count. An in-place edit of a memory whose keyword index has not been built yet causes this until its index job runs. If this keeps being logged, run `muninn vault reindex-fts <vault>`",
+		"vault_prefix", fmt.Sprintf("%x", ws), "document_frequency", df, "documents", uint64(n))
+}
 
-	val, closer, err := idx.db.Get(key)
+// noteUnindexedEdit records that ReindexEngram just wrote postings for a
+// document that had none (see reportStatsBehind).
+func (idx *Index) noteUnindexedEdit(ws [8]byte) {
+	v, _ := idx.unindexedEdit.LoadOrStore(ws, new(atomic.Int64))
+	v.(*atomic.Int64).Store(idx.now().UnixNano())
+}
+
+// statsWithDocument returns the vault's corpus statistics as they stand after
+// one more document of docLen tokens. Caller holds idx.mu: this is the read half
+// of a read-modify-write.
+func (idx *Index) statsWithDocument(ws [8]byte, docLen int) (FTSStats, error) {
+	// Not found means an empty index. A read that FAILED must not: carrying on
+	// would write a document count of 1 over the real one.
+	val, closer, err := idx.db.Get(keys.FTSStatsKey(ws))
 	var st FTSStats
-	if err == nil {
+	switch {
+	case err == nil:
 		st = decodeStats(val)
 		closer.Close()
+	case !errors.Is(err, pebble.ErrNotFound):
+		return FTSStats{}, fmt.Errorf("fts: read corpus statistics: %w", err)
 	}
 
 	// Rolling average of doc length
 	oldTotal := float64(st.TotalEngrams) * float64(st.AvgDocLen)
 	st.TotalEngrams++
 	st.AvgDocLen = float32((oldTotal + float64(docLen)) / float64(st.TotalEngrams))
+	return st, nil
+}
 
-	return idx.db.Set(key, encodeStats(st), pebble.NoSync)
+// UpdateStats counts one more document of docLen tokens in the vault's corpus
+// statistics, on its own. IndexEngram does not use it — it commits the same
+// update inside its posting batch — so this is for a caller adding to the count
+// without indexing through IndexEngram.
+func (idx *Index) UpdateStats(ws [8]byte, docLen int) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	st, err := idx.statsWithDocument(ws, docLen)
+	if err != nil {
+		return err
+	}
+	return idx.db.Set(keys.FTSStatsKey(ws), encodeStats(st), pebble.NoSync)
 }

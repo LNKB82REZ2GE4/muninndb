@@ -48,7 +48,34 @@ type PebbleStore struct {
 	gc            *wal.GroupCommitter
 	noSyncEngrams bool
 	vaultCounters sync.Map // [8]byte -> *vaultCounter
-	vaultGates    sync.Map // [8]byte -> *sync.RWMutex; see vaultClearGate
+	countLocks    sync.Map // [8]byte -> *sync.RWMutex (vault_count.go)
+	// recountedAtOpen records whether this store recounted every vault when it
+	// opened (no valid clean-shutdown marker). For tests and logs.
+	recountedAtOpen bool
+	// TEST-ONLY seams for the vault count model (vault_count_model_test.go).
+	// Production never sets them.
+	deleteBeforeCountForTest    func()
+	writeBeforeCommitForTest    func()
+	closeAfterFinalSweepForTest func()
+	// readOnly is set at open when the database refuses writes (a read-only
+	// open of a backup). No marker is read or written, and when the saved
+	// counts are not known to be clean every count is seeded by a scan.
+	readOnly bool
+	// countKeysUntrusted means every count is seeded from a scan, never from
+	// the saved key, for the rest of the process: set at a read-only open
+	// without a valid marker, and by ResetAllVaultCounts at promotion. In
+	// that mode a foreign commit also drops the counter of every vault it
+	// touches (vault_count.go).
+	countKeysUntrusted atomic.Bool
+	// foreignCommits is set, for the rest of the process, the first time a
+	// batch committed to this DB past the store's write path is reported to
+	// the store (InvalidateCommittedRepr, NoteCommittedRepr,
+	// InvalidateAllCaches: a cluster follower's applier). Those records moved
+	// without moving any count, so Close writes no clean-shutdown marker and
+	// the next start recounts (STO-30).
+	foreignCommits                atomic.Bool
+	clearBeforeRangeDeleteForTest func()
+	clearAfterRangeDeleteForTest  func()
 	// contradictsGen counts RelContradicts association writes per vault, so the
 	// COG-29 debt readout can cache the expensive declared-edge scan and know
 	// when it is stale. See contradicts_gen.go for why this lives in the store.
@@ -114,6 +141,15 @@ type PebbleStore struct {
 	// conflict with each other — so the hot path pays an uncontended RLock and
 	// only the rare `none` write excludes.
 	declaredContradictionLocks stripedRWMutex
+	// assocGuardLocks makes the STO-15 RelType-collision check and the write
+	// that follows it one step, per (vault, src, dst) pair. Without it two
+	// writers of different RelTypes on the same key both pass the check and
+	// the later commit silently replaces the earlier edge. Lock order: INNER
+	// to casLocks (a batch commit holds its engram stripes first). While it
+	// is held only leaf locks are taken — Pebble, the replication log, the
+	// fill guard, the retired set and the caches — none of which re-enters an
+	// association write.
+	assocGuardLocks stripedMutex
 	// archiveBloom is an in-memory Bloom filter over src engram IDs that have
 	// archived associations in the 0x25 namespace. Gates the 0x25 prefix scan
 	// during BFS traversal: if the filter says "no," skip the scan entirely.
@@ -161,6 +197,16 @@ type PebbleStore struct {
 	// the unix-nano stamp of the last WARN, used to rate-limit it.
 	guardReadFaults        atomic.Uint64
 	guardReadFaultLoggedAt atomic.Int64
+
+	// retired is the per-vault in-memory retired-engram set ([8]byte →
+	// *retiredSet), derived from the store and driven by every committed
+	// batch through replicateBatch. See retired.go.
+	retired sync.Map
+	// retiredDisagreements counts engrams whose 0x02 metadata disagreed with
+	// their 0x01 record on liveness at a retired-set build (0x01 trusted);
+	// retiredDisagreeWarned holds the vaults already WARNed about. STO-23.
+	retiredDisagreements  atomic.Int64
+	retiredDisagreeWarned sync.Map
 }
 
 // pointGet is the single-key read used by the metadata helpers that must tell
@@ -272,18 +318,16 @@ type recentActiveCacheEntry struct {
 type vaultCounter struct {
 	once  sync.Once
 	count atomic.Int64
+	ready atomic.Bool // set once the seed has finished; the sweep saves only ready counters
 }
 
 // getOrInitCounter returns the vault counter, initializing it from Pebble on first access.
 //
-// EVERY caller passes through once.Do, including the one that finds the
-// counter already in the map. The fast path used to return a Load hit
-// directly, so a caller could receive a counter another goroutine was still
-// seeding: a writer then committed while the seed scan ran (the scan counted
-// it and so did its Add — high) or Added before the seed's Store overwrote it
-// (low). Reachable on every first touch of a vault, and on every reseed after
-// ClearVault. once.Do on a completed Once is a single atomic load. Pinned by
-// TestClearVault_WritesRacingSameVaultClearKeepCounterExact.
+// Every caller waits for the initialization, including one that finds the
+// counter already in the map. The fast path used to return it straight away,
+// so a second writer could commit while the first writer's seed scan was still
+// running: the scan counted that engram and the writer's own Add counted it
+// again.
 func (ps *PebbleStore) getOrInitCounter(ctx context.Context, wsPrefix [8]byte) *vaultCounter {
 	var loaded *vaultCounter
 	if v, ok := ps.vaultCounters.Load(wsPrefix); ok {
@@ -296,52 +340,21 @@ func (ps *PebbleStore) getOrInitCounter(ctx context.Context, wsPrefix [8]byte) *
 		// Try to read persisted count from Pebble
 		countKey := keys.VaultCountKey(wsPrefix)
 		val, err := Get(ps.db, countKey)
-		if err == nil && len(val) == 8 {
+		if err == nil && len(val) == 8 && !ps.countKeysUntrusted.Load() {
 			n := int64(binary.BigEndian.Uint64(val))
 			loaded.count.Store(n)
 			return
 		}
-		// Fall back to per-vault scan (one-time cost on first startup)
+		// No persisted count: scan. The result is NOT written back. Seeding
+		// runs before the commit it counts (holdCounts), so persisting
+		// here saved the count from before that write, and a crash before the
+		// next sweep left it trusted forever. The key is written only by the
+		// coalescer from post-commit counts. Until then a restart scans again.
 		n, _ := ps.countEngramsForVault(ctx, wsPrefix)
 		loaded.count.Store(n)
-		// The seed deliberately persists NOTHING. Write paths seed BEFORE their
-		// commit (G9), so n excludes the write in flight. A durable Set of n
-		// here would land ahead of that write's increment, and a crash before
-		// the increment reached disk would leave a short count that no later
-		// start rescans; queueing n on the coalescer instead lets that stale
-		// value overwrite a later direct Set (DeleteEngram, MergeVaultData)
-		// at the next flush. The first mutation persists the counter through
-		// its own path; until then the key stays absent and a restart simply
-		// rescans, which is the truth.
 	})
+	loaded.ready.Store(true)
 	return loaded
-}
-
-// persistCounterNow durably writes n as vault ws's count on behalf of a path
-// that cannot wait for the coalescer (DeleteEngram, MergeVaultData). Two rules
-// it exists to enforce:
-//
-//   - n is written only if vc is still the live counter for ws. ClearVault
-//     evicts the counter and point-deletes the key; a mutation that loaded vc
-//     before the clear must not write its pre-clear count back afterwards.
-//   - n is also queued on the coalescer, replacing whatever value a recent
-//     write had queued. Without that, the next flush overwrites this direct Set
-//     with the older queued count (a write of 3 then a delete persisted 3, not 2).
-//
-// Reports whether it wrote.
-func (ps *PebbleStore) persistCounterNow(ws [8]byte, vc *vaultCounter, n int64, opt *pebble.WriteOptions) (bool, error) {
-	if current, ok := ps.vaultCounters.Load(ws); !ok || current.(*vaultCounter) != vc {
-		return false, nil
-	}
-	if ps.counterFlush != nil {
-		ps.counterFlush.Submit(ws, n)
-	}
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, uint64(n))
-	if err := ps.db.Set(keys.VaultCountKey(ws), buf, opt); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 // countEngramsForVault scans the 0x01 prefix for a single vault.
@@ -398,7 +411,9 @@ func NewPebbleStore(db *pebble.DB, cfg PebbleStoreConfig) *PebbleStore {
 		revAssocCache:    revAssocCache,
 	}
 	ps.walSync = newWALSyncer(db)
-	ps.counterFlush = newCounterCoalescer(db)
+	// Before the coalescer starts and before anything reads a count.
+	ps.recountedAtOpen = ps.reconcileCountsAtOpen()
+	ps.counterFlush = newCounterCoalescer(db, ps.liveVaultCount)
 	ps.provWork = newProvenanceWorker(prov)
 	ps.transCache = NewTransitionCache(ps)
 	ps.archiveBloom = ps.RebuildArchiveBloom()
@@ -452,6 +467,10 @@ func (ps *PebbleStore) VaultPrefix(vault string) [8]byte {
 // WriteEngram atomically writes the full engram record and metadata-only copy in a single Pebble batch.
 // Also writes association forward/reverse keys and secondary index entries.
 func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *Engram) (ULID, error) {
+	// The vault's count lock, shared, from before the commit until the count
+	// is updated, and before any other lock (vault_count.go).
+	hold := ps.holdCounts(ctx, wsPrefix)
+	defer hold.release()
 	if eng.ID == (ULID{}) {
 		if !eng.CreatedAt.IsZero() {
 			eng.ID = NewULIDWithTime(eng.CreatedAt)
@@ -565,19 +584,11 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 	if ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
-	// Vault counter: load it, and on a first touch seed it, BEFORE the commit.
-	// The seed scans the vault's 0x01 keys; run after the commit, that scan
-	// already contains this engram and the Add below counts it a second time
-	// (G9: a fresh vault's first write reported 2). Seeded here, the scan
-	// excludes it and the Add is its only count.
-	//
-	// Held against a concurrent ClearVault of this vault from here through the
-	// provenance Submit (vaultClearGate; STO-6a).
-	defer ps.holdVaultsAgainstClear(wsPrefix)()
-	vc := ps.getOrInitCounter(ctx, wsPrefix)
-
+	if h := ps.writeBeforeCommitForTest; h != nil {
+		h()
+	}
 	releaseMark := ps.holdDeclaredContradictionMark(wsPrefix, markedContradiction)
-	commitErr := batch.Commit(syncOption)
+	commitErr := ps.commitBatch(batch, syncOption)
 	releaseMark()
 	if commitErr != nil {
 		return ULID{}, fmt.Errorf("commit batch: %w", commitErr)
@@ -590,17 +601,8 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 
 	// NOTE: Intentionally NOT caching on write to avoid flooding L1 cache.
 
-	// Vault counter: in-memory atomic; coalescer persists every 100ms.
-	// vc was loaded (and seeded, on first touch) before the commit above.
-	newCount := vc.count.Add(1)
-	// Only submit if vc is still the current counter for this vault.
-	// ClearVault may have evicted the counter between Add and Submit; in that
-	// case submitting would re-seed the coalescer with a stale count.
-	if ps.counterFlush != nil {
-		if current, ok := ps.vaultCounters.Load(wsPrefix); ok && current.(*vaultCounter) == vc {
-			ps.counterFlush.Submit(wsPrefix, newCount)
-		}
-	}
+	// Vault counter: held since entry (vault_count.go), saved by the sweep.
+	hold.add(wsPrefix, 1)
 
 	// WAL MOL entry (async, non-blocking).
 	if ps.gc != nil {
@@ -620,6 +622,7 @@ func (ps *PebbleStore) WriteEngram(ctx context.Context, wsPrefix [8]byte, eng *E
 			Source:    provenance.SourceHuman,
 			AgentID:   eng.CreatedBy,
 			Operation: "create",
+			Details:   stampWriterIdentity(ctx, nil),
 		})
 	}
 
@@ -644,6 +647,14 @@ type EngramBatchItem struct {
 // Returns a slice of (ULID, error) per item. If the batch commit itself fails,
 // all items receive the commit error.
 func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatchItem) ([]ULID, []error) {
+	// Count locks of every vault in the batch, shared, before any other lock
+	// and before the commit (vault_count.go).
+	batchWS := make([][8]byte, 0, len(items))
+	for i := range items {
+		batchWS = append(batchWS, items[i].WSPrefix)
+	}
+	hold := ps.holdCounts(ctx, batchWS...)
+	defer hold.release()
 	// Vaults with a RelContradicts edge queued in this batch. The generation is
 	// bumped only AFTER the commit — see noteContradictsWrite.
 	contradictsQueued := map[[8]byte]struct{}{}
@@ -906,29 +917,8 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 	if ps.noSyncEngrams {
 		syncOption = pebble.NoSync
 	}
-	// Seed every touched vault's counter BEFORE the commit (G9) — see the
-	// matching comment in WriteEngram. Seeded after it, the first batch a
-	// fresh vault ever received was counted twice: 50 written, 100 reported.
-	//
-	// Every touched vault is held against a concurrent ClearVault through the
-	// post-commit counter Adds and provenance Submits (vaultClearGate; STO-6a).
-	gated := make([][8]byte, 0, len(items))
-	for i := range items {
-		if errs[i] == nil {
-			gated = append(gated, items[i].WSPrefix)
-		}
-	}
-	if len(gated) > 0 {
-		defer ps.holdVaultsAgainstClear(gated...)()
-	}
-	for i := range items {
-		if errs[i] == nil {
-			ps.getOrInitCounter(ctx, items[i].WSPrefix)
-		}
-	}
-
 	releaseMarks := ps.holdDeclaredContradictionMarks(markedContradictionWS)
-	commitErr := batch.Commit(syncOption)
+	commitErr := ps.commitBatch(batch, syncOption)
 	releaseMarks()
 	if commitErr != nil {
 		for i := range errs {
@@ -952,13 +942,7 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 		eng := items[i].Engram
 		ws := items[i].WSPrefix
 
-		vc := ps.getOrInitCounter(ctx, ws)
-		newCount := vc.count.Add(1)
-		if ps.counterFlush != nil {
-			if current, ok := ps.vaultCounters.Load(ws); ok && current.(*vaultCounter) == vc {
-				ps.counterFlush.Submit(ws, newCount)
-			}
-		}
+		hold.add(ws, 1)
 
 		if ps.gc != nil {
 			idBytes := [16]byte(eng.ID)
@@ -976,6 +960,7 @@ func (ps *PebbleStore) WriteEngramBatch(ctx context.Context, items []EngramBatch
 				Source:    provenance.SourceHuman,
 				AgentID:   eng.CreatedBy,
 				Operation: "create",
+				Details:   stampWriterIdentity(ctx, nil),
 			})
 		}
 	}
@@ -1091,7 +1076,7 @@ func (ps *PebbleStore) ClearFTSKeys(ws, wsPlus [8]byte) error {
 			return fmt.Errorf("storage: clear FTS keys 0x%02X: %w", p, err)
 		}
 	}
-	if err := batch.Commit(pebble.Sync); err != nil {
+	if err := ps.commitBatch(batch, pebble.Sync); err != nil {
 		batch.Close()
 		return fmt.Errorf("storage: commit FTS clear batch: %w", err)
 	}
@@ -1142,6 +1127,17 @@ func (ps *PebbleStore) Close() error {
 		}
 		if ps.counterFlush != nil {
 			ps.counterFlush.Close()
+			if h := ps.closeAfterFinalSweepForTest; h != nil {
+				h()
+			}
+			// Only when the final sweep saved every change: a count that moved
+			// after it (a write still running at shutdown) leaves no marker,
+			// and the next start recounts. Never after a foreign commit: the
+			// saved counts are this process's counts, and records it applied
+			// from elsewhere never moved them.
+			if !ps.readOnly && !ps.foreignCommits.Load() && ps.counterFlush.clean() {
+				ps.writeCleanShutdownMarker()
+			}
 		}
 		if ps.provWork != nil {
 			ps.provWork.Close()

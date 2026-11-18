@@ -117,11 +117,29 @@ func (ps *PebbleStore) WriteAssociation(ctx context.Context, wsPrefix [8]byte, s
 		return err
 	}
 	// #771: refuse rather than silently replace a different RelType edge
-	// collision at the same (src, weight, dst) key.
+	// collision at the same (src, weight, dst) key. The check and the write
+	// are held together by the pair's guard lock (STO-15): two concurrent
+	// writers of different RelTypes — the novelty worker's automatic `refines`
+	// and a caller's declared `supersedes` on the same pair — used to both
+	// pass the check, and the later commit erased the earlier edge.
+	mu := ps.assocGuardLocks.For(assocPairLockKey(wsPrefix, src, dst))
+	mu.Lock()
+	defer mu.Unlock()
 	if err := checkRelTypeCollision(ps.db, wsPrefix, [16]byte(src), assoc.Weight, [16]byte(dst), assoc.RelType); err != nil {
 		return err
 	}
 	return ps.writeAssociationUnguarded(ctx, wsPrefix, src, dst, assoc)
+}
+
+// assocPairLockKey is the assocGuardLocks key for one (vault, src, dst) pair.
+// It ignores weight on purpose: the stripe only has to cover the exact
+// (src, weight, dst) key, and one key per pair keeps the locking simple.
+func assocPairLockKey(ws [8]byte, src, dst ULID) []byte {
+	k := make([]byte, 0, 40)
+	k = append(k, ws[:]...)
+	k = append(k, src[:]...)
+	k = append(k, dst[:]...)
+	return k
 }
 
 // writeAssociationUnguarded is WriteAssociation's body without the STO-12
@@ -152,7 +170,7 @@ func (ps *PebbleStore) writeAssociationUnguarded(ctx context.Context, wsPrefix [
 	release := ps.holdDeclaredContradictionMark(wsPrefix,
 		MarkDeclaredContradictionInBatch(batch, wsPrefix, assoc.RelType))
 
-	err := batch.Commit(pebble.NoSync)
+	err := ps.commitBatch(batch, pebble.NoSync)
 	release()
 	if err != nil {
 		return fmt.Errorf("commit batch: %w", err)
@@ -218,6 +236,7 @@ func (ps *PebbleStore) GetAssociations(ctx context.Context, wsPrefix [8]byte, id
 	// Phase 3: open ONE iterator covering the entire 0x03|wsPrefix range (snapshot-aware).
 	lower := keys.AssocFwdRangeStart(wsPrefix)
 	upper := keys.AssocFwdRangeEnd(wsPrefix) // nil means unbounded (all-0xFF workspace)
+	tok := ps.readFillToken(ctx)             // before NewIter (cache_guard.go R1)
 	rawIter, err := ps.pebbleReader(ctx).NewIter(&pebble.IterOptions{
 		LowerBound: lower,
 		UpperBound: upper,
@@ -287,7 +306,7 @@ func (ps *PebbleStore) GetAssociations(ctx context.Context, wsPrefix [8]byte, id
 			return nil, fmt.Errorf("assoc scan: %w", err)
 		}
 
-		ps.assocCache.Add(assocCacheKey(wsPrefix, id), &assocCacheEntry{assocs: assocs, truncated: truncated})
+		ps.fillAssoc(wsPrefix, id, &assocCacheEntry{assocs: assocs, truncated: truncated}, tok)
 		// COPY (#820). `assocs` is now the cache entry's backing array; the hit
 		// path above copies for the same reason, and this function's own doc
 		// comment promises it. Returning `assocs` published a live view of the
@@ -422,6 +441,7 @@ func (ps *PebbleStore) rankingReverseEdges(ctx context.Context, wsPrefix [8]byte
 		return bytes.Compare(sorted[i][:], sorted[j][:]) < 0
 	})
 
+	tok := ps.readFillToken(ctx) // before NewIter (cache_guard.go R1)
 	iter, err := ps.pebbleReader(ctx).NewIter(&pebble.IterOptions{
 		LowerBound: keys.AssocRevRangeStart(wsPrefix),
 		UpperBound: keys.AssocRevRangeEnd(wsPrefix),
@@ -484,7 +504,7 @@ func (ps *PebbleStore) rankingReverseEdges(ctx context.Context, wsPrefix [8]byte
 		if err := iter.Error(); err != nil {
 			return nil, fmt.Errorf("ranking reverse scan: %w", err)
 		}
-		ps.revAssocCache.Add(assocCacheKey(wsPrefix, id), &revAssocCacheEntry{assocs: assocs, truncated: truncated})
+		ps.fillRevAssoc(wsPrefix, id, &revAssocCacheEntry{assocs: assocs, truncated: truncated}, tok)
 		n := len(assocs)
 		if maxPerNode > 0 && n > maxPerNode {
 			n = maxPerNode
@@ -600,6 +620,7 @@ func (ps *PebbleStore) associationsForOne(wsPrefix [8]byte, id ULID, maxPerNode 
 	prefix := keys.AssocFwdKey(wsPrefix, [16]byte(id), 1.0, [16]byte{})
 	prefix = prefix[0 : 1+8+16] // trim to just the prefix portion
 
+	tok := ps.cache.guard.token() // live read: before the iterator (cache_guard.go R1)
 	rawIter, err := PrefixIterator(ps.db, prefix)
 	if err != nil {
 		return nil, fmt.Errorf("prefix iterator: %w", err)
@@ -648,7 +669,7 @@ func (ps *PebbleStore) associationsForOne(wsPrefix [8]byte, id ULID, maxPerNode 
 		return nil, fmt.Errorf("associationsForOne scan: %w", err)
 	}
 	// Populate cache — expirable.LRU enforces the TTL automatically.
-	ps.assocCache.Add(ck, &assocCacheEntry{assocs: assocs, truncated: truncated})
+	ps.fillAssoc(wsPrefix, id, &assocCacheEntry{assocs: assocs, truncated: truncated}, tok)
 	return assocs, nil
 }
 
@@ -799,10 +820,19 @@ func assocMonotonicAnchor(stored, incoming int32) int32 {
 // Unlike the batch form there is no per-pair skip channel to report through:
 // one call, one pair, so a dead endpoint is simply the call's error, and both
 // callers already log-and-continue on one.
+//
+// STO-15: moving an edge to a new weight is a write at a new key, and the key
+// does not carry the relation. A move onto a key another relation holds is
+// refused with ErrAssocRelTypeCollision and the edge keeps its weight. The
+// check and the commit are held together by the pair's guard lock, as in
+// WriteAssociation.
 func (ps *PebbleStore) UpdateAssocWeight(ctx context.Context, wsPrefix [8]byte, a, b ULID, weight float32, countDelta uint32) error {
 	if err := ps.checkEndpointsLive(wsPrefix, [16]byte(a), [16]byte(b)); err != nil {
 		return err
 	}
+	mu := ps.assocGuardLocks.For(assocPairLockKey(wsPrefix, a, b))
+	mu.Lock()
+	defer mu.Unlock()
 
 	batch := ps.db.NewBatch()
 	defer batch.Close()
@@ -820,6 +850,10 @@ func (ps *PebbleStore) UpdateAssocWeight(ctx context.Context, wsPrefix [8]byte, 
 	if err != nil {
 		return fmt.Errorf("update assoc weight: %w", err)
 	}
+	if err := checkRelTypeCollision(ps.db, wsPrefix, [16]byte(a), weight, [16]byte(b), relType); err != nil {
+		return fmt.Errorf("update assoc weight: %w", err)
+	}
+	testAssocGuardPoint("weight-update", wsPrefix, a, b)
 
 	if oldWeight > 0 {
 		batch.Delete(keys.AssocFwdKey(wsPrefix, [16]byte(a), oldWeight, [16]byte(b)), nil)
@@ -877,7 +911,7 @@ func (ps *PebbleStore) UpdateAssocWeight(ctx context.Context, wsPrefix [8]byte, 
 	binary.BigEndian.PutUint32(wiBuf[:], math.Float32bits(weight))
 	batch.Set(keys.AssocWeightIndexKey(wsPrefix, [16]byte(a), [16]byte(b)), wiBuf[:], nil)
 
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
 	ps.replicateBatch(batch)
@@ -889,7 +923,9 @@ func (ps *PebbleStore) UpdateAssocWeight(ctx context.Context, wsPrefix [8]byte, 
 
 // AssocBatchSkipError reports that UpdateAssocWeightBatch committed every
 // update whose existing metadata it could read, and SKIPPED the ones it could
-// not. It is returned alongside a successful commit — the batch that landed is
+// not, the ones with a dead endpoint, and the ones whose move would land on a
+// key another relation holds (STO-15, see CollisionSkips). It is returned
+// alongside a successful commit — the batch that landed is
 // durable — so a caller must treat it as "partially applied", not "failed".
 //
 // Skipped holds indices into the updates slice passed to the call, ascending.
@@ -931,6 +967,21 @@ func (e *AssocBatchSkipError) Error() string {
 // Pebble failure.
 func (e *AssocBatchSkipError) Unwrap() []error { return e.Errs }
 
+// CollisionSkips returns the indices of the updates skipped because the key
+// the edge would move to holds another relation (ErrAssocRelTypeCollision,
+// STO-15). Such an edge keeps the weight it has: the skip is the guard doing
+// its job, not a fault, and a caller that counts faults leaves these out.
+// Declared as a method for the same reason as SkippedUpdates.
+func (e *AssocBatchSkipError) CollisionSkips() []int {
+	var out []int
+	for i, err := range e.Errs {
+		if i < len(e.Skipped) && errors.Is(err, ErrAssocRelTypeCollision) {
+			out = append(out, e.Skipped[i])
+		}
+	}
+	return out
+}
+
 // UpdateAssocWeightBatch updates multiple association weights in a single Pebble
 // batch. Every update whose existing metadata could be read is committed
 // atomically — the batch is all-or-nothing about what it WRITES, so no pair is
@@ -964,7 +1015,31 @@ func (e *AssocBatchSkipError) Unwrap() []error { return e.Errs }
 // silently-wrong class one layer up, so a partial application returns
 // *AssocBatchSkipError naming each skipped pair and its cause, with the indices
 // the caller needs to know which of its updates did not land.
+//
+// # A move onto another relation's key is skipped too (STO-15)
+//
+// The weight is in the key and the relation is not, so moving an edge to a
+// weight another relation of the same pair sits at used to Set over that
+// relation and erase it. The Hebbian worker reached this with ordinary calls:
+// a relates_to edge climbing to 1.0 erased a supersedes edge declared at 1.0
+// on the same directed pair, the target looked free, and a rival was linked.
+// Such an update is skipped with ErrAssocRelTypeCollision as its cause
+// (AssocBatchSkipError.CollisionSkips) and the edge keeps its weight.
+//
+// Every pair in the batch has its guard lock held from the reads through the
+// commit, as WriteAssociation and a batch commit hold theirs, so a Link cannot
+// land on the destination between the check and the write, and a decay chunk
+// cannot commit inside this read-to-commit window (nor this one inside
+// decay's). Edges this batch itself moves are not visible to the check: the
+// in-tree callers send at most one update per pair.
 func (ps *PebbleStore) UpdateAssocWeightBatch(ctx context.Context, updates []AssocWeightUpdate) error {
+	lockKeys := make([][]byte, 0, len(updates))
+	for _, u := range updates {
+		lockKeys = append(lockKeys, assocPairLockKey(u.WS, ULID(u.Src), ULID(u.Dst)))
+	}
+	unlock := ps.assocGuardLocks.lockMany(lockKeys)
+	defer unlock()
+
 	batch := ps.db.NewBatch()
 	defer batch.Close()
 
@@ -1013,6 +1088,13 @@ func (ps *PebbleStore) UpdateAssocWeightBatch(ctx context.Context, updates []Ass
 				ULID(update.Src).String(), ULID(update.Dst).String(), err))
 			continue
 		}
+		if err := checkRelTypeCollision(ps.db, update.WS, update.Src, update.Weight, update.Dst, relType); err != nil {
+			skipped = append(skipped, i)
+			skipErrs = append(skipErrs, fmt.Errorf("pair %s->%s: %w",
+				ULID(update.Src).String(), ULID(update.Dst).String(), err))
+			continue
+		}
+		testAssocGuardPoint("weight-update", update.WS, ULID(update.Src), ULID(update.Dst))
 		applied++
 
 		// The decay anchor is monotonic: a late-arriving or remotely-produced
@@ -1068,7 +1150,7 @@ func (ps *PebbleStore) UpdateAssocWeightBatch(ctx context.Context, updates []Ass
 		batch.Set(keys.AssocWeightIndexKey(update.WS, update.Src, update.Dst), wiBuf[:], nil)
 	}
 
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 		return fmt.Errorf("commit batch: %w", err)
 	}
 	ps.replicateBatch(batch)
@@ -1126,6 +1208,116 @@ const assocDecayChunkSize = 10_000
 // <= epsilon after both 1,329 and 39,876 skipped passes.
 const assocDecayWriteEpsilon = 0.001
 
+// decayPreCommitHook is a TEST-ONLY seam, nil in production. It fires once
+// per decay chunk, after the chunk's moves are re-checked under the pairs'
+// guard locks and before the commit, so a test can land a concurrent Link in
+// exactly that window (the assocWeightRepairPreFlushHook precedent).
+var decayPreCommitHook func()
+
+// decayPreLockHook is a TEST-ONLY seam, nil in production. It fires once per
+// decay chunk, after the scan collected the chunk from its snapshot and before
+// the pairs' guard locks are taken, so a test can change an edge the scan has
+// already read (the window the re-check exists for).
+var decayPreLockHook func()
+
+// decayEntry is one edge a decay pass moves, archives, deletes or re-stamps.
+type decayEntry struct {
+	src     [16]byte
+	dst     [16]byte
+	oldW    float32
+	newW    float32
+	remove  bool
+	archive bool
+	// Preserved from existing Pebble value:
+	relType           RelType
+	confidence        float32
+	createdAt         time.Time
+	lastActivated     int32
+	peakWeight        float32 // historical max Weight
+	coActivationCount uint32
+}
+
+// recheckDecayMovesLocked repeats, against committed state, the checks a decay
+// chunk's writes depend on, and returns the entries that may still be written.
+// The caller holds the STO-15 guard lock of every pair in the chunk and keeps
+// it through the commit.
+//
+// What the re-check covers is a change COMMITTED between the scan's snapshot
+// and these locks. What the held locks cover is a change committed between
+// this re-check and the chunk's commit, and only from a writer that takes the
+// pair's guard lock: WriteAssociation (every Link), a batch commit's guarded
+// edges, the weight update (the Hebbian worker and dream inference) and both
+// archive restores. Writers that take no pair lock can still commit in that
+// window, and decay then writes over them: the hard-delete cascade (a deleted
+// memory's edge written back) and the associations an engram write carries
+// inline. Both were open on develop before this guard existed, for the whole
+// pass rather than one chunk.
+//
+//   - The edge must still be at the key the scan read, with the same relation.
+//     The scan reads a snapshot, so a Link, a weight update or a delete since
+//     then would otherwise be overwritten by a stale value, or a deleted edge
+//     written back.
+//   - An archive must not replace another relation's archive row (the 0x25 key
+//     is (src, dst), with no relation in it). That edge is clamped to its floor
+//     instead, or left alone if the floor is not below its weight.
+//   - A move must not land on a key holding another relation, committed or
+//     written earlier in this chunk. The edge stays at its weight; the next
+//     pass tries again.
+func (ps *PebbleStore) recheckDecayMovesLocked(ws [8]byte, chunk []decayEntry) []decayEntry {
+	pendingFwd := map[string]RelType{}
+	pendingArch := map[string]RelType{}
+	relAt := func(key []byte, pending map[string]RelType) (RelType, bool) {
+		if rel, ok := pending[string(key)]; ok {
+			return rel, true
+		}
+		v, err := Get(ps.db, key)
+		if err != nil || v == nil {
+			return 0, false
+		}
+		rel, _, _, _, _, _, _ := decodeAssocValue(v)
+		return rel, true
+	}
+	kept := chunk[:0]
+	for _, e := range chunk {
+		if rel, ok := relAt(keys.AssocFwdKey(ws, e.src, e.oldW, e.dst), nil); !ok || rel != e.relType {
+			continue
+		}
+		if e.archive {
+			blocked := false
+			for _, k := range [][]byte{keys.ArchiveAssocKey(ws, e.src, e.dst), keys.ArchiveAssocKey(ws, e.dst, e.src)} {
+				if rel, ok := relAt(k, pendingArch); ok && rel != e.relType {
+					blocked = true
+				}
+				if !e.relType.IsSymmetric() {
+					break // only a symmetric edge writes the mirrored row
+				}
+			}
+			if blocked {
+				e.archive = false
+				e.newW = e.peakWeight * 0.05
+				if e.newW >= e.oldW {
+					continue
+				}
+			}
+		}
+		if !e.archive && !e.remove && e.newW != e.oldW {
+			dest := keys.AssocFwdKey(ws, e.src, e.newW, e.dst)
+			if rel, ok := relAt(dest, pendingFwd); ok && rel != e.relType {
+				continue
+			}
+			pendingFwd[string(dest)] = e.relType
+		}
+		if e.archive {
+			pendingArch[string(keys.ArchiveAssocKey(ws, e.src, e.dst))] = e.relType
+			if e.relType.IsSymmetric() {
+				pendingArch[string(keys.ArchiveAssocKey(ws, e.dst, e.src))] = e.relType
+			}
+		}
+		kept = append(kept, e)
+	}
+	return kept
+}
+
 // DecayAssocWeights applies time-normalized decay to every association under
 // wsPrefix. Returns count of deleted entries.
 //
@@ -1157,6 +1349,25 @@ const assocDecayWriteEpsilon = 0.001
 // exceeds archiveThreshold, the edge is moved to the 0x25 archive namespace
 // instead of being clamped.
 //
+// Two edges are never touched, whatever their weights:
+//
+//   - A SUPERSEDES edge. It is a declaration, not a co-activation, and the fork
+//     guard, Link and every inline supersedes read it to know its target is
+//     taken. Relocating, archiving or deleting it made the retired memory look
+//     free: a rival was linked, and a recall's lazy restore then gave the
+//     memory a second successor for good.
+//   - An edge whose move would land on a key another relation holds. A
+//     relation's weight is in the key and its type is not, so two relations on
+//     one pair that decay to one weight (equal peaks share a floor) meet at one
+//     key, and the Set used to erase one of them. The edge stays at the weight
+//     it has (STO-15), and an archive row of another relation is never
+//     replaced either: that edge is clamped to its floor instead.
+//
+// Each chunk's moves are re-checked against committed state under the pairs'
+// STO-15 guard locks, held through the commit, so a concurrent Link cannot land
+// on a destination between the check and the write. An edge that moved or went
+// since the scan's snapshot is left to the next pass.
+//
 // Processes in chunks of assocDecayChunkSize to bound memory usage.
 // The Pebble iterator sees a consistent snapshot (created before any mutations),
 // so chunked commits are safe: each original key is visited exactly once.
@@ -1181,32 +1392,32 @@ func (ps *PebbleStore) DecayAssocWeights(ctx context.Context, wsPrefix [8]byte, 
 	}
 	defer iter.Close()
 
-	type assocEntry struct {
-		src     [16]byte
-		dst     [16]byte
-		oldW    float32
-		newW    float32
-		remove  bool
-		archive bool
-		// Preserved from existing Pebble value:
-		relType           RelType
-		confidence        float32
-		createdAt         time.Time
-		lastActivated     int32
-		peakWeight        float32 // historical max Weight
-		coActivationCount uint32
-	}
-
 	removed := 0
-	chunk := make([]assocEntry, 0, assocDecayChunkSize)
+	chunk := make([]decayEntry, 0, assocDecayChunkSize)
 
 	flushChunk := func() error {
 		if len(chunk) == 0 {
 			return nil
 		}
+		if decayPreLockHook != nil {
+			decayPreLockHook()
+		}
+		lockKeys := make([][]byte, 0, len(chunk))
+		for _, e := range chunk {
+			lockKeys = append(lockKeys, assocPairLockKey(wsPrefix, ULID(e.src), ULID(e.dst)))
+		}
+		unlock := ps.assocGuardLocks.lockMany(lockKeys)
+		defer unlock()
+		chunk = ps.recheckDecayMovesLocked(wsPrefix, chunk)
+		if decayPreCommitHook != nil {
+			decayPreCommitHook()
+		}
 		batch := ps.db.NewBatch()
 		defer batch.Close()
 		for _, e := range chunk {
+			if e.remove {
+				removed++
+			}
 			// e.oldW is decoded from the scanned KEY, so this delete depends on
 			// encode(decode(k)) == k for encoder-produced complements — pinned
 			// exhaustively (all float32 in [0,1]) by the byte-compat tests in
@@ -1257,7 +1468,7 @@ func (ps *PebbleStore) DecayAssocWeights(ctx context.Context, wsPrefix [8]byte, 
 				_ = batch.Delete(keys.AssocWeightIndexKey(wsPrefix, e.src, e.dst), nil)
 			}
 		}
-		if err := batch.Commit(pebble.NoSync); err != nil {
+		if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 			return fmt.Errorf("decay assoc chunk commit: %w", err)
 		}
 		ps.replicateBatch(batch)
@@ -1283,6 +1494,10 @@ func (ps *PebbleStore) DecayAssocWeights(ctx context.Context, wsPrefix [8]byte, 
 
 		// Decode existing metadata from the value bytes before extracting key fields.
 		relType, confidence, createdAt, lastActivated, peakWeight, coActivationCount, _ := decodeAssocValue(iter.Value())
+		if relType == RelSupersedes {
+			// A declaration, never decayed (see the doc comment).
+			continue
+		}
 
 		var src, dst [16]byte
 		copy(src[:], key[9:25])
@@ -1313,7 +1528,7 @@ func (ps *PebbleStore) DecayAssocWeights(ctx context.Context, wsPrefix [8]byte, 
 			}
 		}
 
-		e := assocEntry{
+		e := decayEntry{
 			src: src, dst: dst, oldW: oldW, newW: oldW,
 			relType: relType, confidence: confidence,
 			createdAt: createdAt, lastActivated: lastActivated,
@@ -1388,7 +1603,6 @@ func (ps *PebbleStore) DecayAssocWeights(ctx context.Context, wsPrefix [8]byte, 
 			} else {
 				// No peak (guard; shouldn't reach here after bootstrap).
 				e.remove = true
-				removed++
 			}
 		} // else: newW >= minWeight, standard keep
 
@@ -1533,6 +1747,46 @@ func (ps *PebbleStore) GetReverseAssociations(ctx context.Context, wsPrefix [8]b
 	return results, nil
 }
 
+// SupersedersOf returns the distinct engrams holding a RelSupersedes edge onto
+// id. Unlike GetReverseAssociations it is NOT capped: the 0x04 reverse index
+// orders a node's incoming edges by weight, then source, with no relation in
+// the key, so any capped scan can be starved — a node with >= cap incoming
+// max-weight edges of another relation hides its supersedes edge entirely.
+// Cost is one full pass over id's incoming edges, decoding only the relation;
+// the write paths that need an exact answer (evolve's fork guard) pay it.
+func (ps *PebbleStore) SupersedersOf(ctx context.Context, wsPrefix [8]byte, id ULID) ([]ULID, error) {
+	iter, err := PrefixIterator(ps.db, keys.AssocRevPrefixForID(wsPrefix, [16]byte(id)))
+	if err != nil {
+		return nil, fmt.Errorf("SupersedersOf prefix iter: %w", err)
+	}
+	defer iter.Close()
+	seen := map[ULID]bool{}
+	var out []ULID
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		k := iter.Key()
+		if len(k) < 45 {
+			continue
+		}
+		relType, _, _, _, _, _, _ := decodeAssocValue(iter.Value())
+		if relType != RelSupersedes {
+			continue
+		}
+		var src ULID
+		copy(src[:], k[29:45])
+		if !seen[src] {
+			seen[src] = true
+			out = append(out, src)
+		}
+	}
+	if err := iter.Error(); err != nil {
+		return nil, fmt.Errorf("SupersedersOf scan: %w", err)
+	}
+	return out, nil
+}
+
 // contradictionValueLen is the current 0x0A value length: the partner ULID
 // followed by the detection time in Unix nanoseconds.
 // Layout: partner(16) | detectedAtUnixNano(8).
@@ -1667,7 +1921,7 @@ func (ps *PebbleStore) FlagContradiction(ctx context.Context, wsPrefix [8]byte, 
 	// Also write reverse for quick lookup
 	batch.Set(contraKeyRev, encodeContradictionValue(aBytes, detectedAt), nil)
 
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 		return false, fmt.Errorf("commit batch: %w", err)
 	}
 	ps.replicateBatch(batch)
@@ -1691,7 +1945,7 @@ func (ps *PebbleStore) ResolveContradiction(ctx context.Context, wsPrefix [8]byt
 	batch.Delete(contraKeyAB, nil)
 	batch.Delete(contraKeyBA, nil)
 
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 		return fmt.Errorf("resolve contradiction: %w", err)
 	}
 	ps.replicateBatch(batch)

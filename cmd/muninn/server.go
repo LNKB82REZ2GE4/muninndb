@@ -50,6 +50,7 @@ import (
 	"github.com/scrypster/muninndb/internal/transport/rest"
 	"github.com/scrypster/muninndb/internal/ui"
 	"github.com/scrypster/muninndb/internal/wal"
+	"github.com/scrypster/muninndb/internal/writetwin"
 	webui "github.com/scrypster/muninndb/web"
 )
 
@@ -782,6 +783,41 @@ type enrichInitFailure struct {
 	err  error  // the init/parse error
 }
 
+// maxUnconfiguredVaultsShown bounds the names in the startup notice so one
+// line stays one line on a server with hundreds of vaults.
+const maxUnconfiguredVaultsShown = 20
+
+// logUnconfiguredVaults reports, in ONE line at INFO, which vaults have no
+// explicit access policy. Those vaults take the fail-closed default (an API key
+// is required). That is the secure state and not a fault, so it is stated once
+// with the count and the names instead of one WARN per vault on every start.
+// It is WARN only when the list could not be built, because then the operator
+// has been told nothing.
+func logUnconfiguredVaults(listVaults func() ([]string, error), unconfigured func([]string) ([]string, error)) {
+	const hint = "use muninn api-key create to grant access"
+	names, err := listVaults()
+	if err != nil {
+		slog.Warn("vault fail-closed: could not list vaults to report which have no explicit access policy; unconfigured vaults require an API key", "err", err)
+		return
+	}
+	locked, err := unconfigured(names)
+	if err != nil {
+		slog.Warn("vault fail-closed: could not read vault configs to report which vaults have no explicit access policy; unconfigured vaults require an API key", "err", err)
+		return
+	}
+	if len(locked) == 0 {
+		slog.Info("vault fail-closed: unconfigured vaults require an API key; every vault on this server has an explicit access policy", "vaults", len(names))
+		return
+	}
+	shown := locked
+	if len(shown) > maxUnconfiguredVaultsShown {
+		shown = shown[:maxUnconfiguredVaultsShown]
+	}
+	slog.Info("vault fail-closed: unconfigured vaults require an API key; "+hint,
+		"unconfigured", len(locked), "of", len(names),
+		"names", strings.Join(shown, ", "), "names_not_shown", len(locked)-len(shown))
+}
+
 // buildEnricher constructs an EnrichService. Priority:
 //  1. MUNINN_ENRICH_URL env var
 //  2. Saved plugin_config.json (cfg parameter)
@@ -938,81 +974,6 @@ func warnVaultDimMismatches(store *storage.PebbleStore, embedderDim int) {
 	}
 }
 
-// handleClusterConn reads MBP frames from an incoming cluster TCP connection
-// and dispatches them to the coordinator. Exits when the connection is closed.
-//
-// Protocol: the first frame MUST be TypeJoinRequest. On success, ownership of
-// conn transfers to the PeerConn inside ConnManager (HandleIncomingJoin →
-// RegisterConn). After that, this goroutine no longer closes conn on exit —
-// the coordinator's cleanup owns it. If the join fails or a protocol violation
-// occurs, this goroutine closes conn via the deferred call.
-func handleClusterConn(conn net.Conn, coord *replication.ClusterCoordinator) {
-	// connOwned flips to false once HandleIncomingJoin succeeds and the
-	// PeerConn takes ownership, preventing a double-close on goroutine exit.
-	connOwned := true
-	defer func() {
-		if connOwned {
-			conn.Close()
-		}
-	}()
-
-	fromNodeID := conn.RemoteAddr().String() // ephemeral until join completes
-	joined := false
-
-	for {
-		frame, err := mbp.ReadFrame(conn)
-		if err != nil {
-			// The inbound conn died. If it had been adopted as a peer's registered
-			// conn, evict it (unless already replaced) so the peer's restart isn't
-			// blocked by a stale live-looking PeerConn (#534).
-			if joined {
-				coord.EvictConn(fromNodeID, conn)
-			}
-			return // connection closed or error
-		}
-		if frame.Type == mbp.TypeJoinRequest {
-			nodeID, adopted, err := coord.HandleIncomingJoin(conn, frame.Payload)
-			if err != nil {
-				log.Printf("[cluster] join error from %s: %v", fromNodeID, err)
-				return
-			}
-			if !adopted {
-				// Non-leader rejected the join with a redirect (already written to
-				// the raw conn). The conn was NOT registered, so close it here.
-				return
-			}
-			fromNodeID = nodeID
-			joined = true
-			connOwned = false // PeerConn now owns conn
-			continue
-		}
-		// PeerHello discovery handshake (#522 Step 4) — an alternative first frame
-		// for peers that don't join (two primaries, sentinels, lobe↔lobe).
-		if frame.Type == mbp.TypePeerHello {
-			nodeID, adopted, err := coord.HandleIncomingHello(conn, frame.Payload)
-			if err != nil {
-				log.Printf("[cluster] hello error from %s: %v", fromNodeID, err)
-				return
-			}
-			if !adopted {
-				return // tie-break loser: conn deliberately closed in adoptHelloPeer
-			}
-			fromNodeID = nodeID
-			joined = true
-			connOwned = false // PeerConn now owns conn
-			continue
-		}
-		// Reject any frame that arrives before a join/hello handshake completes.
-		if !joined {
-			log.Printf("[cluster] unexpected frame type 0x%02x from %s before join; closing", frame.Type, fromNodeID)
-			return
-		}
-		if err := coord.HandleIncomingFrame(fromNodeID, frame.Type, frame.Payload); err != nil {
-			log.Printf("[cluster] frame error from %s: %v", fromNodeID, err)
-		}
-	}
-}
-
 // validateServerFlags checks that each addr is a valid host:port pair with a
 // port number in the range 1-65535. Returns the first validation error found.
 func validateServerFlags(addrs ...string) error {
@@ -1144,6 +1105,7 @@ func runServer() {
 		fmt.Fprintf(os.Stderr, "  MUNINN_GC_PERCENT            Go GC target percentage (default: 200)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_RATE_LIMIT_GLOBAL_RPS Global rate limit requests/sec (default: 1000)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_RATE_LIMIT_PER_IP_RPS Per-IP rate limit requests/sec (default: 100)\n")
+		fmt.Fprintf(os.Stderr, "  MUNINN_MBP_MAX_CONNECTIONS   Most MBP connections held at once (default: derived from MUNINN_MEM_LIMIT_GB, 16 at 4 GB)\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_BACKUP_INTERVAL        Automated backup interval (e.g. 6h, 30m); empty = disabled\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_BACKUP_DIR             Directory to write automated backups into\n")
 		fmt.Fprintf(os.Stderr, "  MUNINN_BACKUP_RETAIN          Number of automated backups to keep (default: 5)\n")
@@ -1403,9 +1365,10 @@ func runServer() {
 	// Wire ClusterCoordinator when cluster mode is enabled.
 	var coordinator *replication.ClusterCoordinator
 	var repLog *replication.ReplicationLog
+	var applier *replication.Applier
 	if clusterCfg.Enabled {
 		repLog = replication.NewReplicationLog(db)
-		applier := replication.NewApplier(db)
+		applier = replication.NewApplier(db)
 		epochStore, err := replication.NewEpochStore(db)
 		if err != nil {
 			slog.Error("create epoch store", "err", err)
@@ -1421,6 +1384,13 @@ func runServer() {
 	sessionSecret, err := auth.Bootstrap(authStore, secretPath)
 	if err != nil {
 		slog.Error("auth bootstrap failed", "err", err)
+		os.Exit(1)
+	}
+	if len(sessionSecret) == 0 {
+		// Bootstrap guarantees a non-empty secret. This is the second lock on the
+		// same door: the REST and UI servers serve admin routes without auth when
+		// handed an empty secret, so the server must not start with one.
+		slog.Error("auth bootstrap returned an empty session secret; refusing to start", "path", secretPath)
 		os.Exit(1)
 	}
 
@@ -1480,6 +1450,9 @@ func runServer() {
 		storeCfg.RepLogAppend = replication.LocalAppendFunc(coordinator, repLog)
 	}
 	store := storage.NewPebbleStore(db, storeCfg)
+	if applier != nil {
+		wireApplierToStore(applier, store)
+	}
 
 	// Run startup migrations before the engine is built.
 	runStartupMigrations(context.Background(), store)
@@ -1593,6 +1566,19 @@ func runServer() {
 	transitionWorkerImpl := cognitive.NewTransitionWorker(ctx, store.TransitionCache())
 	actEngine.SetTransitionStore(store.TransitionCache())
 
+	// Write-time twin check (COG-36): off | shadow | 1, default off. An
+	// unrecognised value runs OFF, loudly — a switch that adds to write
+	// responses must never turn on by accident.
+	writeTwinMode, writeTwinOK := writetwin.ParseMode(os.Getenv("MUNINN_WRITE_RELATED"))
+	if !writeTwinOK {
+		slog.Warn("MUNINN_WRITE_RELATED has an unrecognised value; the write-time twin check stays off (use off, shadow or 1)",
+			"value", os.Getenv("MUNINN_WRITE_RELATED"))
+	} else if writeTwinMode != writetwin.Off {
+		// The audit (muninn twin-audit) reads this line back as a ring
+		// warm-up start: keep the message equal to writetwin.StartLogMsg.
+		slog.Info(writetwin.StartLogMsg, "mode", writeTwinMode.String())
+	}
+
 	// Build engine API - pass the full worker implementations
 	eng := engine.NewEngine(engine.EngineConfig{
 		Store:            store,
@@ -1606,6 +1592,10 @@ func runServer() {
 		Embedder:         embedder,
 		HNSWRegistry:     hnswRegistry,
 		EmbedModelName:   embedModelName,
+		// The persisted auth secret keys read-only query ids (ro2./ro1.) and the
+		// label pipeline's credential/session hashes, so ids survive restarts.
+		QueryIDSecret: sessionSecret,
+		WriteTwinMode: writeTwinMode,
 	})
 	eng.SetEmbedHealth(embedHealth)
 
@@ -1630,6 +1620,7 @@ func runServer() {
 		var cogHeb *cognitive.HebbianWorker
 		var cogTransition *cognitive.TransitionWorker
 
+		coordinator.BeforeBecomingCortex = vaultCountResetAtPromotion(store)
 		coordinator.OnBecameCortex = func(epoch uint64) {
 			slog.Info("[cluster] node promoted to Cortex — starting cognitive workers", "epoch", epoch)
 			cogHeb = cognitive.NewHebbianWorker(hebbianStore)
@@ -1735,6 +1726,9 @@ func runServer() {
 	// authenticate on every transport and muninn_create_workflow_vault (opt-in
 	// via MUNINN_AGENT_VAULT_CREATE) can mint workflow capabilities (RFC #597).
 	mcpServer := mcp.New(*mcpAddr, mcpAdapter, *mcpToken, authStore, authStore, clientTLS)
+	// muninn_status health folds in the same storage-writability probe that
+	// REST /api/health reports as db_writable.
+	mcpServer.SetStorageWritableProbe(restServer.DBWritable)
 
 	// Build gRPC server
 	grpcAdapter := grpcpkg.NewEngineAdapter(eng)
@@ -1801,7 +1795,7 @@ func runServer() {
 						continue
 					}
 				}
-				go handleClusterConn(conn, coord)
+				go coord.ServeConn(conn)
 			}
 		}()
 		go func() {
@@ -1899,6 +1893,12 @@ func runServer() {
 		// so vector-scored matches on freshly-written engrams are not missed.
 		retroProcessor.SetOnEmbed(eng.ReevaluatePushOnEmbed)
 		retroProcessor.SetEmbedHealth(embedHealth)
+		// Feed the write-time twin ring (COG-36) the exact vector each write
+		// was stored and indexed with. A no-op when the check is off.
+		if writeTwinMode != writetwin.Off {
+			retroProcessor.SetOnEmbedded(eng.WriteTwinOnEmbedded)
+			eng.SetWriteTwinFeed(retroProcessor)
+		}
 		retroProcessor.Start(ctx)
 		slog.Info("retroactive embed processor started")
 		// Keep embed_backend honest while idle: without traffic, a backend
@@ -1998,7 +1998,7 @@ func runServer() {
 	}
 	slog.Info("UI server listening", "addr", *uiAddr)
 
-	slog.Info("vault fail-closed: unconfigured vaults require an API key; use muninn api-key create to grant access")
+	logUnconfiguredVaults(store.ListVaultNames, authStore.UnconfiguredVaults)
 
 	// Upgrade notice: warn operators if data exists but no vault configs are set.
 	// This detects the scenario where an operator upgraded from a version that

@@ -82,18 +82,28 @@ func seedReadOnlyPair(t *testing.T, eng *Engine, as *auth.Store, store *storage.
 		t.Fatalf("SetVaultConfig: %v", err)
 	}
 
+	// Distinct, ordered creation times. An id's millisecond comes from its
+	// CreatedAt and NewULID draws fresh entropy per call, so two writes in the
+	// same millisecond sorted at random. The Hebbian worker learns only on the
+	// key min(id)->max(id). When the partner sorted first it strengthened the
+	// partner->probe key and the seeded probe->partner edge stayed at 0.1
+	// (forced: 11 of 20 runs failed with "0.1 -> 0.1").
+	probeAt := time.Now().Add(-2 * time.Second)
+	partnerAt := probeAt.Add(time.Second)
 	probeResp, err := eng.Write(ctx, &mbp.WriteRequest{
-		Vault:   vault,
-		Concept: "kiln firing schedule",
-		Content: "the bisque kiln ramps at eighty degrees an hour to cone zero four",
+		Vault:     vault,
+		CreatedAt: &probeAt,
+		Concept:   "kiln firing schedule",
+		Content:   "the bisque kiln ramps at eighty degrees an hour to cone zero four",
 	})
 	if err != nil {
 		t.Fatalf("Write(probe): %v", err)
 	}
 	partnerResp, err := eng.Write(ctx, &mbp.WriteRequest{
-		Vault:   vault,
-		Concept: "glaze mixing ratio",
-		Content: "the celadon glaze is mixed at one part ash to two parts feldspar",
+		Vault:     vault,
+		CreatedAt: &partnerAt,
+		Concept:   "glaze mixing ratio",
+		Content:   "the celadon glaze is mixed at one part ash to two parts feldspar",
 	})
 	if err != nil {
 		t.Fatalf("Write(partner): %v", err)
@@ -198,6 +208,17 @@ func TestActivate_NotReadOnly_StillHebbianStrengthens(t *testing.T) {
 		t.Fatalf("GetAssocWeight: %v", err)
 	}
 	if after <= initialWeight {
+		// Report what tells the causes apart: the worker learns only the key
+		// min(id)->max(id), so a probe that sorts after its partner sends the
+		// update to the reverse key (the CI failure, see seedReadOnlyPair). A
+		// zero score skips the pair. The worker's counters show an event
+		// that never arrived, was dropped, or failed to persist.
+		reverse, _ := store.GetAssocWeight(ctx, ws, partnerID, probeID)
+		for _, a := range resp.Activations {
+			t.Logf("activation %s score=%v", a.ID, a.Score)
+		}
+		t.Logf("probe=%s partner=%s probe sorts first=%v reverse-key weight=%v worker=%+v",
+			probeID, partnerID, probeID.String() < partnerID.String(), reverse, hw.Stats())
 		t.Errorf("ordinary (read_only:false) recall did not strengthen the "+
 			"probe/partner association (%v -> %v); the fix must not disable "+
 			"Hebbian learning outright", initialWeight, after)
@@ -247,9 +268,9 @@ func TestActivateReadOnly_ObserveMode_StillSuppresses(t *testing.T) {
 // TestActivateReadOnly_FullMode_SuppressesRecallEvent is the RED test for the
 // second write site: a read_only:true recall from a full-mode credential must
 // not persist a 0x29 recall event. Persistence is observable from the
-// outside without a purpose-gated read: a persisted event replaces the
-// fast, non-persisted "q-..." query ID with a real event ULID (see
-// (*Engine).fastQueryID and the persist branch in activateCore).
+// outside: a read-only recall's query id is the self-verifying "ro2."/"ro0."
+// form, never an event ULID (see mintRecallQueryID), and no 0x29 event
+// exists under it.
 func TestActivateReadOnly_FullMode_SuppressesRecallEvent(t *testing.T) {
 	eng, as, store, _, cleanup := hebbianReadOnlyEnv(t)
 	defer cleanup()
@@ -267,10 +288,16 @@ func TestActivateReadOnly_FullMode_SuppressesRecallEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
-	if len(resp.QueryID) < 2 || resp.QueryID[:2] != "q-" {
-		t.Errorf("read_only:true recall persisted a recall event (query_id %q "+
-			"is not the unpersisted fast-ID form) — a pure read must not write "+
-			"the signal calibration reads", resp.QueryID)
+	if len(resp.QueryID) < 3 || resp.QueryID[:2] != "ro" {
+		t.Errorf("read_only:true recall got query_id %q, not the read-only "+
+			"(ro2./ro0.) form — a pure read must not write the signal calibration reads", resp.QueryID)
+	}
+	n, err := store.CountRecallEventsSince(context.Background(), store.ResolveVaultPrefix(vault), time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("read_only:true recall persisted %d recall event(s)", n)
 	}
 }
 
@@ -293,9 +320,13 @@ func TestActivate_NotReadOnly_StillPersistsRecallEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Activate: %v", err)
 	}
-	if len(resp.QueryID) >= 2 && resp.QueryID[:2] == "q-" {
-		t.Errorf("ordinary recall did not persist a recall event (query_id %q); "+
-			"the fix must not disable recall-event persistence outright", resp.QueryID)
+	n, err := store.CountRecallEventsSince(context.Background(), store.ResolveVaultPrefix(vault), time.Now().Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || len(resp.QueryID) != 26 {
+		t.Errorf("ordinary recall did not persist its recall event (events %d, query_id %q); "+
+			"the fix must not disable recall-event persistence outright", n, resp.QueryID)
 	}
 }
 

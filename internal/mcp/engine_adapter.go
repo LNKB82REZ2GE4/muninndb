@@ -48,6 +48,14 @@ func NewEngineAdapter(eng *engine.Engine, enricher plugin.EnrichPlugin, pStore p
 	return &mcpEngineAdapter{eng: eng, enricher: enricher, pStore: pStore}
 }
 
+// WriteTwinEnabled reports whether the write-time twin check runs (COG-36).
+func (a *mcpEngineAdapter) WriteTwinEnabled() bool { return a.eng.WriteTwinEnabled() }
+
+// WriteTwinInline forwards the mode-1 write-time twin check (COG-36).
+func (a *mcpEngineAdapter) WriteTwinInline(ctx context.Context, vault, newID string, render func(*engine.WriteTwinResult) int) *engine.WriteTwinResult {
+	return a.eng.WriteTwinInline(ctx, vault, newID, render)
+}
+
 func (a *mcpEngineAdapter) Write(ctx context.Context, req *mbp.WriteRequest) (*mbp.WriteResponse, error) {
 	return a.eng.Write(ctx, req)
 }
@@ -186,6 +194,32 @@ func (a *mcpEngineAdapter) Evolve(ctx context.Context, vault, oldID, newContent,
 					"muninn_evolve with 'concept' — concept-surfacing views show the label, not the content.",
 				eng.Concept))
 		}
+		// #872: evolve now INHERITS the record's trust level instead of
+		// resetting it to inferred — an evolve replaces CONTENT, it does not
+		// re-adjudicate who vouched for it. That is the right default, but it
+		// is the same dilemma #769 settled for `concept`: "verified" means a
+		// human confirmed THIS content, and the content just changed. #769's
+		// residual was never the inheritance, it was that nothing SAID the
+		// label had been inherited. Announce it here too.
+		//
+		// Only the two levels that carry a consequence are loud. `inferred` is
+		// the default state of nearly every memory and `external` is an
+		// ordinary provenance label; warning on either would fire on almost
+		// every evolve in every vault, which is a warning on none.
+		switch eng.Trust {
+		case storage.TrustVerified:
+			res.Warnings = append(res.Warnings,
+				"trust=verified was carried forward from the previous version onto content that just "+
+					"changed — nothing has confirmed the NEW text. Verified memories also get a "+
+					"higher effective importance (prune protection). If this revision has not been "+
+					"checked by a human, disclaim it with muninn_trust(id, \"inferred\").")
+		case storage.TrustUntrusted:
+			res.Warnings = append(res.Warnings,
+				"trust=untrusted was carried forward from the previous version: editing the content did "+
+					"NOT clear the unreliable flag, and vaults configured to exclude untrusted memories "+
+					"will still hide this one. Clear it with muninn_trust(id, \"inferred\") once the "+
+					"reason for the flag is resolved.")
+		}
 	} else if err != nil {
 		// Never fail an accepted write over a cosmetic read-back; say so rather
 		// than reporting an empty concept as if that were the stored value.
@@ -200,18 +234,48 @@ func (a *mcpEngineAdapter) Consolidate(ctx context.Context, vault string, ids []
 	}
 	return &ConsolidateResult{ID: res.MergedID.String(), Archived: res.Archived, Warnings: res.Warnings}, nil
 }
-func (a *mcpEngineAdapter) Session(ctx context.Context, vault string, since time.Time) (*SessionSummary, error) {
-	res, err := a.eng.Session(ctx, vault, since)
+func (a *mcpEngineAdapter) Session(ctx context.Context, vault string, req SessionRequest) (*SessionSummary, error) {
+	var before *storage.ULID
+	if req.Before != "" {
+		u, err := storage.ParseULID(req.Before)
+		if err != nil {
+			return nil, fmt.Errorf("'before' must be a memory id (the next_before of a previous page): %w", err)
+		}
+		before = &u
+	}
+	offset, limit := req.Offset, req.Limit
+	res, err := a.eng.SessionPagedBefore(ctx, vault, req.Since, before, offset, limit)
 	if err != nil {
 		return nil, err
 	}
-	summary := &SessionSummary{Since: since}
+	if limit <= 0 {
+		limit = engine.SessionDefaultLimit
+	}
+	if limit > engine.SessionMaxLimit {
+		limit = engine.SessionMaxLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	summary := &SessionSummary{
+		Since:       res.Since,
+		Writes:      []SessionEntry{},
+		Activations: res.Activations,
+		Total:       res.Total,
+		Offset:      offset,
+		Limit:       limit,
+	}
 	for _, w := range res.Writes {
 		summary.Writes = append(summary.Writes, SessionEntry{
 			ID:        w.ID,
 			Concept:   w.Concept,
 			CreatedAt: w.At,
 		})
+	}
+	summary.Returned = len(summary.Writes)
+	summary.Truncated = offset+summary.Returned < summary.Total
+	if summary.Truncated && summary.Returned > 0 {
+		summary.NextBefore = summary.Writes[summary.Returned-1].ID
 	}
 	return summary, nil
 }
@@ -220,7 +284,7 @@ func (a *mcpEngineAdapter) Decide(ctx context.Context, vault, decision, rational
 	if err != nil {
 		return nil, err
 	}
-	return &WriteResult{ID: res.ID.String(), Concept: res.Concept, Warnings: res.Warnings}, nil
+	return &WriteResult{ID: res.ID.String(), Concept: res.Concept, Warnings: res.Warnings, Notes: res.Notes}, nil
 }
 
 func (a *mcpEngineAdapter) Restore(ctx context.Context, vault, id string) (*RestoreResult, error) {
@@ -292,6 +356,9 @@ func explainResultFromEngine(data *engine.ExplainData) *ExplainResult {
 		WouldReturn: data.WouldReturn,
 		Threshold:   data.Threshold,
 		Note:        data.Note,
+		// WithheldReason travels with would_return: a false would_return on a
+		// row that clears the bar is unexplained without it.
+		WithheldReason: data.WithheldReason,
 	}
 	// Stored confidence never depends on the query: report it whenever the
 	// engram exists. (It was previously unmapped entirely, so muninn_explain
@@ -308,6 +375,8 @@ func explainResultFromEngine(data *engine.ExplainData) *ExplainResult {
 		res.Components.SemanticSimilarityRaw = f64(float64(data.Components.SemanticSimilarityRaw))
 		res.Components.DecayFactor = f64(float64(data.Components.DecayFactor))
 		res.Components.HebbianBoost = f64(float64(data.Components.HebbianBoost))
+		res.Components.TransitionBoost = f64(float64(data.Components.TransitionBoost))
+		res.Components.EntityBoost = f64(float64(data.Components.EntityBoost))
 		res.Components.AccessFrequency = f64(float64(data.Components.AccessFrequency))
 	}
 	return res
@@ -444,6 +513,29 @@ func (a *mcpEngineAdapter) RecallTree(ctx context.Context, vault, rootID string,
 
 func (a *mcpEngineAdapter) CountChildren(ctx context.Context, vault, engramID string) (int, error) {
 	return a.eng.CountChildren(ctx, vault, engramID)
+}
+
+// HealthSnapshot implements healthReporter from in-memory state only: two
+// atomic loads (RecallEmbedHealth), the workers' counters, and the embed backfill's
+// progress counters. No store scan, no embedder call.
+func (a *mcpEngineAdapter) HealthSnapshot(_ context.Context) healthSnapshot {
+	eh := a.eng.RecallEmbedHealth()
+	snap := healthSnapshot{
+		EmbedState:          eh.State,
+		EmbedLastOKAt:       eh.LastOKAt,
+		EmbedLastDegraded:   eh.LastDegradedAt,
+		EmbedDegradedReason: eh.LastDegradedReason,
+		Workers:             a.eng.WorkerStats(),
+		Now:                 time.Now(),
+	}
+	if es := a.eng.EmbedStats(); es.Status == "running" && es.Total > 0 {
+		pending := es.Total - es.Processed
+		if pending < 0 {
+			pending = 0
+		}
+		snap.EmbeddingsPending = &pending
+	}
+	return snap
 }
 
 func (a *mcpEngineAdapter) GetEnrichmentMode(ctx context.Context) string {
@@ -684,6 +776,46 @@ func (a *mcpEngineAdapter) ApplyEnrichment(ctx context.Context, vault string, re
 
 func (a *mcpEngineAdapter) RecordFeedback(ctx context.Context, vault, engramID string, useful bool) error {
 	return a.eng.RecordFeedback(ctx, vault, engramID, useful)
+}
+
+func (a *mcpEngineAdapter) RecordFeedbackLabels(ctx context.Context, vault string, groups []FeedbackGroup, source string, probeOtherVaults bool) ([]FeedbackOutcome, error) {
+	eg := make([]engine.FeedbackGroup, len(groups))
+	for i, g := range groups {
+		eg[i] = engine.FeedbackGroup{QueryID: g.QueryID, IDs: g.IDs, Useful: g.Useful}
+	}
+	res, err := a.eng.RecordFeedbackLabelsDetailed(ctx, vault, eg, source, engine.FeedbackOptions{ProbeOtherVaults: probeOtherVaults})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]FeedbackOutcome, len(res))
+	for i, r := range res {
+		out[i] = FeedbackOutcome{Group: r.Group, QueryID: r.QueryID, ID: r.ID, Outcome: r.Outcome, Reason: r.Reason, HeadID: r.HeadID, Vault: r.Vault}
+	}
+	return out, nil
+}
+
+// LabelStats implements labelStatsReporter.
+func (a *mcpEngineAdapter) LabelStats(ctx context.Context, vault string) (*LabelsStatus, error) {
+	st, err := a.eng.LabelStats(ctx, vault)
+	if err != nil {
+		return nil, err
+	}
+	out := &LabelsStatus{
+		WindowDays:           st.WindowDays,
+		Verified:             st.Verified,
+		Token:                st.Token,
+		Legacy:               st.Legacy,
+		Positive:             st.Positive,
+		Negative:             st.Negative,
+		MemoryCredentialDays: st.MemoryCredentialDays,
+		Bumps:                st.Bumps,
+		Rejected:             st.Rejected,
+		Note:                 labelsStatusNote,
+	}
+	if !st.RejectedSince.IsZero() {
+		out.RejectedSince = st.RejectedSince.UTC().Format(time.RFC3339)
+	}
+	return out, nil
 }
 
 func (a *mcpEngineAdapter) GetProvenance(ctx context.Context, vault, id string) ([]ProvenanceEntry, error) {

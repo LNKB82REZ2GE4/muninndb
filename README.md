@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/scrypster/muninndb/actions/workflows/ci.yml/badge.svg)](https://github.com/scrypster/muninndb/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-BSL%201.1-blue)](LICENSE)
-[![Go](https://img.shields.io/badge/go-1.25%2B-00ADD8)](https://go.dev)
+[![Go](https://img.shields.io/badge/go-1.26.11%2B-00ADD8)](https://go.dev)
 [![Status](https://img.shields.io/badge/status-alpha-orange)](https://github.com/scrypster/muninndb/releases)
 
 > **Prerequisites:** None. Single binary, zero dependencies, zero configuration required.
@@ -353,7 +353,11 @@ const result = await client.activate({ context: ['login flow'] });
 ```
 
 ```bash
-npm install @muninndb/client
+# @muninndb/client is not on npm yet. Build it from this repository:
+git clone https://github.com/scrypster/muninndb.git
+cd muninndb/sdk/node && npm ci && npm run build && npm pack
+# then, in your project, install the .tgz file that npm pack printed:
+npm install /path/to/muninndb/sdk/node/muninndb-client-<version>.tgz
 ```
 
 **PHP SDK:**
@@ -409,6 +413,7 @@ When you're ready to customize:
 | LLM enrichment | `MUNINN_ENRICH_URL=anthropic://claude-haiku-4-5-20251001` + `MUNINN_ANTHROPIC_KEY=sk-ant-...` |
 | Data directory | `MUNINNDB_DATA=/path/to/data` (default: `~/.muninn/data`) |
 | Memory limit | `MUNINN_MEM_LIMIT_GB=4` |
+| MBP connection limit | `MUNINN_MBP_MAX_CONNECTIONS=64` (default: derived from the memory limit, 16 at 4 GB) |
 
 **Docker:**
 

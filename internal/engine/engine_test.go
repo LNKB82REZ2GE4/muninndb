@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/vfs"
 	"github.com/scrypster/muninndb/internal/auth"
 	"github.com/scrypster/muninndb/internal/engine/activation"
 	"github.com/scrypster/muninndb/internal/engine/trigger"
@@ -17,22 +19,33 @@ import (
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 )
 
+// openMemPebble opens Pebble with the production options (storage.DefaultOptions)
+// on a fresh in-memory filesystem. Every code path is the one a server runs —
+// pebble.Sync writes, the WAL, flushes, compactions — but the fsyncs those
+// paths issue cost nothing. On a real disk the open alone paid ~50-70ms of
+// directory/MANIFEST fsyncs and every synced write a few ms more; across the
+// ~500 tests built on testEnv that was the largest single cost in this
+// package's wall time. A test that needs the bytes to survive a process
+// restart, or that inspects files on disk, opens its own store instead (see
+// openRCEnv, which shares one vfs.FS across a close and reopen).
+func openMemPebble(t testing.TB) *pebble.DB {
+	t.Helper()
+	opts := storage.DefaultOptions()
+	opts.FS = vfs.NewMem()
+	db, err := storage.OpenPebble("engine-test-db", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
 // testEnv wires up a fully functional Engine with real storage and FTS,
-// using a temporary directory that is cleaned up after the test.
+// on an in-memory filesystem (openMemPebble).
 // testEnv takes testing.TB so benchmarks (BenchmarkRecallContradictionGate)
 // can build the same environment tests do.
 func testEnv(t testing.TB) (*Engine, func()) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "muninndb-engine-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	db, err := storage.OpenPebble(dir, storage.DefaultOptions())
-	if err != nil {
-		os.RemoveAll(dir)
-		t.Fatal(err)
-	}
+	db := openMemPebble(t)
 
 	store := storage.NewPebbleStore(db, storage.PebbleStoreConfig{CacheSize: 1000})
 	ftsIdx := fts.New(db)
@@ -46,7 +59,6 @@ func testEnv(t testing.TB) (*Engine, func()) {
 	return eng, func() {
 		eng.Stop()    // stop FTS worker, novelty worker, coherence flush, autoAssoc
 		store.Close() // stop PebbleStore background workers and close db
-		os.RemoveAll(dir)
 	}
 }
 
@@ -56,16 +68,7 @@ func testEnv(t testing.TB) (*Engine, func()) {
 // is drained before the DB is closed — preventing flaky panics in adjacent tests.
 func testEnvWithStore(t *testing.T) (*Engine, *storage.PebbleStore, func()) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "muninndb-engine-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	db, err := storage.OpenPebble(dir, storage.DefaultOptions())
-	if err != nil {
-		os.RemoveAll(dir)
-		t.Fatal(err)
-	}
+	db := openMemPebble(t)
 
 	store := storage.NewPebbleStore(db, storage.PebbleStoreConfig{CacheSize: 1000})
 	ftsIdx := fts.New(db)
@@ -78,12 +81,11 @@ func testEnvWithStore(t *testing.T) (*Engine, *storage.PebbleStore, func()) {
 	return eng, store, func() {
 		eng.Stop()
 		// store.Close() may panic or error if db was already closed by the test;
-		// recover gracefully so cleanup always removes the temp dir.
+		// recover gracefully so cleanup always completes.
 		func() {
 			defer func() { recover() }()
 			store.Close()
 		}()
-		os.RemoveAll(dir)
 	}
 }
 
@@ -125,6 +127,27 @@ func (a *ftsAdapter) Search(ctx context.Context, ws [8]byte, query string, topK 
 		out[i] = activation.ScoredID{ID: storage.ULID(r.ID), Score: r.Score}
 	}
 	return out, nil
+}
+
+// SearchLive mirrors the production adapter (activation.NewFTSAdapter), so
+// every engine test built on testEnv recalls through the same retired-aware
+// keyword path a server does.
+func (a *ftsAdapter) SearchLive(ctx context.Context, ws [8]byte, query string, topK int, retired func([16]byte) bool, shadowBudget int) ([]activation.ScoredID, []activation.ScoredID, error) {
+	live, shadows, err := a.idx.SearchLive(ctx, ws, query, topK, retired, shadowBudget)
+	if err != nil {
+		return nil, nil, err
+	}
+	conv := func(in []fts.ScoredID) []activation.ScoredID {
+		if in == nil {
+			return nil
+		}
+		out := make([]activation.ScoredID, len(in))
+		for i, r := range in {
+			out[i] = activation.ScoredID{ID: storage.ULID(r.ID), Score: r.Score}
+		}
+		return out
+	}
+	return conv(live), conv(shadows), nil
 }
 
 // ftsTrigAdapter converts fts.ScoredID to trigger.ScoredID.
@@ -1049,7 +1072,7 @@ func TestCoherenceRegistryAfterWrite(t *testing.T) {
 		}
 	}
 
-	stat, err := eng.Stat(ctx, &mbp.StatRequest{})
+	stat, err := eng.Stat(ctx, &mbp.StatRequest{Vault: vault})
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
@@ -2044,7 +2067,8 @@ func TestStat_CountsConfigOnlyVaults(t *testing.T) {
 	}
 
 	// Stat() must count both config-only vaults (no data written to either).
-	resp, err := eng.Stat(ctx, &mbp.StatRequest{})
+	// The vault count is a server-wide figure, so it is asked for as one.
+	resp, err := eng.Stat(ctx, &mbp.StatRequest{ServerWide: true})
 	if err != nil {
 		t.Fatalf("Stat after SetVaultConfig: %v", err)
 	}
@@ -2077,7 +2101,7 @@ func TestStat_DeduplicatesVaultCount(t *testing.T) {
 		t.Fatalf("SetVaultConfig: %v", err)
 	}
 
-	resp, err := eng.Stat(ctx, &mbp.StatRequest{})
+	resp, err := eng.Stat(ctx, &mbp.StatRequest{ServerWide: true})
 	if err != nil {
 		t.Fatalf("Stat: %v", err)
 	}
@@ -2096,7 +2120,7 @@ func TestStat_DefaultVaultMinimum(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	resp, err := eng.Stat(ctx, &mbp.StatRequest{})
+	resp, err := eng.Stat(ctx, &mbp.StatRequest{ServerWide: true})
 	if err != nil {
 		t.Fatalf("Stat on empty engine: %v", err)
 	}
@@ -2257,9 +2281,18 @@ func TestActivate_TrustPropagation(t *testing.T) {
 	}
 }
 
-// TestEvolve_AutoStampsTrustInferred verifies that Evolve auto-stamps
-// TrustInferred on the new engram it creates.
-func TestEvolve_AutoStampsTrustInferred(t *testing.T) {
+// TestEvolve_InferredPredecessorStaysInferred: an evolve of an ordinary
+// (inferred) memory produces an inferred successor.
+//
+// Renamed from TestEvolve_AutoStampsTrustInferred (#872). Under the old
+// semantics evolve HARDCODED TrustInferred on every successor; it now inherits
+// the predecessor's level. This test's outcome is unchanged either way — and
+// that is precisely why it never caught the defect: its fixture writes with no
+// trust, so the predecessor is already inferred and "stamped" and "inherited"
+// are indistinguishable here. It is kept as the ordinary-case pin, with an
+// explicit premise assertion so a future reader can see what it does and does
+// not prove; the discriminating cases live in engine_evolve_trust_test.go.
+func TestEvolve_InferredPredecessorStaysInferred(t *testing.T) {
 	eng, cleanup := testEnv(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -2271,6 +2304,13 @@ func TestEvolve_AutoStampsTrustInferred(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("Write: %v", err)
+	}
+	// State the premise this test rests on: the predecessor is inferred, so a
+	// passing result says nothing about whether the level was carried or minted.
+	if pre, err := eng.Read(ctx, &mbp.ReadRequest{Vault: "test", ID: writeResp.ID}); err != nil {
+		t.Fatalf("Read predecessor: %v", err)
+	} else if pre.Trust != uint8(storage.TrustInferred) {
+		t.Fatalf("premise: predecessor trust = %d, want %d (TrustInferred)", pre.Trust, storage.TrustInferred)
 	}
 
 	newULID, err := eng.Evolve(ctx, "test", writeResp.ID, "Evolved content after trust stamp.", "trust test evolution", nil, "")
@@ -2306,7 +2346,8 @@ func TestEngine_SetTrust(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	if err := eng.SetTrust(context.Background(), "default", resp.ID, "verified"); err != nil {
+	// verified is gated (SEC-14): SetTrust needs a context whose mode may assert it.
+	if err := eng.SetTrust(withMode(auth.ModeWrite), "default", resp.ID, "verified"); err != nil {
 		t.Fatalf("SetTrust: %v", err)
 	}
 
@@ -2324,8 +2365,10 @@ func TestEngine_SetTrust(t *testing.T) {
 
 	// SetTrust on a nonexistent engram returns an error
 	fakeID := "01ARZ3NDEKTSV4RRFFQ69G5FAV" // valid ULID format but no such engram
-	if err := eng.SetTrust(context.Background(), "default", fakeID, "verified"); err == nil {
-		t.Error("expected error for nonexistent engram")
+	// Under a mode that clears the verified gate, so the error is the missing
+	// engram and not the gate.
+	if err := eng.SetTrust(withMode(auth.ModeWrite), "default", fakeID, "verified"); !errors.Is(err, ErrEngramNotFound) {
+		t.Errorf("SetTrust on a nonexistent engram: err = %v, want ErrEngramNotFound", err)
 	}
 }
 

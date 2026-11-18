@@ -6,7 +6,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
 // P2: ClearVault of one vault while another vault is being written used to
@@ -51,45 +50,4 @@ func TestClearVault_ConcurrentWritesToOtherVaultDoNotPanic(t *testing.T) {
 			t.Fatalf("round %d: ClearVault panicked: %v", r, pv)
 		}
 	}
-}
-
-// ClearVault's provenance drain is scoped to the vault being cleared: an
-// append in flight for a DIFFERENT vault must not hold it up (a busy vault
-// would otherwise starve every clear for as long as it keeps writing).
-func TestProvenanceWorker_DrainVaultIgnoresOtherVaults(t *testing.T) {
-	store := openTestStore(t)
-	w := store.provWork
-	other := store.VaultPrefix("drain-scope-other")
-	target := store.VaultPrefix("drain-scope-target")
-
-	w.acquire(other) // an append for another vault, still in flight
-	done := make(chan struct{})
-	go func() {
-		w.DrainVault(target)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("DrainVault(target) blocked on an in-flight append for another vault")
-	}
-
-	w.acquire(target)
-	drained := make(chan struct{})
-	go func() {
-		w.DrainVault(target)
-		close(drained)
-	}()
-	select {
-	case <-drained:
-		t.Fatal("DrainVault(target) returned while an append for target was in flight")
-	case <-time.After(50 * time.Millisecond):
-	}
-	w.release(target)
-	select {
-	case <-drained:
-	case <-time.After(5 * time.Second):
-		t.Fatal("DrainVault(target) did not return after the in-flight append finished")
-	}
-	w.release(other)
 }

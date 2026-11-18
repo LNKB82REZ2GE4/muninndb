@@ -190,8 +190,11 @@ type ReadResponse struct {
 
 // ActivateRequest queries for relevant engrams.
 type ActivateRequest struct {
-	Context     []string  `msgpack:"context" json:"context"`
-	Threshold   float32   `msgpack:"threshold,omitempty" json:"threshold,omitempty"`
+	Context   []string `msgpack:"context" json:"context"`
+	Threshold float32  `msgpack:"threshold,omitempty" json:"threshold,omitempty"`
+	// MaxResults bounds the rows returned, except for the bounded COG-29
+	// partner overflow (ConflictBlock.AdjacencyOverflow, at most
+	// min(MaxResults, 3)).
 	MaxResults  int       `msgpack:"max_results,omitempty" json:"max_results,omitempty"`
 	MaxHops     int       `msgpack:"max_hops,omitempty" json:"max_hops,omitempty"`
 	IncludeWhy  bool      `msgpack:"include_why,omitempty" json:"include_why,omitempty"`
@@ -238,6 +241,16 @@ type ActivateRequest struct {
 	// IncludeInvalid disables the valid-time gate entirely (show history):
 	// expired facts are returned, annotated with expired=true.
 	IncludeInvalid bool `json:"include_invalid,omitempty" msgpack:"include_invalid,omitempty"`
+	// IncludeWeak opts out of weak_only abstention: on a calibrated response
+	// whose every row is band `weak`, recall withholds the rows by default
+	// (abstained_reason "weak_only", weak_available = how many). true returns
+	// them. An explicit Threshold, any Filters, or mode "deep" imply it.
+	IncludeWeak bool `json:"include_weak,omitempty" msgpack:"include_weak,omitempty"`
+	// ExcludeAssociated suppresses the response's `associated` block (MCP
+	// include_associated:false). Zero value = include — on a surface that
+	// returns the block at all (WithAssociatedRendered); every other surface
+	// never gets one.
+	ExcludeAssociated bool `json:"exclude_associated,omitempty" msgpack:"exclude_associated,omitempty"`
 }
 
 // Weights defines scoring weight distribution.
@@ -300,9 +313,15 @@ type ActivateResponse struct {
 	// primary HNSW vector search produced real scores and only a secondary
 	// post-load fetch failed (over-warn beats under-warn on a correctness signal).
 	// Caller-supplied embeddings are not zero-checked (only embed-backend paths).
-	// Carried on MBP + REST (alias) + MCP muninn_recall; gRPC does NOT yet map it
-	// (pb.ActivateResponse has no field — a documented deferral, tracked separately).
+	// Carried on MBP + REST (alias) + MCP muninn_recall + gRPC
+	// (pb.ActivateResponse.semantic_degraded, field 7).
 	SemanticDegraded bool `msgpack:"semantic_degraded,omitempty" json:"semantic_degraded,omitempty"`
+	// SemanticDegradedReason names which failure set SemanticDegraded:
+	// embed_timeout (the query embed missed its budget — embedder busy or
+	// slow) | embed_unavailable (the embed call failed) | embed_zero_vector |
+	// stored_embedding_read. Empty iff SemanticDegraded is false. Same
+	// surfaces as SemanticDegraded (gRPC field 8).
+	SemanticDegradedReason string `msgpack:"semantic_degraded_reason,omitempty" json:"semantic_degraded_reason,omitempty"`
 	// Abstained is true when the recall pipeline ran to completion and
 	// DELIBERATELY returned nothing: candidates were scored and every one fell
 	// below the relevance bar (or was filtered). It distinguishes "the vault
@@ -310,7 +329,10 @@ type ActivateResponse struct {
 	// result is indistinguishable from an un-run one, the silent-substitution
 	// class fixed across #742..#746. AbstainedReason is machine-readable:
 	// no_candidates | below_threshold | filtered | superseded_only |
-	// ambiguous_version. The last two come from COG-28 version-head resolution
+	// ambiguous_version | weak_only. weak_only: the response was CALIBRATED and
+	// every row it would have returned was band `weak` — neighbours of the
+	// query, not answers — so they were withheld; WeakAvailable says how many,
+	// and the request's include_weak returns them. The middle two come from COG-28 version-head resolution
 	// (#763): the query's only admission-worthy evidence sat in a declared
 	// supersession chain with, respectively, no reachable current head or a
 	// fork the engine refuses to choose a branch of. Both fields are
@@ -320,12 +342,46 @@ type ActivateResponse struct {
 	// flag. Empty iff Abstained is false.
 	Abstained       bool   `msgpack:"abstained,omitempty"        json:"abstained,omitempty"`
 	AbstainedReason string `msgpack:"abstained_reason,omitempty" json:"abstained_reason,omitempty"`
+	// WeakAvailable is set only with AbstainedReason "weak_only": the number of
+	// weak rows withheld. Recall again with include_weak to receive them.
+	WeakAvailable int `msgpack:"weak_available,omitempty" json:"weak_available,omitempty"`
 	// Conflict is COG-29 contradiction honesty (#764): at least two returned
 	// memories are declared to contradict each other and the conflict is
 	// unresolved, so neither is presented as the answer. nil otherwise.
 	// Carried on MBP + REST (alias) + MCP; gRPC does NOT map it (pb has no
 	// annotation fields at all — obligation #3, deliberate).
 	Conflict *ConflictBlock `msgpack:"conflict,omitempty" json:"conflict,omitempty"`
+	// Associated (COG-35) lists, in a separate bounded channel, memories that
+	// did NOT match the query but are associated with rows that did, when they
+	// did not make the cut: at most 3, compact (no content), the array at most
+	// 600 bytes as encoding/json encodes it (HTML-escaped; the "associated"
+	// key not counted). An item too long on its own is shortened and marked
+	// Truncated, never dropped. Not counted against max_results or in
+	// TotalFound, never abstention-relevant. nil (absent) when there are none,
+	// the caller set ExcludeAssociated, or the surface does not return the
+	// block (no WithAssociatedRendered on the request context).
+	Associated []AssociatedItem `msgpack:"associated,omitempty" json:"associated,omitempty"`
+	// AssociatedOmitted counts association-only memories that qualified for
+	// Associated but were left out by its 3-item or byte cap. Absent (0) when
+	// every qualifying memory is shown.
+	AssociatedOmitted int `msgpack:"associated_omitted,omitempty" json:"associated_omitted,omitempty"`
+}
+
+// AssociatedItem is one association-only memory: evidence that it is
+// ASSOCIATED with a returned memory, never that it matched the query.
+type AssociatedItem struct {
+	ID      string `msgpack:"id"      json:"id"`
+	Concept string `msgpack:"concept" json:"concept"`
+	// Why names the evidence, e.g. `shares entity "X" with <returned id>`.
+	Why string `msgpack:"why" json:"why"`
+	// Strength is the association evidence (the rarity-weighted entity
+	// evidence shared with returned rows, 0..0.30). Not a match score.
+	Strength float32 `msgpack:"strength" json:"strength"`
+	// Basis is always "associated_not_matched".
+	Basis string `msgpack:"basis" json:"basis"`
+	// Truncated is true when Concept and/or the entity name in Why were
+	// shortened (on a UTF-8 boundary, ending in "…") to fit the byte cap.
+	Truncated bool `msgpack:"truncated,omitempty" json:"truncated,omitempty"`
 }
 
 // ActivationItem is a single activated engram.
@@ -346,10 +402,12 @@ type ActivationItem struct {
 	Relevance       float32         `msgpack:"relevance,omitempty"         json:"relevance,omitempty"`
 	// RelevanceBand is #773's ABSOLUTE relevance band for this row:
 	// strong | moderate | weak | filter_match | uncalibrated.
+	// Evidence, not answerability: moderate is a candidate to verify, not an
+	// answer (COG-30 (d)). Comment only; the wire value is unchanged.
 	//
-	// Derived from ScoreComponents.AbsoluteScore against THIS VAULT's own
-	// calibration (its resolved default gate and its resolved content-channel
-	// ceiling) — NOT from Score, which is renormalized per query and therefore
+	// Derived from ScoreComponents.AbsoluteScore against fixed band edges (twice
+	// the fusion mode's default gate — a constant, not measured per vault — and
+	// half the vault's resolved content-channel ceiling) — NOT from Score, which is renormalized per query and therefore
 	// pins the best row of ANY query, however weak, to ~1.0. Not from
 	// Confidence either: that is the stored TRUTH-belief (COG-10), not a
 	// retrieval statistic.
@@ -495,9 +553,10 @@ type ConflictBlock struct {
 	Pairs      []ConflictPairInfo `msgpack:"pairs,omitempty"   json:"pairs,omitempty"`
 	Warning    string             `msgpack:"warning,omitempty" json:"warning,omitempty"`
 	// AdjacencyOverflow reports how many rows beyond max_results the response
-	// carries in order to keep a conflict cluster whole. Returning one side of
-	// a conflict alone is the failure this block exists to remove, so the
-	// truncation yields to it — but never silently.
+	// carries: each is the disputing partner of a returned row that did not
+	// make the cut — only the partner, at most one per returned row, never
+	// chained, at most min(max_results, 3) (engine.applyContradictionCut).
+	// A partner the cap keeps out is still named on its row.
 	AdjacencyOverflow int `msgpack:"adjacency_overflow,omitempty" json:"adjacency_overflow,omitempty"`
 }
 
@@ -631,10 +690,34 @@ type ForgetResponse struct {
 	OK bool `msgpack:"ok" json:"ok"`
 }
 
-// StatRequest queries database statistics.
+// StatRequest queries statistics.
+//
+// By default the answer covers ONE vault — Vault, or "default" when it is
+// empty — and says nothing about any other: that is all a caller entitled to
+// one vault may learn (SEC-24).
 type StatRequest struct {
 	Vault string `msgpack:"vault,omitempty" json:"vault,omitempty"`
+
+	// ServerWide asks for the server-wide answer instead: every vault's
+	// coherence entry by name, the server's vault count and its on-disk size
+	// (engram_count is still Vault's own when Vault is set). It is for callers
+	// the server has already established may see every vault — the admin
+	// session behind the console's dashboard.
+	//
+	// It has no wire name on purpose. No msgpack frame and no JSON body can set
+	// it, so no client can ask for it; only server code can, at a call site that
+	// has checked who is asking. TestStatRequest_ServerWideCannotComeOffTheWire
+	// pins that.
+	ServerWide bool `msgpack:"-" json:"-"`
 }
+
+// The values of StatResponse.Scope.
+const (
+	// StatScopeVault: the answer covers the one vault the request named.
+	StatScopeVault = "vault"
+	// StatScopeServer: the answer covers every vault on the server.
+	StatScopeServer = "server"
+)
 
 // CoherenceResult holds coherence metrics for a single vault.
 type CoherenceResult struct {
@@ -646,13 +729,24 @@ type CoherenceResult struct {
 	TotalEngrams         int64   `msgpack:"total_engrams"         json:"total_engrams"`
 }
 
-// StatResponse returns database stats.
+// StatResponse returns statistics for the scope named in Scope.
+//
+// At vault scope every figure is about that one vault: EngramCount is its
+// count, VaultCount is 1, CoherenceScores has at most its own entry, and
+// StorageBytes is 0 — the store's on-disk size is one figure for all vaults, so
+// reporting it would tell a single-vault caller how much everyone else holds.
+// At server scope VaultCount, StorageBytes and CoherenceScores cover the whole
+// server.
 type StatResponse struct {
 	EngramCount     int64                      `msgpack:"engram_count"        json:"engram_count"`
 	VaultCount      int                        `msgpack:"vault_count"         json:"vault_count"`
 	IndexSize       int64                      `msgpack:"index_size"          json:"index_size"`
 	StorageBytes    int64                      `msgpack:"storage_bytes"       json:"storage_bytes"`
 	CoherenceScores map[string]CoherenceResult `msgpack:"coherence,omitempty" json:"coherence,omitempty"`
+	// Scope is StatScopeVault or StatScopeServer: what the figures above cover.
+	// A reader that sees "vault" knows vault_count and storage_bytes are not
+	// the server's.
+	Scope string `msgpack:"scope,omitempty" json:"scope,omitempty"`
 }
 
 // PingRequest is a keepalive probe.

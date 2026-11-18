@@ -68,6 +68,15 @@ type roleEvent struct {
 	cause    demotionCause // valid when !promoted
 }
 
+// haltRetryInterval is the shortest time a follower that has been refused
+// waits before asking again, and haltReminderInterval is how often it repeats
+// the refusal in its log while nothing has changed. Neither is a tuning knob
+// for replication: a refused follower is waiting for an operator.
+const (
+	haltRetryInterval    = 5 * time.Second
+	haltReminderInterval = time.Minute
+)
+
 // ErrDraining is returned when a write is attempted while the node is draining.
 var ErrDraining = errors.New("node is draining: not accepting new writes")
 
@@ -121,6 +130,32 @@ type ClusterCoordinator struct {
 	// Per-Lobe streamers (Cortex only): lobeID -> cancel func
 	streamers   map[string]context.CancelFunc
 	streamersMu sync.Mutex
+	// streamerWG counts live streamer goroutines so Stop can join them. A
+	// cancel func only asks a streamer to exit; a streamer already past its
+	// context check still performs one more replication-log read, and the
+	// caller of Stop closes the store next.
+	streamerWG sync.WaitGroup
+	// streamersStopped latches in Stop (guarded by streamersMu). Once set,
+	// startStreamerForLobe starts nothing: a streamer started after Stop has
+	// begun its join would be neither cancelled nor waited for.
+	streamersStopped bool
+
+	// pruneStop and pruneWG let Stop end and join the periodic prune loop
+	// (startPeriodicPrune). The loop is otherwise ended only by Run's context,
+	// which Stop does not own, and a tick still running when the caller closes
+	// the store panics with "pebble: closed" inside the prune's compaction.
+	// pruneStopped latches in Stop under pruneMu, the same way
+	// streamersStopped does: a loop started after Stop has begun its wait
+	// would be neither ended nor waited for.
+	pruneStop chan struct{}
+	// haltRetry is haltRetryInterval, as a field so a test can shorten it.
+	haltRetry    time.Duration
+	pruneMu      sync.Mutex
+	pruneStopped bool
+	pruneWG      sync.WaitGroup
+	// streamerBeforeRead is handed to every NetworkStreamer this coordinator
+	// starts (NetworkStreamer.beforeRead). Test seam; nil in production.
+	streamerBeforeRead func()
 
 	// quorumLostSince is the time when this Cortex first noticed it could not
 	// reach a quorum of live peers. Zero value means quorum is healthy.
@@ -162,13 +197,6 @@ type ClusterCoordinator struct {
 	// deleting WAL segments that the snapshot receiver still needs.
 	snapshotInProgress atomic.Int32
 
-	// lastLoggedPruneSeq is the highest watermark the periodic prune loop has
-	// already logged. ReplicationLog.Prune is a cheap no-op once a watermark
-	// has already been pruned (#726), so the loop calls it unconditionally
-	// every tick — this just keeps that from writing an identical INFO line
-	// every PruneIntervalSec once the log is caught up.
-	lastLoggedPruneSeq atomic.Uint64
-
 	// reconciler runs post-partition cognitive reconciliation.
 	// Set via SetReconciler after the coordinator is created.
 	reconciler *Reconciler
@@ -200,8 +228,18 @@ type ClusterCoordinator struct {
 	started atomic.Bool
 
 	// Callbacks for the engine layer
-	OnBecameCortex func(epoch uint64) // engine should start cognitive workers
-	OnBecameLobe   func()             // engine should stop cognitive workers
+	//
+	// BeforeBecomingCortex runs inside takeLeaderRole BEFORE the role flips,
+	// while the applier is held, so no entry is applied and no local write or
+	// prune is let through as leader until it returns. It is for local state
+	// that must be right before this node acts as leader: the vault counts,
+	// which a follower's applied records never moved (STO-30). It runs under
+	// election.mu and the applier's lock and must not call back into the
+	// coordinator or the applier. A panic is recovered and logged, and the
+	// promotion goes ahead.
+	BeforeBecomingCortex func(epoch uint64)
+	OnBecameCortex       func(epoch uint64) // engine should start cognitive workers
+	OnBecameLobe         func()             // engine should stop cognitive workers
 }
 
 // Coordinator is a type alias for backward compatibility.
@@ -227,6 +265,9 @@ func NewClusterCoordinator(
 	election := NewElection(cfg.NodeID, epochStore, mgr)
 	joinHandler := NewJoinHandler(cfg.NodeID, cfg.ClusterSecret, epochStore, repLog, mgr)
 	joinHandler.localAddr = advertiseAddr
+	if applier != nil {
+		joinHandler.appliedMark = applier.LastAppliedMark
+	}
 	joinClient := NewJoinClient(cfg.NodeID, advertiseAddr, cfg.ClusterSecret, epochStore, applier, mgr)
 	joinClient.localRole = roleFromConfigString(cfg.Role)
 
@@ -236,6 +277,8 @@ func NewClusterCoordinator(
 	}
 
 	c := &ClusterCoordinator{
+		pruneStop:     make(chan struct{}),
+		haltRetry:     haltRetryInterval,
 		cfg:           cfg,
 		repLog:        repLog,
 		applier:       applier,
@@ -655,6 +698,13 @@ func (c *ClusterCoordinator) joinWithRetry(ctx context.Context, seeds []string, 
 		if err == nil {
 			return resp, nil
 		}
+		// The leader that answered refused this node for the history it holds,
+		// or did not confirm it while an earlier refusal stands. Retrying cannot
+		// change that, so hand the refusal to the caller instead of backing off
+		// into it.
+		if errors.Is(err, ErrFollowerAhead) {
+			return resp, err
+		}
 		// Redirect: a non-leader rejected us and pointed at the leader it knows.
 		// Try that address immediately (no backoff) instead of cycling seeds, so
 		// a Lobe finds the real Cortex fast after a failover (#533).
@@ -714,6 +764,17 @@ func (c *ClusterCoordinator) streamReplication(ctx context.Context, role string,
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if errors.Is(err, ErrFollowerAhead) {
+				// Who leads, and at what epoch, is not taken from a refusal. A
+				// join answer is not authenticated: the cluster secret proves
+				// this node to the leader, not the leader to this node. This node
+				// learns the leader from its claim (peer discovery announces it
+				// on every new connection, and an election broadcasts it). Until
+				// that claim has arrived the wait below cannot tell that the term
+				// is unchanged, and asks again once per retry interval.
+				c.haltReplication(ctx, resp.CortexID, resp.Epoch, err)
+				continue
 			}
 			// Non-fatal: the leader may not be up yet (or this node is a demoted
 			// Cortex whose seeds are its now-down lobes). Back off and keep trying
@@ -778,6 +839,68 @@ func (c *ClusterCoordinator) streamReplication(ctx context.Context, role string,
 	}
 }
 
+// haltReplication holds the join loop of a follower that has just been refused
+// (ErrFollowerAhead) until something that could change the answer has
+// happened: a different leader, or a different epoch.
+//
+// It does not keep asking the same leader. The answer cannot improve within a
+// term, and asking costs something: a leader built before the check admits the
+// node, registers the join connection in place of the one carrying this node's
+// heartbeats and votes, and this node then declines and closes it.
+//
+// The refusal itself is not kept here. It is on disk (HaltRecord), written by
+// the join that was refused, and it is what ReplicationHalt reports. This only
+// decides when to ask again.
+//
+// The node keeps heartbeating and voting throughout. Only replication stops.
+func (c *ClusterCoordinator) haltReplication(ctx context.Context, leaderID string, epoch uint64, cause error) {
+	sameTerm := func() bool {
+		return c.election.CurrentLeader() == leaderID && c.epochStore.Load() == epoch
+	}
+	// Always wait one retry interval, so a node that cannot tell whether the
+	// term has changed (it never saw this leader's claim) asks again at a
+	// bounded rate instead of spinning.
+	retry := time.NewTimer(c.haltRetry)
+	defer retry.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-retry.C:
+	}
+
+	poll := time.NewTicker(c.heartbeatInterval())
+	defer poll.Stop()
+	remind := time.NewTicker(haltReminderInterval)
+	defer remind.Stop()
+	for sameTerm() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-poll.C:
+		case <-remind.C:
+			slog.Error("cluster: replication is still stopped: this node holds an entry its leader does not",
+				"node", c.cfg.NodeID, "leader", leaderID, "epoch", epoch, "cause", cause)
+		}
+	}
+}
+
+// ReplicationHalt reports whether this node, as a follower, is not replicating
+// because a leader refused it, and why. A leader is never halted.
+//
+// The answer comes from the record on this node's disk (HaltRecord), so it is
+// the same before the node has contacted anyone after a restart as it was
+// before the restart. What removes the record is listed on HaltRecord.
+func (c *ClusterCoordinator) ReplicationHalt() (reason string, halted bool) {
+	if c.applier == nil || c.IsLeader() {
+		return "", false
+	}
+	rec, ok := c.applier.Halt()
+	if !ok {
+		return "", false
+	}
+	return rec.err().Error(), true
+}
+
 // streamFromCortex reads replication frames from the Cortex over the live join
 // connection and dispatches each via HandleIncomingFrame, until the connection
 // errors or ctx is cancelled. Returns nil on ctx cancellation; the read error
@@ -810,7 +933,7 @@ func (c *ClusterCoordinator) streamFromCortex(ctx context.Context, conn net.Conn
 		}
 		// After applying a replication entry, report our progress so the Cortex
 		// can track replica lag (#516 part 3). The Cortex reads these acks via
-		// handleClusterConn → HandleIncomingFrame → UpdateReplicaSeq.
+		// ServeConn → HandleIncomingFrame → UpdateReplicaSeq.
 		if frame.Type == mbp.TypeReplEntry {
 			c.sendReplAck(cortexID, conn)
 		}
@@ -1315,7 +1438,7 @@ func (c *ClusterCoordinator) EvictConn(nodeID string, conn net.Conn) {
 // HandleIncomingJoin processes a TypeJoinRequest frame on a raw inbound conn
 // whose node ID is not yet known. It registers the live conn under req.NodeID
 // so that peer.Send works immediately (no dial required), processes the join
-// request, and returns the joining node's stable ID so that handleClusterConn
+// request, and returns the joining node's stable ID so that ServeConn
 // can use it for all subsequent frames on the same connection.
 func (c *ClusterCoordinator) HandleIncomingJoin(conn net.Conn, payload []byte) (string, bool, error) {
 	var req mbp.JoinRequest
@@ -1385,6 +1508,33 @@ func (c *ClusterCoordinator) HandleIncomingJoin(conn net.Conn, payload []byte) (
 			})
 		}
 		return req.NodeID, false, nil
+	}
+
+	// A joiner that holds an entry this Cortex does not, or that was refused
+	// before and cannot be confirmed now, is refused BEFORE its conn is
+	// registered, for the reason the non-leader gate above gives:
+	// registering would evict the joiner's existing peer connection, the one
+	// carrying its heartbeats and votes, in exchange for a join conn that is
+	// about to be closed. A refused replica must stay a live voter. The answer
+	// goes out on the raw conn and the caller closes it.
+	//
+	// Only for a request the ordinary path would have admitted this far: an
+	// unauthenticated one must not learn the log head, and a version mismatch
+	// is the more useful thing to tell a joiner that has both problems. Those
+	// fall through and are rejected below as before.
+	if req.ProtocolVersion >= mbp.MinSupportedProtocolVersion && req.ProtocolVersion <= mbp.CurrentProtocolVersion &&
+		c.joinHandler.ValidSecret(req.NodeID, req.Role, req.ProtocolVersion, req.SecretHash) {
+		if resp, refused, _ := c.joinHandler.refuseIfAhead(req); refused {
+			if respPayload, err := msgpack.Marshal(resp); err == nil {
+				_ = mbp.WriteFrame(conn, &mbp.Frame{
+					Version:       0x01,
+					Type:          mbp.TypeJoinResponse,
+					PayloadLength: uint32(len(respPayload)),
+					Payload:       respPayload,
+				})
+			}
+			return req.NodeID, false, nil
+		}
 	}
 
 	// Register the live inbound conn so peer.Send succeeds immediately.
@@ -1580,18 +1730,53 @@ func (c *ClusterCoordinator) HandleIncomingFrame(fromNodeID string, frameType ui
 	}
 }
 
-// Stop performs a graceful shutdown: stops streamers, stops MSP, closes connections.
+// Stop shuts the replication streamers down and closes every peer connection.
+// It is terminal: no streamer starts on this coordinator afterwards.
+//
+// Stop returns only after every streamer goroutine has exited, because its
+// caller closes the store next (cmd/muninn/server.go) and a streamer reads the
+// replication log straight from Pebble, which panics on a read after Close.
+// Cancelling is not enough on its own: Stream checks its context and then
+// reads, so a streamer already past the check reads once more.
+//
+// The wait is short: a cancelled streamer exits at its next context check, and
+// between two checks it does one log read (at most 1000 entries) or one frame
+// send, which the connection close below fails.
+//
+// Only the streamers are joined. The other goroutines this coordinator starts
+// are not: they end with Run's context, with their connection, or on their
+// own, and nothing waits for them. Some of those use the store as well (the
+// periodic prune, the post-join snapshot sender, the frame readers that apply
+// entries), so "Stop returned" does not yet mean nothing in this package can
+// touch the store.
 func (c *ClusterCoordinator) Stop() error {
-	// Stop all streamers
+	// Cancel all streamers and refuse new ones.
 	c.streamersMu.Lock()
+	c.streamersStopped = true
 	for id, cancel := range c.streamers {
 		cancel()
 		delete(c.streamers, id)
 	}
 	c.streamersMu.Unlock()
 
-	// Close all peer connections
-	return c.mgr.Close()
+	// Close all peer connections. Before the join, not after: a streamer in
+	// the middle of a frame write to a slow peer sees its context only once
+	// that write returns.
+	err := c.mgr.Close()
+
+	c.streamerWG.Wait()
+
+	// End the periodic prune loop and wait for it, including a tick that is
+	// in the middle of a delete and compaction: the caller closes the store
+	// next.
+	c.pruneMu.Lock()
+	if !c.pruneStopped {
+		c.pruneStopped = true
+		close(c.pruneStop)
+	}
+	c.pruneMu.Unlock()
+	c.pruneWG.Wait()
+	return err
 }
 
 // handlePromotion is called when this node wins an election.
@@ -1608,9 +1793,7 @@ func (c *ClusterCoordinator) handlePromotion(epoch uint64) {
 			"epoch", epoch, "node", c.cfg.NodeID)
 		return
 	}
-	c.roleMu.Lock()
-	c.role = RolePrimary
-	c.roleMu.Unlock()
+	c.takeLeaderRole(epoch)
 	c.election.mu.Unlock()
 
 	slog.Info("cluster: promoted to Cortex", "epoch", epoch, "node", c.cfg.NodeID)
@@ -1618,6 +1801,137 @@ func (c *ClusterCoordinator) handlePromotion(epoch uint64) {
 	c.pushRoleEvent(roleEvent{promoted: true})
 
 	c.invokeOnBecameCortex(epoch)
+}
+
+// takeLeaderRole makes this node the leader: it brings the replication log's
+// sequence counter up to the node's applied position and then flips the role,
+// in that order and as one step with respect to the applier.
+//
+// Why the counter moves. While this node followed, it applied the leader's
+// entries without appending any of its own (the applier records last_applied
+// only, and LocalAppendFunc suppresses a follower's appends), so its counter is
+// wherever its own last term as leader left it, which is 0 if it has never led. A
+// follower of the previous leader has applied up to that leader's head and
+// skips every entry numbered at or below that (Applier.Apply). Numbered from
+// the stale counter, this node's first writes as leader would all be skipped,
+// by followers reporting no lag. Numbered from its applied position, its first
+// entry is one past everything it has applied.
+//
+// Why before the flip. The role is what lets local writes into the log
+// (LocalAppendFunc appends unless the node is definitively a follower). With
+// the counter raised first, no append can be numbered from the old value.
+//
+// Why under the applier's lock. An entry from the previous leader may still be
+// arriving. Holding the cursor means such an entry has either been counted in
+// the position read here or is applied after the role has changed. It cannot
+// land between the read and the flip and leave the counter one short.
+//
+// What this does not cover:
+//   - A follower that had applied FURTHER than this node. This node cannot
+//     number its way past entries it never saw, so that follower is refused
+//     at join where the difference can be proven (JoinHandler.divergence,
+//     STO-27) rather than streamed to.
+//   - Entries the previous leader streams after this point. A leader does not
+//     stop applying what a deposed leader still sends, and another follower
+//     may apply them too. Telling two leaders' entries apart needs positions
+//     tagged with the epoch that wrote them.
+//
+// A node that takes the role while it holds a refusal record. A vote does not
+// look at replication, so a refused node can be elected, and nothing here
+// stops it. The record is removed, because a leader follows nobody and the
+// other nodes are measured against it from now on. That is the moment the
+// cluster's history changes line, and it is logged as an error for that
+// reason (reportHaltAtPromotion). The record is removed in the same step that
+// flips the role, under the applier's lock, and from then until this node
+// steps down no refusal can be recorded (Applier.takeLead). A join answered
+// before the flip can arrive after it, and it must not leave a refusal on the
+// leader.
+//
+// Caller holds election.mu.
+func (c *ClusterCoordinator) takeLeaderRole(epoch uint64) {
+	flip := func() {
+		c.roleMu.Lock()
+		c.role = RolePrimary
+		c.roleMu.Unlock()
+	}
+	if c.applier == nil || c.repLog == nil {
+		c.invokeBeforeBecomingCortex(epoch)
+		flip()
+		return
+	}
+	was, removed, err := c.applier.takeLead(epoch, func(applied uint64) {
+		// Under the applier's hold: nothing is applied between this and the
+		// flip, so local state prepared here is still right when the role
+		// changes.
+		c.invokeBeforeBecomingCortex(epoch)
+		previous, err := c.repLog.AdvanceTo(applied)
+		switch {
+		case err != nil:
+			// AdvanceTo keeps the target whichever step failed (see its doc), so
+			// the promotion goes ahead: the claim is already broadcast, and a
+			// leader that then declined the role would leave the cluster
+			// following nobody.
+			slog.Error("cluster: could not record the replication sequence position at promotion (numbering continues from it regardless)",
+				"node", c.cfg.NodeID, "epoch", epoch, "applied", applied, "err", err)
+		case applied > previous:
+			slog.Info("cluster: replication sequence continues from this node's applied position",
+				"node", c.cfg.NodeID, "epoch", epoch, "log_head_was", previous, "log_head", applied)
+		}
+		flip()
+	})
+	c.reportHaltAtPromotion(epoch, was, removed, err)
+}
+
+// reportHaltAtPromotion says in the log what the promotion of a node that held
+// a refusal record did. takeLead has already removed the record.
+//
+// The node had been refused because it held an entry its leader did not. It
+// now leads from its own position, so its history is the cluster's. Everything
+// the leader that refused it acknowledged and this node never applied is on
+// that leader's disk only. And that leader is NOT refused in turn when it
+// rejoins: a deposed leader asks to join from its apply cursor, which is where
+// it stood when it was promoted, not from the head of the log it wrote, so
+// nothing it wrote in its term is compared with anything
+// (TestFailover_ARefusedReplicaCanWinAnElection). An operator reading the log
+// afterwards has to be able to find the line where this happened, whether an
+// election did it or they asked for it.
+func (c *ClusterCoordinator) reportHaltAtPromotion(epoch uint64, was HaltRecord, cleared bool, err error) {
+	if err != nil {
+		slog.Error("cluster: this node is now the Cortex but its stored refusal record could not be removed; "+
+			"it will report itself refused again if it is restarted or demoted",
+			"node", c.cfg.NodeID, "epoch", epoch, "err", err)
+	}
+	if !cleared && err == nil {
+		return
+	}
+	slog.Error("cluster: THE CLUSTER'S HISTORY HAS CHANGED LINE. This node had been refused as a replica because it held an entry its Cortex did not, and it is now the Cortex. "+
+		"Its history is the cluster's from here. Every write the previous Cortex acknowledged that this node never applied is on that node only, "+
+		"including any it numbered at or below this node's position. Nothing refuses that node when it rejoins: "+
+		"it follows this node, keeps those writes on its own disk and reports itself healthy. Compare the two nodes before trusting either",
+		"node", c.cfg.NodeID,
+		"epoch", epoch,
+		"was_refused_by", was.LeaderID,
+		"was_refused_in_epoch", was.Epoch,
+		"this_node_position", was.LastApplied,
+		"that_cortex_log_head_then", was.LeaderHead,
+		"was_refused_because", was.Why,
+		"see", "docs/cluster-operations.md, \"A replica the leader refuses\"",
+	)
+}
+
+// invokeBeforeBecomingCortex runs BeforeBecomingCortex, recovered so a panic
+// cannot stop a promotion that has already been claimed.
+func (c *ClusterCoordinator) invokeBeforeBecomingCortex(epoch uint64) {
+	if c.BeforeBecomingCortex == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("cluster: BeforeBecomingCortex callback panicked",
+				"node", c.cfg.NodeID, "epoch", epoch, "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	c.BeforeBecomingCortex(epoch)
 }
 
 // invokeOnBecameCortex runs OnBecameCortex synchronously on the caller's
@@ -1676,6 +1990,9 @@ func (c *ClusterCoordinator) handleDemotion(cause demotionCause) {
 	c.roleMu.Lock()
 	c.role = RoleReplica
 	c.roleMu.Unlock()
+	if c.applier != nil {
+		c.applier.stepDown()
+	}
 
 	// A new leadership term is over: clear the "observed a live quorum" latch so
 	// the next term's pre-emptive quorum-loss demotion is gated afresh (#522).
@@ -1723,11 +2040,21 @@ func (c *ClusterCoordinator) startStreamerForLobe(info NodeInfo) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c.streamersMu.Lock()
+	if c.streamersStopped {
+		// Stop has run (see streamersStopped). A Lobe can still get here: Stop
+		// drops its connection, it rejoins, and the join handler calls this.
+		c.streamersMu.Unlock()
+		cancel()
+		return
+	}
 	// Cancel any existing streamer for this lobe
 	if existing, ok := c.streamers[info.NodeID]; ok {
 		existing()
 	}
 	c.streamers[info.NodeID] = cancel
+	// Counted under the same lock as the streamersStopped check, so Stop's
+	// Wait cannot begin between that check and this Add.
+	c.streamerWG.Add(1)
 	c.streamersMu.Unlock()
 
 	startSeq := c.streamStartSeq(info.NodeID)
@@ -1736,7 +2063,9 @@ func (c *ClusterCoordinator) startStreamerForLobe(info NodeInfo) {
 		"lobe", info.NodeID, "from_seq", startSeq, "log_seq", logSeq, "backlog", logSeq-min(logSeq, startSeq))
 
 	go func() {
+		defer c.streamerWG.Done()
 		s := NewNetworkStreamer(c.repLog, peer, startSeq)
+		s.beforeRead = c.streamerBeforeRead
 		if err := s.Stream(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			// Report where the stream got to. Without this a streamer that died
 			// mid-catch-up was indistinguishable in the log from a healthy idle
@@ -2394,7 +2723,15 @@ func (c *ClusterCoordinator) startPeriodicPrune(ctx context.Context) {
 	if c.mol == nil && c.repLog == nil {
 		return
 	}
+	c.pruneMu.Lock()
+	if c.pruneStopped {
+		c.pruneMu.Unlock()
+		return
+	}
+	c.pruneWG.Add(1)
+	c.pruneMu.Unlock()
 	go func() {
+		defer c.pruneWG.Done()
 		pruneInterval := time.Duration(c.cfg.PruneIntervalSec) * time.Second
 		if pruneInterval <= 0 {
 			pruneInterval = 60 * time.Second
@@ -2405,52 +2742,67 @@ func (c *ClusterCoordinator) startPeriodicPrune(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
+			case <-c.pruneStop:
+				return
 			case <-ticker.C:
-				if !c.IsLeader() {
-					continue
-				}
-				if c.snapshotInProgress.Load() > 0 {
-					slog.Warn("cluster: skipping WAL prune — snapshot transfer in progress")
-					continue
-				}
-				pruneSeq, forced := c.pruneWatermark()
-				if pruneSeq == 0 {
-					continue
-				}
-				if c.mol != nil {
-					pruned, err := c.mol.SafePrune(pruneSeq)
-					if err != nil {
-						slog.Warn("cluster: periodic prune failed", "err", err)
-					} else if pruned > 0 {
-						slog.Info("cluster: pruned WAL segments", "pruned", pruned, "min_replicated_seq", pruneSeq)
-					}
-				}
-				// A forced prune goes past what replicas have acked. Drop those
-				// replicas BEFORE deleting the entries they still need, so they
-				// re-snapshot instead of silently skipping the hole.
-				if forced {
-					c.evictLobesBehind(pruneSeq)
-				}
-				// The MOL prune above only unlinks sealed segment FILES. The
-				// replication log lives in its own Pebble sub-range
-				// (prefix.Replication|subEntry, #726) and needs its own prune,
-				// or it grows without bound (observed: ~10 GB/day on an
-				// otherwise idle primary). ReplicationLog.Prune is a cheap
-				// no-op once a watermark has already been pruned, so this can
-				// run unconditionally every tick without an entry count to
-				// gate on.
-				if c.repLog != nil {
-					if err := c.repLog.Prune(pruneSeq); err != nil {
-						slog.Warn("cluster: replication log prune failed", "err", err)
-					} else if pruneSeq > c.lastLoggedPruneSeq.Load() {
-						c.lastLoggedPruneSeq.Store(pruneSeq)
-						slog.Info("cluster: pruned replication log",
-							"until_seq", pruneSeq, "forced_by_backlog", forced)
-					}
-				}
+				c.pruneOnce()
 			}
 		}
 	}()
+}
+
+// pruneOnce is one tick of the periodic prune. It returns the watermark it
+// pruned the replication log to and whether that deleted anything, for tests.
+func (c *ClusterCoordinator) pruneOnce() (untilSeq uint64, deleted bool) {
+	if !c.IsLeader() {
+		return 0, false
+	}
+	if c.snapshotInProgress.Load() > 0 {
+		slog.Warn("cluster: skipping WAL prune — snapshot transfer in progress")
+		return 0, false
+	}
+	pruneSeq, forced := c.pruneWatermark()
+	if pruneSeq == 0 {
+		return 0, false
+	}
+	if c.mol != nil {
+		pruned, err := c.mol.SafePrune(pruneSeq)
+		if err != nil {
+			slog.Warn("cluster: periodic prune failed", "err", err)
+		} else if pruned > 0 {
+			slog.Info("cluster: pruned WAL segments", "pruned", pruned, "min_replicated_seq", pruneSeq)
+		}
+	}
+	// A forced prune goes past what replicas have acked. Drop those
+	// replicas BEFORE deleting the entries they still need, so they
+	// re-snapshot instead of silently skipping the hole.
+	if forced {
+		c.evictLobesBehind(pruneSeq)
+	}
+	// The MOL prune above only unlinks sealed segment FILES. The
+	// replication log lives in its own Pebble sub-range
+	// (prefix.Replication|subEntry, #726) and needs its own prune,
+	// or it grows without bound (observed: ~10 GB/day on an
+	// otherwise idle primary). ReplicationLog.Prune is a cheap
+	// no-op once a watermark has already been pruned, so this can
+	// run unconditionally every tick without an entry count to
+	// gate on.
+	if c.repLog == nil {
+		return pruneSeq, false
+	}
+	deleted, err := c.repLog.prune(pruneSeq)
+	if err != nil {
+		slog.Warn("cluster: replication log prune failed", "err", err)
+		return pruneSeq, false
+	}
+	// Logged only when this tick deleted something. The watermark alone does
+	// not say that: at or past the log head, and at a watermark already
+	// pruned to, nothing is deleted.
+	if deleted {
+		slog.Info("cluster: pruned replication log",
+			"until_seq", pruneSeq, "forced_by_backlog", forced)
+	}
+	return pruneSeq, deleted
 }
 
 // RemoveNode gracefully removes a node from the cluster.

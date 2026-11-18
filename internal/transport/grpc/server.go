@@ -8,10 +8,12 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/scrypster/muninndb/internal/auth"
 	"github.com/scrypster/muninndb/internal/engine/trigger"
+	"github.com/scrypster/muninndb/internal/storage"
 	"github.com/scrypster/muninndb/internal/transport/mbp"
 	pb "github.com/scrypster/muninndb/proto/gen/go/muninn/v1"
 	"google.golang.org/grpc"
@@ -19,7 +21,9 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // EngineAPI is the interface the gRPC server requires from the engine.
@@ -51,6 +55,10 @@ type Server struct {
 	authStore *auth.Store
 	gs        *grpc.Server
 	tlsConfig *tls.Config // nil = plain TCP
+
+	// streamRecheck overrides subscribeRecheckInterval when positive. Tests
+	// set it so they do not wait thirty seconds for an idle stream's check.
+	streamRecheck time.Duration
 }
 
 // notCortexUnaryInterceptor turns a write refused by the cluster single-writer
@@ -85,6 +93,32 @@ func denyReadOnlyMutation(ctx context.Context) error {
 	return nil
 }
 
+// denyWriteOnlyRead rejects write-mode (ingest-only) keys on RPCs that return
+// stored memory or vault state: Read, Activate, Stat, ListVaults, Subscribe,
+// and AdjustConfidence (which returns an engram's confidence).
+// It is the gRPC counterpart of REST's auth.WriteOnlyGuard and of MCP's
+// write-mode tool gate. Which RPCs are reads is pinned against the service
+// descriptor by TestEveryRPCHasAModeClass, and the behaviour for every mode
+// and every RPC by TestCredentialModeMatrix.
+func denyWriteOnlyRead(ctx context.Context) error {
+	if auth.WriteOnlyFromContext(ctx) {
+		return status.Error(codes.PermissionDenied, "write-only key cannot read")
+	}
+	return nil
+}
+
+// msgInvalidVaultName is what a request is told when it names something no
+// vault can be called (auth.IsValidVaultName). A caller with no key names a
+// vault before it has shown any credential, and the name is looked up to find
+// out whether that vault is public; a message can carry megabytes in that
+// field. The name is checked first, and the refusal does not repeat it
+// (SEC-27). The status code is the one the request got before the check
+// existed: Unauthenticated with no key, PermissionDenied for a key naming a
+// vault that is not its own. Every path that makes a vault public has checked
+// its name against the same rule, so this refuses no vault that could have
+// been reached.
+const msgInvalidVaultName = "invalid vault name"
+
 // resolveRequestVault validates the vault named in an RPC request against the
 // authenticated context and returns the vault to hand to the engine. It mirrors
 // the REST layer's validateResolvedVault so gRPC enforces the same vault model:
@@ -103,10 +137,18 @@ func denyReadOnlyMutation(ctx context.Context) error {
 func (s *Server) resolveRequestVault(ctx context.Context, reqVault string) (string, error) {
 	reqVault = strings.TrimSpace(reqVault)
 	if key, ok := ctx.Value(auth.ContextAPIKey).(*auth.APIKey); ok && key != nil {
+		// Fork: scoped keys (a vault list or glob) resolve through
+		// auth.ResolveScopedVault; a single-vault key behaves exactly as
+		// upstream's "the key's vault is authoritative".
 		resolved, ok := auth.ResolveScopedVault(key.Scope(), reqVault)
 		if !ok {
 			if reqVault == "" {
 				return "", status.Error(codes.PermissionDenied, "this key requires an explicit vault")
+			}
+			// Upstream #949/SEC-27: a non-vault-name is refused as that,
+			// without being repeated back.
+			if !auth.IsValidVaultName(reqVault) {
+				return "", status.Error(codes.PermissionDenied, msgInvalidVaultName)
 			}
 			return "", status.Errorf(codes.PermissionDenied, "api key is not authorized for vault %q", reqVault)
 		}
@@ -116,6 +158,11 @@ func (s *Server) resolveRequestVault(ctx context.Context, reqVault string) (stri
 	vault := reqVault
 	if vault == "" {
 		vault = "default"
+	}
+	// A name no vault can have is refused as that, before it is looked up or
+	// repeated back: see msgInvalidVaultName.
+	if !auth.IsValidVaultName(vault) {
+		return "", status.Error(codes.Unauthenticated, msgInvalidVaultName)
 	}
 	if s.authStore == nil {
 		return "", status.Errorf(codes.Unauthenticated, "vault %q requires an API key", vault)
@@ -147,10 +194,10 @@ func NewServer(addr string, engine EngineAPI, authStore *auth.Store, tlsConfig *
 
 	opts := []grpc.ServerOption{
 		grpc.MaxConcurrentStreams(500),
+		grpc.StatsHandler(connTagger{}),
 		grpc.KeepaliveParams(kasp),
 		grpc.ChainUnaryInterceptor(server.authUnaryInterceptor, notCortexUnaryInterceptor),
 		grpc.ChainStreamInterceptor(server.authStreamInterceptor, notCortexStreamInterceptor),
-		grpc.ForceServerCodec(jsonCodec{}),
 	}
 	if tlsConfig != nil {
 		opts = append(opts, grpc.Creds(credentials.NewTLS(tlsConfig)))
@@ -210,6 +257,9 @@ func (s *Server) authUnaryInterceptor(ctx context.Context, req any, _ *grpc.Unar
 	}
 
 	// No token — check vault config (fail-closed: unconfigured vaults require a key).
+	if !auth.IsValidVaultName(vault) {
+		return nil, status.Error(codes.Unauthenticated, msgInvalidVaultName)
+	}
 	cfg, err := s.authStore.GetVaultConfig(vault)
 	if err != nil || !cfg.Public {
 		return nil, status.Errorf(codes.Unauthenticated, "vault %q requires an API key", vault)
@@ -362,6 +412,9 @@ func (s *Server) BatchWrite(ctx context.Context, req *pb.BatchWriteRequest) (*pb
 
 // Read implements the Read RPC.
 func (s *Server) Read(ctx context.Context, req *pb.ReadRequest) (*pb.ReadResponse, error) {
+	if err := denyWriteOnlyRead(ctx); err != nil {
+		return nil, err
+	}
 	vault, err := s.resolveRequestVault(ctx, req.Vault)
 	if err != nil {
 		return nil, err
@@ -410,6 +463,9 @@ func (s *Server) BatchForget(ctx context.Context, req *pb.BatchForgetRequest) (*
 
 // Stat implements the Stat RPC.
 func (s *Server) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatResponse, error) {
+	if err := denyWriteOnlyRead(ctx); err != nil {
+		return nil, err
+	}
 	vault, err := s.resolveRequestVault(ctx, req.Vault)
 	if err != nil {
 		return nil, err
@@ -425,16 +481,24 @@ func (s *Server) Stat(ctx context.Context, req *pb.StatRequest) (*pb.StatRespons
 
 // ListVaults implements the ListVaults RPC.
 // Requires a valid API key — anonymous/public-vault callers are rejected to
-// prevent cross-vault name enumeration by unauthenticated clients.
+// prevent cross-vault name enumeration by unauthenticated clients. A key is
+// pinned to one vault and is told about that vault only: enumeration by an
+// authenticated client is the same disclosure (SEC-25).
 func (s *Server) ListVaults(ctx context.Context, req *pb.ListVaultsRequest) (*pb.ListVaultsResponse, error) {
-	if ctx.Value(auth.ContextAPIKey) == nil {
+	key, _ := ctx.Value(auth.ContextAPIKey).(*auth.APIKey)
+	if key == nil {
 		return nil, status.Error(codes.Unauthenticated, "ListVaults requires an API key")
+	}
+	if err := denyWriteOnlyRead(ctx); err != nil {
+		return nil, err
 	}
 	resp, err := s.engine.ListVaults(ctx, req)
 	if err != nil {
 		slog.Error("list vaults failed", "error", err)
 		return nil, err
 	}
+	// The key's own vault, whatever else the server holds.
+	resp.Vaults = []string{key.Vault}
 	return resp, nil
 }
 
@@ -450,6 +514,13 @@ func (s *Server) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkRespons
 	req.Vault = vault
 	resp, err := s.engine.Link(ctx, req)
 	if err != nil {
+		// A link that would replace an edge of another relation at the same
+		// weight in the same direction (STO-15) is refused, and the caller
+		// changes the weight. Bare, it reached the client as codes.Unknown and
+		// was logged here as a server fault.
+		if errors.Is(err, storage.ErrAssocRelTypeCollision) {
+			return nil, status.Error(codes.FailedPrecondition, err.Error())
+		}
 		slog.Error("link failed", "error", err)
 		return nil, err
 	}
@@ -462,6 +533,11 @@ func (s *Server) Link(ctx context.Context, req *pb.LinkRequest) (*pb.LinkRespons
 // parsing and the documented sentinel→codes mapping.
 func (s *Server) AdjustConfidence(ctx context.Context, req *pb.AdjustConfidenceRequest) (*pb.AdjustConfidenceResponse, error) {
 	if err := denyReadOnlyMutation(ctx); err != nil {
+		return nil, err
+	}
+	// The response carries the resulting confidence, and with delta 0 nothing
+	// changes: for an ingest-only key that is a read (SEC-19).
+	if err := denyWriteOnlyRead(ctx); err != nil {
 		return nil, err
 	}
 	vault, err := s.resolveRequestVault(ctx, req.Vault)
@@ -480,6 +556,9 @@ func (s *Server) AdjustConfidence(ctx context.Context, req *pb.AdjustConfidenceR
 // Activate implements the Activate RPC (server-streaming).
 func (s *Server) Activate(req *pb.ActivateRequest, stream pb.MuninnDB_ActivateServer) error {
 	ctx := stream.Context()
+	if err := denyWriteOnlyRead(ctx); err != nil {
+		return err
+	}
 
 	// Multi-vault merged recall (project-vaults phase 2): "vaults" is
 	// mutually exclusive with "vault". Every entry must pass the caller's
@@ -558,20 +637,103 @@ func (s *Server) resolveRequestVaultsMulti(ctx context.Context, req *pb.Activate
 
 	reqs := make([]*pb.ActivateRequest, len(vaults))
 	for i, v := range vaults {
-		clone := *req
+		// proto.Clone, not a struct copy: generated messages carry internal
+		// state (protoimpl.MessageState) that must not be copied by value.
+		clone := proto.Clone(req).(*pb.ActivateRequest)
 		clone.Vault = v
 		clone.Vaults = nil
 		clone.VaultWeights = nil
-		reqs[i] = &clone
+		reqs[i] = clone
 	}
 	return reqs, weights, nil
+}
+
+// maxSubscribeStreamsPerConnection is how many Subscribe streams one client
+// connection may have open at once. It is the number an MBP connection is
+// allowed (mbp.maxSubscriptionsPerConnection) for the same reason: a vault
+// allows 100 subscriptions in all, and without a limit of its own one
+// connection could hold every one of them. A client that needs more opens
+// another connection. This bounds what ONE connection takes; it does not stop
+// a caller who opens many connections (SEC-26 residual).
+const maxSubscribeStreamsPerConnection = 8
+
+// connState is what the server keeps about one client connection.
+type connState struct {
+	subscribeStreams atomic.Int32 // Subscribe streams open on it now
+}
+
+type connStateKey struct{}
+
+// connOf returns the state of the connection an RPC arrived on, or nil for a
+// handler called without a transport (as unit tests do).
+func connOf(ctx context.Context) *connState {
+	c, _ := ctx.Value(connStateKey{}).(*connState)
+	return c
+}
+
+// connTagger is a stats.Handler whose only job is to give each client
+// connection a connState, carried in the context every RPC on that connection
+// inherits. gRPC has no other per-connection hook: a handler sees a stream,
+// and the peer address alone does not say when a connection has been replaced.
+type connTagger struct{}
+
+func (connTagger) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+	return context.WithValue(ctx, connStateKey{}, &connState{})
+}
+func (connTagger) HandleConn(context.Context, stats.ConnStats) {}
+func (connTagger) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context {
+	return ctx
+}
+func (connTagger) HandleRPC(context.Context, stats.RPCStats) {}
+
+// subscribeRecheckInterval is the longest an open Subscribe stream with nothing
+// to deliver goes without asking whether it is still authorised (SEC-23). It is
+// the interval of the REST subscription stream's keepalive, which does the same
+// job there.
+const subscribeRecheckInterval = 30 * time.Second
+
+// subscriptionEnded returns the error an open Subscribe stream ends with once
+// what authorised it no longer holds, and nil while it does.
+func (s *Server) subscriptionEnded(ctx context.Context, vault string) error {
+	if s.authStore == nil {
+		return nil
+	}
+	err := s.authStore.StreamStillAuthorized(ctx, vault)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, auth.ErrVaultNoLongerPublic):
+		return status.Errorf(codes.Unauthenticated, "vault %q requires an API key", vault)
+	default:
+		return status.Error(codes.Unauthenticated, auth.ErrKeyNoLongerValid.Error())
+	}
 }
 
 // Subscribe implements the Subscribe RPC (bidirectional streaming).
 // The client sends one SubscribeRequest; the server streams ActivationPush
 // messages until the client disconnects or the subscription TTL expires.
+//
+// The stream is authorised for as long as what authorised it holds: the server
+// asks again before every push and periodically in between, and ends the
+// stream with Unauthenticated when the key is no longer valid or the vault is
+// no longer public (SEC-23).
 func (s *Server) Subscribe(stream pb.MuninnDB_SubscribeServer) error {
 	ctx := stream.Context()
+	if err := denyWriteOnlyRead(ctx); err != nil {
+		return err
+	}
+
+	// One connection holds a bounded number of Subscribe streams at a time, so
+	// that it cannot take every subscription its vault allows (SEC-26). The
+	// place is taken before anything is read from the stream and given back
+	// when the stream ends, however it ends.
+	if conn := connOf(ctx); conn != nil {
+		if conn.subscribeStreams.Add(1) > maxSubscribeStreamsPerConnection {
+			conn.subscribeStreams.Add(-1)
+			return status.Error(codes.ResourceExhausted, "subscription limit reached for this connection")
+		}
+		defer conn.subscribeStreams.Add(-1)
+	}
 
 	req, err := stream.Recv()
 	if err != nil {
@@ -608,6 +770,11 @@ func (s *Server) Subscribe(stream pb.MuninnDB_SubscribeServer) error {
 
 	subID, err := s.engine.SubscribeWithDeliver(ctx, req, deliver)
 	if err != nil {
+		// A full vault or a full server is the caller's to act on, not a server
+		// fault to log at ERROR for every refused stream.
+		if errors.Is(err, trigger.ErrVaultSubscriptionLimitReached) || errors.Is(err, trigger.ErrGlobalSubscriptionLimitReached) {
+			return status.Error(codes.ResourceExhausted, "subscription limit reached")
+		}
 		slog.Error("subscribe failed", "error", err)
 		return err
 	}
@@ -615,30 +782,50 @@ func (s *Server) Subscribe(stream pb.MuninnDB_SubscribeServer) error {
 
 	// Confirm subscription to the client.
 	if err := stream.Send(&pb.ActivationPush{
-		SubscriptionID: subID,
+		SubscriptionId: subID,
 		Trigger:        "subscription_created",
 		At:             time.Now().UnixNano(),
 	}); err != nil {
 		return err
 	}
 
+	// What authorised this stream when it opened is asked again before every
+	// push, and every subscribeRecheckInterval while there is nothing to push.
+	// The stream ends when the answer is no: a key that was revoked or has
+	// expired, or, for a caller with no key, a vault that is no longer public
+	// (SEC-23). Returning ends the subscription too (the deferred Unsubscribe),
+	// so it stops counting against the vault.
+	interval := subscribeRecheckInterval
+	if s.streamRecheck > 0 {
+		interval = s.streamRecheck
+	}
+	recheck := time.NewTicker(interval)
+	defer recheck.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-recheck.C:
+			if err := s.subscriptionEnded(ctx, vault); err != nil {
+				return err
+			}
 		case push, ok := <-pushCh:
 			if !ok {
 				return nil
 			}
+			if err := s.subscriptionEnded(ctx, vault); err != nil {
+				return err
+			}
 			pbPush := &pb.ActivationPush{
-				SubscriptionID: push.SubscriptionID,
+				SubscriptionId: push.SubscriptionID,
 				Trigger:        string(push.Trigger),
 				PushNumber:     int32(push.PushNumber),
 				At:             push.At.UnixNano(),
 			}
 			if push.Engram != nil {
 				pbPush.Activation = &pb.ActivationItem{
-					ID:      push.Engram.ID.String(),
+					Id:      push.Engram.ID.String(),
 					Concept: push.Engram.Concept,
 					Content: push.Engram.Content,
 					Score:   float32(push.Score),

@@ -56,8 +56,11 @@ func TestSortScoredIDsDeterministicOnTies(t *testing.T) {
 	for _, in := range [][]ScoredID{{a, b, c}, {c, b, a}, {b, a, c}} {
 		s := append([]ScoredID(nil), in...)
 		sortScoredIDs(s)
-		if s[0] != a || s[1] != b || s[2] != c {
-			t.Fatalf("ties not ordered by ID ascending: %v", s)
+		// Upstream #918 (adopted at the 0.12.1 merge): exact ties break
+		// newest-first (rankorder.Before: ULID descending), the direction of
+		// recall's final sort.
+		if s[0] != c || s[1] != b || s[2] != a {
+			t.Fatalf("ties not ordered newest-first (ID descending): %v", s)
 		}
 	}
 }

@@ -12,7 +12,7 @@ package prefix
 
 // Source-of-truth prefix bytes. Storage unchanged; auth RELOCATED 0x11–0x14 → 0x42–0x45.
 const (
-	// Storage (0x01–0x2E, 0x30, 0x31; 0x2F is replication's)
+	// Storage (0x01–0x2E, 0x30, 0x31; 0x2F is replication's; fork marker at 0xF0)
 	Engram             byte = 0x01
 	Meta               byte = 0x02
 	AssocFwd           byte = 0x03
@@ -100,26 +100,12 @@ const (
 	// history: 0x2B → 0x2D → 0x2E → 0x2F → 0x30 (0x2F taken by Replication,
 	// #726).
 	UpsertKey byte = 0x30
-	// DeclaredContradictionMark (0x31) — per-vault O(1) answer to "does this
-	// vault contain ANY declared `contradicts` association?", the fast-path
-	// gate for COG-29 contradiction honesty. Key: 0x31 | ws(8) = 9 bytes.
-	// Value: 1 byte — 0x01 declared (sticky), 0x00 proven clean. ABSENT means
-	// UNKNOWN and must never be read as clean; see keys.DeclaredContradictionMarkKey
-	// and docs/internals/keyspace-registry.md.
-	//
-	// RELOCATION (fork, pre-0.11.0 merge): this marker was originally allocated
-	// 0x2F by this fork. Upstream #726 subsequently claimed 0x2F for the
-	// relocated Replication keyspace and #556 claimed 0x30 for UpsertKey, so
-	// both are now RESERVED FOR UPSTREAM and must not be reused here. The
-	// collision was not merely a registry clash: upstream's replication layout
-	// is 0x2F|0x01|seq_be64(8) for log entries and 0x2F|0x02|name for metadata,
-	// while this marker's key is 0x2F|ws(8) — a vault hash whose first byte
-	// happens to be 0x01 or 0x02 would have landed inside upstream's log-entry
-	// or metadata sub-range. Migration v7 (PurgeLegacyDeclaredContradictionMark)
-	// removes every stale 0x2F marker key and rebuilds the marker at 0x31; it is
-	// ordered BEFORE the renumbered upstream replication relocation so the purge
-	// can never delete a replication record.
-	DeclaredContradictionMark byte = 0x31
+	// SupersedesRestoreMark (0x31) — vault-scoped watermark for the one-time
+	// restore of the supersedes edges an older binary's association decay
+	// archived to 0x25 (2026-11-16). It is its own key, not a value of 0x2E,
+	// so the two passes keep separate version sequences: a later bump of
+	// either one's version cannot skip or repeat the other.
+	SupersedesRestoreMark byte = 0x31
 	// Capability (0x40/0x41 — clean since #612)
 	Capability         byte = 0x40
 	CapabilityVaultIdx byte = 0x41
@@ -132,6 +118,45 @@ const (
 	// Previously inlined as 0x29, which collided with storage's RecallEvent
 	// prefix; relocated here during the v0.10.0 merge.
 	APIKeyGlobIdx byte = 0x46
+	// DeclaredContradictionMark (0xF0) — per-vault O(1) answer to "does this
+	// vault contain ANY declared `contradicts` association?", the fast-path
+	// gate for COG-29 contradiction honesty (fork-only). Key: 0xF0 | ws(8) =
+	// 9 bytes. Value: 1 byte — 0x01 declared (sticky), 0x00 proven clean.
+	// ABSENT means UNKNOWN and must never be read as clean; see
+	// keys.DeclaredContradictionMarkKey and docs/internals/keyspace-registry.md.
+	//
+	// RELOCATION HISTORY (fork): 0x2F → 0x31 → 0xF0.
+	//
+	//   - 0x2F (original allocation). Upstream #726 claimed 0x2F for the
+	//     relocated Replication keyspace and #556 claimed 0x30 for UpsertKey,
+	//     so both are RESERVED FOR UPSTREAM. The collision was not merely a
+	//     registry clash: upstream's replication layout is 0x2F|0x01|seq_be64(8)
+	//     for log entries and 0x2F|0x02|name for metadata, while this marker's
+	//     key was 0x2F|ws(8) — a vault hash whose first byte happened to be
+	//     0x01 or 0x02 would have landed inside upstream's log-entry or metadata
+	//     sub-range. Migration v7 (PurgeLegacyDeclaredContradictionMark) removes
+	//     every stale 0x2F marker key; it is ordered BEFORE the renumbered
+	//     upstream replication relocation (v8).
+	//
+	//   - 0x31 (pre-0.11.0 merge to the 0.12.1 merge). Upstream #952 then
+	//     allocated 0x31 to SupersedesRestoreMark with a BYTE-IDENTICAL record
+	//     shape (key 0x31|ws(8), value one byte, version 1 == our "declared"),
+	//     so a stale marker reading 0x01 would make upstream's one-time
+	//     supersedes restore believe it had already run. Migration v11
+	//     (PurgeDeclaredContradictionMarkAt0x31) purges our records off 0x31
+	//     before any binary that knows SupersedesRestoreMark can write there,
+	//     and rebuilds the marker here.
+	//
+	// WHY 0xF0. Twice now the fork took the next free byte in upstream's own
+	// growth path and upstream walked into it. Upstream allocates storage
+	// bytes sequentially upward (0x01 → 0x31; its registry names 0x32–0x3F as
+	// the next storage range, "prefer 0x32+") and auth/capability upward from
+	// 0x40 (0x40–0x45, then 0x46+, where the fork already sits at 0x46). 0xFF
+	// holds upstream's ASCII-named global singletons (mig_ver, vcount_clean).
+	// 0xF0 is far outside every range upstream has used or advertised, below
+	// the 0xFF singleton byte, and unreferenced anywhere in the tree, so it is
+	// the fork's own corner: future fork-only prefixes should go 0xF1, 0xF2…
+	DeclaredContradictionMark byte = 0xF0
 
 	// [RT-FIX RT3] length invariants the v3 discriminator depends on (no magic numbers).
 	MinAPIKeyLen     = 17 // APIKey key = 1 + 16-byte hash
@@ -207,7 +232,7 @@ var registry = []Entry{
 	{AssocWeightRepairMark, "storage", "AssocWeightRepairMark", "vault-scoped-data"},
 	{Replication, "replication", "Replication", "replication"},
 	{UpsertKey, "storage", "UpsertKey", "vault-scoped-data"},
-	{DeclaredContradictionMark, "storage", "DeclaredContradictionMark", "vault-scoped-data"},
+	{SupersedesRestoreMark, "storage", "SupersedesRestoreMark", "vault-scoped-data"},
 	{Capability, "capability", "Capability", "capability"},
 	{CapabilityVaultIdx, "capability", "CapabilityVaultIdx", "capability"},
 	{AdminUser, "auth", "AdminUser", "auth"},
@@ -215,4 +240,5 @@ var registry = []Entry{
 	{APIKeyVaultIdx, "auth", "APIKeyVaultIdx", "auth"},
 	{VaultConfig, "auth", "VaultConfig", "auth"},
 	{APIKeyGlobIdx, "auth", "APIKeyGlobIdx", "auth"},
+	{DeclaredContradictionMark, "storage", "DeclaredContradictionMark", "vault-scoped-data"},
 }

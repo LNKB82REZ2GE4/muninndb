@@ -18,6 +18,7 @@ import (
 	plugincfg "github.com/scrypster/muninndb/internal/config"
 	"github.com/scrypster/muninndb/internal/engine"
 	"github.com/scrypster/muninndb/internal/engine/activation"
+	hnswpkg "github.com/scrypster/muninndb/internal/index/hnsw"
 	"github.com/scrypster/muninndb/internal/plugin"
 )
 
@@ -90,16 +91,12 @@ func (cw *countingWriter) Write(p []byte) (int, error) {
 
 // isValidVaultName returns true if name is a valid vault name: 1–64 characters,
 // containing only lowercase letters, digits, hyphens, and underscores.
+//
+// The rule itself lives in auth.IsValidVaultName, so that the admin routes
+// here, MCP, and the checks every transport makes on a vault named by a caller
+// with no key are one rule and cannot drift apart.
 func isValidVaultName(name string) bool {
-	if len(name) == 0 || len(name) > 64 {
-		return false
-	}
-	for _, r := range name {
-		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
-			return false
-		}
-	}
-	return true
+	return auth.IsValidVaultName(name)
 }
 
 // canonicalize returns a lowercase alphanumeric-only string for collision detection.
@@ -1282,6 +1279,37 @@ func (s *Server) handleReindexFTSVault(w http.ResponseWriter, r *http.Request) {
 		"vault":             name,
 		"engrams_reindexed": count,
 	})
+}
+
+// handleRebuildVectorIndex schedules a background rebuild of a vault's HNSW
+// graph and returns 202 at once; the vault keeps serving vector search from
+// its current graph until the rebuilt one replaces it. Progress: the
+// hnsw_rebuild field of /api/admin/observability.
+func (s *Server) handleRebuildVectorIndex(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "vault name required")
+		return
+	}
+	if !isValidVaultName(name) {
+		s.sendError(r, w, http.StatusBadRequest, ErrInvalidEngram, "vault name contains invalid characters")
+		return
+	}
+	if err := s.engine.RebuildVectorIndex(r.Context(), name); err != nil {
+		switch {
+		case errors.Is(err, engine.ErrVaultNotFound):
+			s.sendError(r, w, http.StatusNotFound, ErrVaultNotFound, err.Error())
+		case errors.Is(err, hnswpkg.ErrRebuildInProgress):
+			s.sendError(r, w, http.StatusConflict, ErrIndexError, err.Error())
+		default:
+			s.sendError(r, w, http.StatusInternalServerError, ErrStorageError, err.Error())
+		}
+		return
+	}
+	s.EmitAudit(r, "vault.reindex_hnsw", "vault", name, "ok", nil)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]any{"vault": name, "state": "queued"})
 }
 
 // handleResetRepairWatermark deletes a per-vault repair watermark (0x2B evolve

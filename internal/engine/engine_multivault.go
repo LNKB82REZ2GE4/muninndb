@@ -134,8 +134,14 @@ func (e *Engine) ActivateMulti(ctx context.Context, reqs []*mbp.ActivateRequest,
 
 	merged := mergeRRF(runs, weights, limit, rrfK)
 
+	// The merged response carries the top-weighted vault's query id: upstream
+	// #918 made a query id the handle of one vault's recall event (feedback
+	// labels are checked for membership against it), and that is the run
+	// whose recording is live (the others ran ModeObserve). Feedback on a row
+	// from another vault is then refused as a non-member — honest, where a
+	// synthetic id would match no event at all.
 	resp := &mbp.ActivateResponse{
-		QueryID:          e.fastQueryID(),
+		QueryID:          runs[topIdx].resp.QueryID,
 		TotalFound:       totalFound,
 		Activations:      merged,
 		DegradedVaults:   degradedVaults,

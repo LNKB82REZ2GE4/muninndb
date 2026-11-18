@@ -64,6 +64,9 @@ func RegisterMigrations(r *Runner) {
 	// every future merge: renumber the INCOMING migrations, never the applied
 	// ones.
 	r.Register(Migration{Version: 5, Description: "backfill glob-scope api key index (0x46) and prune stale 0x29 entries", Up: BackfillAPIKeyGlobIndex})
+	// v6's description names 0x31 because that is where it wrote when it was
+	// applied; the marker now lives at 0xF0 (v11). Descriptions of applied
+	// migrations are kept byte-identical on purpose.
 	r.Register(Migration{Version: 6, Description: "backfill per-vault declared-contradiction marker (0x31) for COG-29's O(1) recall gate", Up: BackfillDeclaredContradictionMark})
 	// v7 must stay BELOW the replication relocation: it clears this fork's
 	// legacy 0x2F marker keys out of the range v8 is about to move replication
@@ -78,6 +81,15 @@ func RegisterMigrations(r *Runner) {
 	// numbering note above). On the next upstream merge, renumber upstream's
 	// incoming migrations above this one, not this one upward.
 	r.Register(Migration{Version: 10, Description: "recount persisted per-vault engram counters (0x15) inflated by the post-commit seed double-count (G9)", Up: RecountVaultCounters})
+	// Fork migration (0.12.1 merge). Upstream #952 took 0x31 for
+	// SupersedesRestoreMark, the byte this fork's declared-contradiction
+	// marker lived on, with an identical record shape; the marker moved to
+	// 0xF0. v11 purges the fork's records off 0x31 and rebuilds them at 0xF0.
+	// It must run before anything reads 0x31 as a restore watermark — the
+	// runner runs before the store and engine exist, and v11 is above every
+	// applied version — see PurgeDeclaredContradictionMarkAt0x31. Upstream
+	// added no migrations in this merge (its registry still ends at v6).
+	r.Register(Migration{Version: 11, Description: "purge fork declared-contradiction markers off 0x31 (now upstream's SupersedesRestoreMark, #952) and rebuild them at 0xF0", Up: PurgeDeclaredContradictionMarkAt0x31})
 }
 
 // MaxRegisteredVersion returns the highest migration version this binary knows.

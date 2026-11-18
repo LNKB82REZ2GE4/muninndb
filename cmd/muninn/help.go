@@ -182,6 +182,34 @@ var subcommandHelp = map[string]func(){
 				"muninn backup --output /backups/muninn-2026-02-25",
 			})
 	},
+	"twin-replay": func() {
+		printSubcommandUsage("twin-replay", "read-only replay of the write-time twin rule over a vault (acceptance check before MUNINN_WRITE_RELATED=1)", "muninn twin-replay --vault <name> [flags]",
+			[][2]string{
+				{"--data-dir <dir>", "Data directory to replay — normally a `muninn backup` copy (default: ~/.muninn/data)"},
+				{"--vault <name>", "Vault to replay (required)"},
+				{"--days <n>", "Replay window in days (default 60)"},
+				{"--threshold <t>", "Use this threshold instead of the vault override / model hint"},
+				{"--model <name>", "Embed model whose hint to use when the vault records none"},
+				{"--out <dir>", "Write pairs.jsonl (ids), judge.jsonl (FULL TEXT, blind) and key.jsonl"},
+				{"--key <file> --labels <file>", "Score blind labels and print the pre-committed verdict"},
+			},
+			[]string{
+				"muninn backup --output /tmp/snap && muninn twin-replay --data-dir /tmp/snap --vault work --model bge-small-en-v1.5 --out /tmp/judge",
+				"muninn twin-replay --data-dir /tmp/snap --vault work --model bge-small-en-v1.5 --key /tmp/judge/key.jsonl --labels /tmp/judge/labels.jsonl",
+			})
+	},
+	"twin-audit": func() {
+		printSubcommandUsage("twin-audit", "count unresolved near-twin pairs from the shadow log, read from the store", "muninn twin-audit --vault <name> --log <server.log> [flags]",
+			[][2]string{
+				{"--data-dir <dir>", "Data directory — normally a `muninn backup` copy (default: ~/.muninn/data)"},
+				{"--vault <name>", "Vault to audit (required)"},
+				{"--log <file>", "Server log with the shadow-mode \"write twin flagged\" lines (required)"},
+				{"--min-age <dur>", "Only count pairs flagged at least this long ago (default 168h)"},
+			},
+			[]string{
+				"muninn twin-audit --data-dir /tmp/snap --vault work --log ~/.muninn/data/muninn.log",
+			})
+	},
 	"upgrade": func() {
 		printSubcommandUsage("upgrade", "check for and install updates", "muninn upgrade [flags]",
 			[][2]string{
@@ -214,7 +242,7 @@ var subcommandHelp = map[string]func(){
 		printSubcommandUsage("vault", "vault management", "muninn vault <command> [flags]",
 			[][2]string{
 				{"create <name> [--public]", "Create and register a new vault"},
-				{"list [--pattern <glob>]", "List all vaults (with optional glob filter)"},
+				{"list [--pattern <glob>]", "List vaults, every vault when signed in as admin (optional glob filter)"},
 				{"delete <name> [--yes] [--force]", "Delete a vault and all its memories"},
 				{"clear <name> [--yes] [--force]", "Remove all memories from a vault"},
 				{"clone <source> <new-name>", "Clone a vault into a new vault"},
@@ -223,6 +251,7 @@ var subcommandHelp = map[string]func(){
 				{"export-markdown --vault <name>", "Export vault notes as markdown .tgz"},
 				{"import <file> --vault <name>", "Import .muninn archive"},
 				{"reindex-fts <name>", "Rebuild FTS index"},
+				{"reindex-hnsw <name>", "Rebuild the vector graph (background)"},
 				{"repair-watermark-reset <name> --which <evolve|assoc_weight|all>", "Re-arm a repair pass on this node"},
 				{"", ""},
 				{"-u <user>", "Admin username (default: root)"},
@@ -355,7 +384,7 @@ func printHelp() {
 	fmt.Printf("  %-32s %s\n", cyan("muninn logs"), "Show last 25 lines + tail")
 	fmt.Printf("  %-32s %s\n", cyan("muninn logs 50"), "Show last 50 lines + tail")
 	fmt.Printf("  %-32s %s\n", cyan("muninn logs --no-follow"), "Print recent lines and exit")
-	fmt.Printf("  %-32s %s\n", cyan("muninn show vaults"), "List all vaults (requires server running)")
+	fmt.Printf("  %-32s %s\n", cyan("muninn show vaults"), "List vaults, every vault when signed in as admin (requires server running)")
 	fmt.Printf("  %-32s %s\n", cyan("muninn vault <command>"), "Vault management (create, list, delete, clear, clone, merge, export, import)")
 	fmt.Printf("  %-32s %s\n", cyan("muninn api-key <command>"), "API key management (create, list, revoke)")
 	fmt.Printf("  %-32s %s\n", cyan("muninn admin change-password"), "Change the admin password")
@@ -386,8 +415,9 @@ func printHelp() {
 	fmt.Printf("  MCP endpoint: %s://127.0.0.1:%s/mcp\n", localScheme(), defaultMCPPort)
 	fmt.Printf("  %-28s %s\n", "MUNINN_MCP_URL", "Override MCP server URL (also used by 'muninn mcp' proxy)")
 	fmt.Printf("  %-28s %s\n", "MUNINNDB_DATA", "Override default data directory")
-	fmt.Printf("  %-28s %s\n", "MUNINNDB_ADMIN_URL", "TLS: base URL for 'muninn status'/admin REST probes")
-	fmt.Printf("  %-28s %s\n", "MUNINNDB_UI_URL", "TLS: base URL for 'muninn status' Web UI probe")
+	fmt.Printf("  %-28s %s\n", "MUNINNDB_ADMIN_URL", "Base URL of the server's REST API: where admin commands are sent")
+	fmt.Printf("  %-28s %s\n", "MUNINNDB_UI_URL", "Base URL the CLI SIGNS IN at (the console). Default: the admin URL's host, next port")
+	fmt.Printf("  %-28s %s\n", "", "An admin session goes only to the host that issued it. Set both only for one server.")
 	fmt.Printf("  %-28s %s\n", "MUNINNDB_MCP_URL", "TLS: base URL for 'muninn status'/'start' MCP probe")
 	fmt.Println()
 

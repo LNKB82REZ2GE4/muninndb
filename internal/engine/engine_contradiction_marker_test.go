@@ -46,7 +46,7 @@ func TestContradictionMarker_GatesWithoutScanning(t *testing.T) {
 	ws := eng.store.ResolveVaultPrefix("cleanmark")
 
 	// First call runs the probe and must persist its COMPLETE clean verdict.
-	if eng.vaultMayHaveContradictions(ctx, ws) {
+	if eng.vaultMayHaveContradictions(ctx, ws, true) {
 		t.Fatal("clean vault gated ON")
 	}
 	mark, known, err := eng.store.DeclaredContradictionMark(ctx, ws)
@@ -61,7 +61,7 @@ func TestContradictionMarker_GatesWithoutScanning(t *testing.T) {
 	// still answer without re-probing.
 	eng.contradictionProbeClean.Delete(ws)
 	eng.contradictionsDeclared.Delete(ws)
-	if eng.vaultMayHaveContradictions(ctx, ws) {
+	if eng.vaultMayHaveContradictions(ctx, ws, true) {
 		t.Error("gate re-ran the scan instead of reading the durable clean marker")
 	}
 	if _, memoised := eng.contradictionProbeClean.Load(ws); memoised {
@@ -72,7 +72,7 @@ func TestContradictionMarker_GatesWithoutScanning(t *testing.T) {
 	contradictionFixture(t, eng, "cleanmark")
 	eng.contradictionsDeclared.Delete(ws)
 	eng.contradictionProbeClean.Delete(ws)
-	if !eng.vaultMayHaveContradictions(ctx, ws) {
+	if !eng.vaultMayHaveContradictions(ctx, ws, true) {
 		t.Error("gate is off on a vault whose durable marker says a contradiction was declared")
 	}
 }
@@ -98,7 +98,7 @@ func TestContradictionMarker_UnknownFailsTowardHonesty(t *testing.T) {
 	eng.contradictionsDeclared.Delete(ws)
 	eng.contradictionProbeClean.Delete(ws)
 
-	if !eng.vaultMayHaveContradictions(ctx, ws) {
+	if !eng.vaultMayHaveContradictions(ctx, ws, true) {
 		t.Fatal("an UNKNOWN marker was read as clean — contradiction honesty is now silently off for this vault")
 	}
 	resp := recallContradiction(t, eng, "unknownmark", nil)
@@ -129,5 +129,30 @@ func TestContradictionMarker_IsMonotone(t *testing.T) {
 	}
 	if !known || mark != storage.DeclaredContradictionYes {
 		t.Fatalf("marker was demoted to 0x%02X — a declared contradiction can now be skipped silently", mark)
+	}
+}
+
+// TestDeclaredContradictionMark_ReadOnlyRecallPersistsNothing: the fork's
+// recall-side marker persistence honours upstream #918's contract that a
+// read-only recall writes nothing — the verdict is computed (and correct) but
+// not written, and the next writable recall still persists it (the memo is not
+// set by the read-only pass).
+func TestDeclaredContradictionMark_ReadOnlyRecallPersistsNothing(t *testing.T) {
+	eng, cleanup := testEnv(t)
+	defer cleanup()
+	ctx := context.Background()
+	ws := eng.store.ResolveVaultPrefix("ro-mark")
+
+	if eng.vaultMayHaveContradictions(ctx, ws, false) {
+		t.Fatal("empty vault reported as possibly contradicted")
+	}
+	if _, known, err := eng.store.DeclaredContradictionMark(ctx, ws); err != nil || known {
+		t.Fatalf("read-only probe persisted a marker (known=%v err=%v)", known, err)
+	}
+	if eng.vaultMayHaveContradictions(ctx, ws, true) {
+		t.Fatal("empty vault reported as possibly contradicted")
+	}
+	if m, known, err := eng.store.DeclaredContradictionMark(ctx, ws); err != nil || !known || m != storage.DeclaredContradictionNone {
+		t.Fatalf("writable probe after a read-only one did not persist `none` (m=%v known=%v err=%v)", m, known, err)
 	}
 }

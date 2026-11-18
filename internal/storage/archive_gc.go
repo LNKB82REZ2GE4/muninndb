@@ -42,7 +42,14 @@ func (ps *PebbleStore) GCArchivedEdges(ctx context.Context, wsPrefix [8]byte) (i
 			break
 		}
 		val := iter.Value()
-		_, _, _, lastActivated, peakWeight, coActivationCount, restoredAt := decodeAssocValue(val)
+		relType, _, _, lastActivated, peakWeight, coActivationCount, restoredAt := decodeAssocValue(val)
+
+		// A supersedes row is a declaration, not a weak association. Reaping it
+		// would erase the claim for good, and leave whichever memory took the
+		// target since as its only successor. Kept until it is restored.
+		if relType == RelSupersedes {
+			continue
+		}
 
 		if peakWeight >= 0.15 {
 			continue
@@ -82,7 +89,7 @@ func (ps *PebbleStore) GCArchivedEdges(ctx context.Context, wsPrefix [8]byte) (i
 		batch.Delete(e.key, nil)
 	}
 
-	if err := batch.Commit(pebble.NoSync); err != nil {
+	if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 		return 0, fmt.Errorf("archive GC commit: %w", err)
 	}
 

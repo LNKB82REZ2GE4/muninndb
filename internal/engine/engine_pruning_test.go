@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -16,26 +15,18 @@ import (
 	"github.com/scrypster/muninndb/internal/engine/trigger"
 	"github.com/scrypster/muninndb/internal/index/fts"
 	"github.com/scrypster/muninndb/internal/storage"
+	"github.com/scrypster/muninndb/internal/transport/mbp"
 )
 
 // ptr is a generic helper to take the address of any value.
 func ptr[T any](v T) *T { return &v }
 
 // testEnvWithAuth wires up a fully functional Engine with a real auth.Store,
-// real storage and FTS, using a temporary directory cleaned up after the test.
+// real storage and FTS, on an in-memory filesystem (openMemPebble).
 // Returns the engine, the auth.Store, the pebble store, and a cleanup func.
 func testEnvWithAuth(t *testing.T) (*Engine, *auth.Store, *storage.PebbleStore, func()) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "muninndb-pruning-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	db, err := storage.OpenPebble(dir, storage.DefaultOptions())
-	if err != nil {
-		os.RemoveAll(dir)
-		t.Fatal(err)
-	}
+	db := openMemPebble(t)
 
 	store := storage.NewPebbleStore(db, storage.PebbleStoreConfig{CacheSize: 1000})
 	ftsIdx := fts.New(db)
@@ -50,7 +41,6 @@ func testEnvWithAuth(t *testing.T) (*Engine, *auth.Store, *storage.PebbleStore, 
 	return eng, as, store, func() {
 		eng.Stop()
 		store.Close()
-		os.RemoveAll(dir)
 	}
 }
 
@@ -657,5 +647,69 @@ func TestPruneVault_ImportanceProtection_Measured(t *testing.T) {
 	}
 	if pruned < nImportant {
 		t.Errorf("prune did not exert real pressure: only %d dropped", pruned)
+	}
+}
+
+// TestPruneVault_FreshVaultCapDoesNotOverPrune pins the data loss the
+// first-write count inflation caused: a vault whose first operation is a write
+// had its count seeded after that write committed, so the count read one high
+// per single write and 2k after a first batch of k, and PruneVault (excess =
+// count - MaxEngrams) deleted real memories to pay for the phantom ones. A
+// batch of 5 under a cap of 5 lost all 5.
+func TestPruneVault_FreshVaultCapDoesNotOverPrune(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		batch    bool
+		n, limit int
+	}{
+		{"single-writes-5-cap-3", false, 5, 3},
+		{"first-batch-5-cap-5", true, 5, 5},
+		{"first-batch-10-cap-8", true, 10, 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			eng, as, store, cleanup := testEnvWithAuth(t)
+			defer cleanup()
+			ctx := context.Background()
+			vault := "prune-fresh-" + tc.name
+			if err := as.SetVaultConfig(auth.VaultConfig{Name: vault, Public: true, Plasticity: &auth.PlasticityConfig{MaxEngrams: ptr(tc.limit)}}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.batch {
+				var reqs []*mbp.WriteRequest
+				for i := 0; i < tc.n; i++ {
+					reqs = append(reqs, &mbp.WriteRequest{Vault: vault, Concept: fmt.Sprintf("swarm log %d", i), Content: fmt.Sprintf("a swarm was caught at the apiary on day %d", i)})
+				}
+				_, errs := eng.WriteBatch(ctx, reqs)
+				for _, err := range errs {
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+			} else {
+				for i := 0; i < tc.n; i++ {
+					if _, err := eng.Write(ctx, &mbp.WriteRequest{Vault: vault, Concept: fmt.Sprintf("swarm log %d", i), Content: fmt.Sprintf("a swarm was caught at the apiary on day %d", i)}); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			ws := store.ResolveVaultPrefix(vault)
+			if got := store.GetVaultCount(ctx, ws); got != int64(tc.n) {
+				t.Errorf("vault count = %d after writing %d memories, want %d", got, tc.n, tc.n)
+			}
+			if _, err := eng.PruneVault(ctx, vault); err != nil {
+				t.Fatal(err)
+			}
+			want := tc.n
+			if want > tc.limit {
+				want = tc.limit
+			}
+			ids, err := store.EngramIDsByCreatedRange(ctx, ws, time.Unix(0, 0), time.Now().Add(48*time.Hour), 100000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(ids) != want {
+				t.Errorf("vault capped at %d holds %d memories after prune, want %d", tc.limit, len(ids), want)
+			}
+		})
 	}
 }

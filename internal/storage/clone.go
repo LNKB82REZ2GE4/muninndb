@@ -2,7 +2,6 @@ package storage
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,7 +9,6 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/scrypster/muninndb/internal/prefix"
 	"github.com/scrypster/muninndb/internal/storage/erf"
-	"github.com/scrypster/muninndb/internal/storage/keys"
 )
 
 // incrementWS returns a copy of ws with the value incremented by 1 (big-endian),
@@ -78,10 +76,32 @@ func (ps *PebbleStore) CloneVaultData(
 	wsSource, wsTarget [8]byte,
 	onCopy func(copied int64),
 ) (int64, error) {
+	// Bulk raw-KV copy bypasses the per-engram lifecycle hooks: drop the
+	// target's retired set so its next reader rebuilds it (retired.go).
+	defer ps.resetRetired(wsTarget)
+	// The target's count is reset on EVERY exit. A bulk copy never computes a
+	// count, and it commits batches as it goes, so a copy that stops part way
+	// (a cancelled context at engine Stop, an I/O error) has still changed what
+	// is stored. Returning before the reset left the old count in place, the
+	// raw batches never mark the vault changed, Close wrote the clean marker,
+	// and the next start trusted it (5 for 517 measured).
+	defer func() {
+		if err := ps.resetVaultCount(wsTarget); err != nil {
+			slog.Warn("vault count reset failed after a bulk copy", "err", err)
+		}
+	}()
 	wsSourceNext, err := incrementWS(wsSource)
 	if err != nil {
 		return 0, fmt.Errorf("clone: %w", err)
 	}
+
+	// Every pass reads the SOURCE from one snapshot (STO-23). Reading each
+	// prefix live let a forget/evolve/archive between the 0x01 pass and the
+	// 0x02 pass leave the copy disagreeing with itself — engram record active,
+	// metadata record soft-deleted — which hid a live memory in the copy.
+	// Target-side existence checks still read the live DB.
+	snap := ps.db.NewSnapshot()
+	defer snap.Close()
 
 	var copiedEngrams int64
 	// Whether phase 2 moved any association key into the target — the trigger
@@ -97,7 +117,7 @@ func (ps *PebbleStore) CloneVaultData(
 		hi[0] = prefix.Engram
 		copy(hi[1:], wsSourceNext[:])
 
-		iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
+		iter, err := snap.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
 		if err != nil {
 			return 0, fmt.Errorf("clone: create engram iter: %w", err)
 		}
@@ -183,7 +203,7 @@ func (ps *PebbleStore) CloneVaultData(
 			batchCount++
 
 			if batchCount >= cloneBatchSize {
-				if err := batch.Commit(pebble.NoSync); err != nil {
+				if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 					batch.Close()
 					iter.Close()
 					return copiedEngrams, fmt.Errorf("clone: commit engram batch: %w", err)
@@ -199,7 +219,7 @@ func (ps *PebbleStore) CloneVaultData(
 		iter.Close()
 
 		if batchCount > 0 {
-			if err := batch.Commit(pebble.NoSync); err != nil {
+			if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 				batch.Close()
 				return copiedEngrams, fmt.Errorf("clone: commit final engram batch: %w", err)
 			}
@@ -219,7 +239,7 @@ func (ps *PebbleStore) CloneVaultData(
 		hi[0] = p
 		copy(hi[1:], wsSourceNext[:])
 
-		iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
+		iter, err := snap.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
 		if err != nil {
 			return copiedEngrams, fmt.Errorf("clone: iter prefix 0x%02X: %w", p, err)
 		}
@@ -259,7 +279,7 @@ func (ps *PebbleStore) CloneVaultData(
 			batchCount++
 
 			if batchCount >= cloneBatchSize {
-				if err := batch.Commit(pebble.NoSync); err != nil {
+				if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 					batch.Close()
 					iter.Close()
 					return copiedEngrams, fmt.Errorf("clone: commit batch prefix 0x%02X: %w", p, err)
@@ -272,7 +292,7 @@ func (ps *PebbleStore) CloneVaultData(
 		iter.Close()
 
 		if batchCount > 0 {
-			if err := batch.Commit(pebble.NoSync); err != nil {
+			if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 				batch.Close()
 				return copiedEngrams, fmt.Errorf("clone: commit final prefix 0x%02X: %w", p, err)
 			}
@@ -284,17 +304,8 @@ func (ps *PebbleStore) CloneVaultData(
 	// (WriteVaultName was already called by the engine under vaultOpsMu before
 	// this goroutine was launched; the cache entry was written there.)
 
-	// ---- Phase 4: Write computed VaultCountKey for target ----
-	// Encode as BigEndian int64 (matches getOrInitCounter read path in impl.go).
-	vaultCountKey := keys.VaultCountKey(wsTarget)
-	buf := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf, uint64(copiedEngrams))
-	if err := ps.db.Set(vaultCountKey, buf, pebble.NoSync); err != nil {
-		return copiedEngrams, fmt.Errorf("clone: write vault count: %w", err)
-	}
-	// Seed the in-memory counter so GetVaultCount is immediately correct.
-	vc := ps.getOrInitCounter(ctx, wsTarget)
-	vc.count.Store(copiedEngrams)
+	// ---- Phase 4: the target's count ----
+	// Reset by the defer at the top of this function (vault_count.go).
 
 	// ---- Phase 5: Reset coherence for target (write zeroed [7]int64) ----
 	if err := ps.WriteCoherence(wsTarget, [7]int64{}); err != nil {
@@ -336,16 +347,32 @@ func (ps *PebbleStore) MergeVaultData(
 	wsSource, wsTarget [8]byte,
 	onCopy func(copied int64),
 ) (int64, error) {
+	// Bulk raw-KV copy bypasses the per-engram lifecycle hooks: drop the
+	// target's retired set so its next reader rebuilds it (retired.go).
+	defer ps.resetRetired(wsTarget)
+	// The target's count is reset on EVERY exit. A bulk copy never computes a
+	// count, and it commits batches as it goes, so a copy that stops part way
+	// (a cancelled context at engine Stop, an I/O error) has still changed what
+	// is stored. Returning before the reset left the old count in place, the
+	// raw batches never mark the vault changed, Close wrote the clean marker,
+	// and the next start trusted it (5 for 517 measured).
+	defer func() {
+		if err := ps.resetVaultCount(wsTarget); err != nil {
+			slog.Warn("vault count reset failed after a bulk copy", "err", err)
+		}
+	}()
 	wsSourceNext, err := incrementWS(wsSource)
 	if err != nil {
 		return 0, fmt.Errorf("merge: %w", err)
 	}
 
-	// Seed the target's counter BEFORE copying anything (G9). Seeded after the
-	// copy — as Phase 4's GetVaultCount used to do on a target with no persisted
-	// count — the scan already includes the merged engrams and Phase 4 then
-	// adds them a second time (2 existing + 4 merged reported 10).
-	targetCounter := ps.getOrInitCounter(ctx, wsTarget)
+	// Every pass reads the SOURCE from one snapshot (STO-23). Reading each
+	// prefix live let a forget/evolve/archive between the 0x01 pass and the
+	// 0x02 pass leave the copy disagreeing with itself — engram record active,
+	// metadata record soft-deleted — which hid a live memory in the copy.
+	// Target-side existence checks still read the live DB.
+	snap := ps.db.NewSnapshot()
+	defer snap.Close()
 
 	var mergedEngrams int64
 	// See CloneVaultData: a bulk copy moves raw 0x03/0x04 bytes and never calls
@@ -361,7 +388,7 @@ func (ps *PebbleStore) MergeVaultData(
 		hi[0] = prefix.Engram
 		copy(hi[1:], wsSourceNext[:])
 
-		iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
+		iter, err := snap.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
 		if err != nil {
 			return 0, fmt.Errorf("merge: create engram iter: %w", err)
 		}
@@ -421,7 +448,7 @@ func (ps *PebbleStore) MergeVaultData(
 			batchCount++
 
 			if batchCount >= cloneBatchSize {
-				if err := batch.Commit(pebble.NoSync); err != nil {
+				if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 					batch.Close()
 					iter.Close()
 					return mergedEngrams, fmt.Errorf("merge: commit engram batch: %w", err)
@@ -437,7 +464,7 @@ func (ps *PebbleStore) MergeVaultData(
 		iter.Close()
 
 		if batchCount > 0 {
-			if err := batch.Commit(pebble.NoSync); err != nil {
+			if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 				batch.Close()
 				return mergedEngrams, fmt.Errorf("merge: commit final engram batch: %w", err)
 			}
@@ -478,7 +505,7 @@ func (ps *PebbleStore) MergeVaultData(
 		hi[0] = p
 		copy(hi[1:], wsSourceNext[:])
 
-		iter, err := ps.db.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
+		iter, err := snap.NewIter(&pebble.IterOptions{LowerBound: lo, UpperBound: hi})
 		if err != nil {
 			return mergedEngrams, fmt.Errorf("merge: iter prefix 0x%02X: %w", p, err)
 		}
@@ -537,7 +564,7 @@ func (ps *PebbleStore) MergeVaultData(
 			batchCount++
 
 			if batchCount >= cloneBatchSize {
-				if err := batch.Commit(pebble.NoSync); err != nil {
+				if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 					batch.Close()
 					iter.Close()
 					return mergedEngrams, fmt.Errorf("merge: commit batch prefix 0x%02X: %w", p, err)
@@ -550,7 +577,7 @@ func (ps *PebbleStore) MergeVaultData(
 		iter.Close()
 
 		if batchCount > 0 {
-			if err := batch.Commit(pebble.NoSync); err != nil {
+			if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 				batch.Close()
 				return mergedEngrams, fmt.Errorf("merge: commit final prefix 0x%02X: %w", p, err)
 			}
@@ -575,13 +602,8 @@ func (ps *PebbleStore) MergeVaultData(
 		return mergedEngrams, fmt.Errorf("merge: write merged coherence: %w", err)
 	}
 
-	// ---- Phase 4: Update VaultCountKey for target ----
-	// Count is the post-merge total: the target counter (seeded before Phase 1,
-	// so it never saw the merged engrams — G9) plus the engrams merged in.
-	newTotal := targetCounter.count.Add(mergedEngrams)
-	if _, err := ps.persistCounterNow(wsTarget, targetCounter, newTotal, pebble.NoSync); err != nil {
-		return mergedEngrams, fmt.Errorf("merge: write vault count: %w", err)
-	}
+	// ---- Phase 4: the target's count ----
+	// Reset by the defer at the top of this function (vault_count.go).
 
 	// ---- Phase 5: Reconcile the target's declared-contradiction marker ----
 	// UNION-copying 0x03/0x04 can hand the target a declared `contradicts` edge

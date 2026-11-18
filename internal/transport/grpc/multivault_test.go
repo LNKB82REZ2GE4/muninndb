@@ -22,7 +22,7 @@ func TestActivate_MultiVault_MergesAndTagsVault(t *testing.T) {
 			}
 			return &pb.ActivateResponse{
 				TotalFound:     2,
-				Activations:    []pb.ActivationItem{{ID: "e1", Vault: reqs[0].Vault}, {ID: "e2", Vault: reqs[1].Vault}},
+				Activations:    []*pb.ActivationItem{{Id: "e1", Vault: reqs[0].Vault}, {Id: "e2", Vault: reqs[1].Vault}},
 				DegradedVaults: []string{"stale-vault"},
 			}, nil
 		},

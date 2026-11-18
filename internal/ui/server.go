@@ -369,10 +369,13 @@ func (s *Server) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	http.SetCookie(w, &http.Cookie{
-		Name:   "muninn_session",
-		Value:  "",
-		Path:   "/",
-		MaxAge: -1,
+		Name:     "muninn_session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   s.tlsConfig != nil,
+		MaxAge:   -1,
 	})
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
@@ -413,7 +416,9 @@ func (s *Server) broadcaster(ctx context.Context) {
 }
 
 func (s *Server) broadcastStats(ctx context.Context, prevCount *int64) {
-	resp, err := s.engine.Stat(ctx, &rest.StatRequest{})
+	// Server-wide on purpose: this feeds the console's live dashboard over
+	// /events, which is behind the admin session.
+	resp, err := s.engine.Stat(ctx, &rest.StatRequest{ServerWide: true})
 	if err != nil {
 		return
 	}

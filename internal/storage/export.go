@@ -261,6 +261,18 @@ func (ps *PebbleStore) ImportVaultData(
 	opts ImportOpts,
 	r io.Reader,
 ) (*ExportResult, error) {
+	// Bulk raw-KV copy bypasses the per-engram lifecycle hooks: drop the
+	// target's retired set so its next reader rebuilds it (retired.go).
+	defer ps.resetRetired(wsTarget)
+	// The count is reset on every exit, success or not: batches commit as the
+	// archive streams in, so even a failed import has changed what is stored.
+	// The next access seeds from a scan (vault_count.go). The archive's own
+	// count key is never imported, see below.
+	defer func() {
+		if err := ps.resetVaultCount(wsTarget); err != nil {
+			slog.Warn("import: vault count reset failed", "vault", vaultName, "err", err)
+		}
+	}()
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return nil, fmt.Errorf("import: gzip reader: %w", err)
@@ -391,6 +403,13 @@ func (ps *PebbleStore) ImportVaultData(
 
 				prefixByte := strippedKey[0]
 
+				// The archive's 9-byte vault count key is the SOURCE's saved
+				// count, possibly stale or inflated. Never import it: the
+				// target's count is reset after the import and recounted.
+				if prefixByte == prefix.VaultCount && len(strippedKey) == 1 {
+					continue
+				}
+
 				// Deduplication: for EngramKey (prefix.Engram), check if this engram already exists
 				// in the target vault. If it does, record its ID in skipIDs so that all
 				// related keys are also skipped.
@@ -471,7 +490,7 @@ func (ps *PebbleStore) ImportVaultData(
 				batchCount++
 
 				if batchCount >= exportBatchSize {
-					if err := batch.Commit(pebble.NoSync); err != nil {
+					if err := ps.commitBatch(batch, pebble.NoSync); err != nil {
 						batch.Close()
 						return nil, fmt.Errorf("import: commit batch: %w", err)
 					}
@@ -512,7 +531,7 @@ func (ps *PebbleStore) ImportVaultData(
 			}
 			// Checksum verified — commit the final batch now.
 			if kv.batchCount > 0 {
-				if err := kv.batch.Commit(pebble.Sync); err != nil {
+				if err := ps.commitBatch(kv.batch, pebble.Sync); err != nil {
 					kv.batch.Close()
 					return nil, fmt.Errorf("import: commit final batch (after checksum): %w", err)
 				}
@@ -520,17 +539,13 @@ func (ps *PebbleStore) ImportVaultData(
 			kv.batch.Close()
 			kv.committed = true
 
-			// The import wrote raw association bytes; return the target's 0x31
-			// marker to UNKNOWN so a pre-import `none` cannot stand over an
-			// imported declared contradiction. There is no source marker to
-			// adopt — 0x31 is not exported.
+			// The import wrote raw association bytes; return the target's
+			// declared-contradiction marker to UNKNOWN so a pre-import `none`
+			// cannot stand over an imported declared contradiction. There is no
+			// source marker to adopt — the marker is not exported.
 			if err := ps.ReconcileDeclaredContradictionMarkAfterBulkCopy(ctx, wsTarget, kv.copiedAssoc, false); err != nil {
 				return nil, fmt.Errorf("import: reconcile contradiction marker: %w", err)
 			}
-
-			// Seed the in-memory vault counter.
-			vc := ps.getOrInitCounter(ctx, wsTarget)
-			vc.count.Store(kv.engramCount)
 		}
 	}
 
@@ -540,7 +555,7 @@ func (ps *PebbleStore) ImportVaultData(
 		slog.Warn("import: archive has no checksum.txt — skipping integrity check (legacy export)",
 			"vault", vaultName)
 		if kv.batchCount > 0 {
-			if err := kv.batch.Commit(pebble.NoSync); err != nil {
+			if err := ps.commitBatch(kv.batch, pebble.NoSync); err != nil {
 				kv.batch.Close()
 				return nil, fmt.Errorf("import: commit final batch: %w", err)
 			}
@@ -551,10 +566,6 @@ func (ps *PebbleStore) ImportVaultData(
 		if err := ps.ReconcileDeclaredContradictionMarkAfterBulkCopy(ctx, wsTarget, kv.copiedAssoc, false); err != nil {
 			return nil, fmt.Errorf("import: reconcile contradiction marker: %w", err)
 		}
-
-		// Seed the in-memory vault counter.
-		vc := ps.getOrInitCounter(ctx, wsTarget)
-		vc.count.Store(kv.engramCount)
 
 		return &ExportResult{
 			EngramCount: kv.engramCount,

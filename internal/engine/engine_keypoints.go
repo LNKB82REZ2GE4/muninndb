@@ -89,7 +89,8 @@ func (e *Engine) UpdateDigestIndexed(ctx context.Context, id storage.ULID, summa
 		}
 	}
 
-	if err := e.store.UpdateDigest(ctx, id, summary, keyPoints, memoryType, typeLabel); err != nil {
+	// Locked variant: this stripe is already held above (not reentrant).
+	if err := e.store.UpdateDigestLocked(ctx, id, summary, keyPoints, memoryType, typeLabel); err != nil {
 		return err
 	}
 
