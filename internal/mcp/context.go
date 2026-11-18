@@ -150,9 +150,9 @@ func authFromRequest(r *http.Request, requiredToken string, apiKeyStore apiKeyVa
 		if cap, err := capStore.ValidateCapability(token); err == nil {
 			metrics.MCPAuthTotal.WithLabelValues(authSourceCapability).Inc()
 			return AuthContext{
-				Token:        token,
-				Authorized:   true,
-				Vault:        cap.Vault,
+				Token:      token,
+				Authorized: true,
+				Vault:      cap.Vault,
 				// Fork: the multi-vault resolvers (resolveVaultScoped,
 				// resolveVaultsWeighted) read Scope, and an empty scope means
 				// "unscoped". A cap_ token is pinned to exactly one vault
