@@ -4,7 +4,19 @@ import json, os, subprocess, urllib.request, time
 from datetime import datetime
 from pathlib import Path
 
-KEY = "mk_REDACTED_SET_YOUR_SCOPED_KEY"
+def _load_key() -> str:
+    """Bearer key: $MUNINN_STATUS_KEY, else the claude agent key in ~/.config/muninn-hook.json.
+    (A hardcoded key here went stale when the 2026-06 keys were revoked.)"""
+    k = os.environ.get("MUNINN_STATUS_KEY")
+    if k:
+        return k
+    cfg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "muninn-hook.json"
+    try:
+        return json.loads(cfg.read_text())["agents"]["claude"]["key"]
+    except Exception as e:
+        raise SystemExit(f"muninn-status: no API key (set MUNINN_STATUS_KEY or fix {cfg}: {e})")
+
+KEY = _load_key()
 STATE = Path.home() / ".local" / "share" / "muninn-enricher"
 
 def api(path):
@@ -51,8 +63,13 @@ except Exception as e:
 
 # enricher daemon
 print(f"\nENRICHER:")
-epid = pid_alive(STATE / "daemon.pid")
-print(f"  daemon: {'RUNNING (pid '+str(epid)+')' if epid else 'NOT RUNNING'}")
+def unit_state(unit):
+    try:
+        return subprocess.run(["systemctl", "--user", "is-active", unit],
+                              capture_output=True, text=True, timeout=5).stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+print(f"  daemon (systemd muninn-enricher): {unit_state('muninn-enricher')}")
 try:
     # read enricher log tail for rate
     lines = open(STATE / "enricher.log").read().strip().split("\n")
