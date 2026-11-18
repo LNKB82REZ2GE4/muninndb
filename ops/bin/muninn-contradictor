@@ -797,7 +797,7 @@ def run_pass(cfg: dict, pcfg: dict, rest: RestClient, lm: LMStudio, conn: sqlite
     model_id = model_cfg["id"]
 
     def model_still_up() -> bool:
-        """Jake's chosen kill switch is stopping LM Studio outright — checked
+        """The operator's kill switch is stopping LM Studio outright — checked
         before every target so a long unlimited sweep stops within one
         target's worth of latency instead of erroring out. Nothing already
         judged is lost: swept_at is only set after a target finishes, so an

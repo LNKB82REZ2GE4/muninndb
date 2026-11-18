@@ -4,17 +4,15 @@
 # `muninn dream` requires exclusive access to the Pebble store, so this script
 # stops muninndb.service, runs a scoped dream per included vault, and restarts
 # the server. Every exit path logs loudly (a silent watcher is indistinguishable
-# from a hung one). Expected outage: ~5-6 min (dominated by agent-memory).
+# from a hung one). Expected outage: ~5-6 min (dominated by the largest vault).
 #
-# Exclusions (deliberate, see docs/MUNINN_V0.10_UPGRADE_BRIEF.md in Pi-RAG and
-# the 2026-08-12 dream audit):
-#   phd-research  — Pi-RAG's paper-knowledge vault: papers that agree are the
-#                   product, not duplicates. Dream must never consolidate it.
-#   pi            — frozen archive: must not be mutated at all.
-#   default       — dead legacy vault (4 engrams).
-#   proj-pi-rag-1e88cef4, proj-x-ray-ct-2c9a1f3e — stale ghost twins awaiting
-#                   retirement (already merged into their live vaults).
-#   proj-smoketest-00000000 — test artifact.
+# Exclusions (deliberate) live in an untracked local config, because they name
+# real vaults. Config file: ${XDG_CONFIG_HOME:-$HOME/.config}/muninn/dream-nightly.conf
+# (see ops/muninn-dream-nightly.conf.example). It is sourced as shell and must
+# define EXCLUDE_RE, an extended regex matched against whole vault names.
+# Typical members: vaults where near-duplicates are the product (e.g. a paper
+# knowledge base), frozen archives that must never be mutated, dead legacy
+# vaults, stale twins awaiting retirement, and test artifacts.
 #
 # Dream itself uses NO LLM (phases 0-2: orient, replay, embedding-cosine dedup;
 # duplicates are soft-archived, recoverable). Idempotent as of fork commit
@@ -29,7 +27,7 @@ HOOK_CONF="$HOME/.config/muninn-hook.json"
 LOG_DIR="$HOME/.local/share/muninn-dream"
 LOG="$LOG_DIR/dream.log"
 PER_VAULT_TIMEOUT=1800   # 30 min hard cap per vault
-EXCLUDE_RE='^(phd-research|pi|default|proj-pi-rag-1e88cef4|proj-x-ray-ct-2c9a1f3e|proj-smoketest-00000000)$'
+CONF="${MUNINN_DREAM_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/muninn/dream-nightly.conf}"
 
 mkdir -p "$LOG_DIR"
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
@@ -41,6 +39,14 @@ fail() {
 }
 
 log "=== nightly dream starting ==="
+
+# Load the exclusion list from the local config. Refuse to run without it: an
+# empty exclusion list would dream vaults that must never be consolidated.
+[ -r "$CONF" ] || fail "missing config $CONF (copy ops/muninn-dream-nightly.conf.example and edit)"
+EXCLUDE_RE=""
+# shellcheck disable=SC1090
+. "$CONF"
+[ -n "$EXCLUDE_RE" ] || fail "EXCLUDE_RE not set in $CONF"
 
 # 1. Enumerate vaults while the server is still up (REST needs it). Abort
 #    before touching the service if enumeration fails.

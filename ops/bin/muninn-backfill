@@ -388,7 +388,7 @@ def build_engram(text: str, source: str, session_path: str, entry_idx: int, ts: 
     `idempotent_salt` (project-vaults topology split, 2026-07-21): the global
     idempotency receipt (internal/storage/keys.go IdempotencyKey, 0x19 prefix)
     has NO vault/workspace component — it's a bare siphash of idempotent_id.
-    Content already backfilled into proj-phd-shared would otherwise dedupe
+    Content already backfilled into proj-example-shared would otherwise dedupe
     globally and land EMPTY in a freshly-split per-repo vault. Passing the
     target vault name as the salt makes the idempotency key effectively
     per-vault (same content, different vault → different key) while staying
@@ -542,7 +542,7 @@ def discover_project(conn, hook_cfg: dict, only_project_vault: str | None) -> tu
 
 
 def reconcile_project_sessions(conn, hook_cfg: dict) -> int:
-    """Project-vaults topology split (2026-07-21): proj-phd-shared was split
+    """Project-vaults topology split (2026-07-21): proj-example-shared was split
     into per-repo vaults. Rows already recorded in `project_sessions` (esp.
     status='done') still point at the OLD resolved vault — `discover_project`
     uses INSERT OR IGNORE keyed on `path`, so it never revisits them. Recompute

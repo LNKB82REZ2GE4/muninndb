@@ -1,0 +1,4 @@
+# Local config for muninn-dream-nightly. Copy to
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/muninn/dream-nightly.conf
+# and edit. Sourced as shell. Vaults matching EXCLUDE_RE are never dreamed.
+EXCLUDE_RE='^(research-notes|frozen-archive|default|proj-example-0000aaaa|proj-smoketest-00000000)$'

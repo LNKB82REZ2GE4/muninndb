@@ -43,7 +43,7 @@ type vaultRun struct {
 // scope. len(weights) must equal len(reqs); callers wanting equal weighting
 // should pass 1/N for every entry.
 //
-// Learning-signal handling (docs/plans/2026-07-19-project-vaults.md §4.2):
+// Learning-signal handling (project-vaults design, §4.2):
 //   - Merging is by rank (RRF), not raw score: ACT-R/CGDN scores are computed
 //     against vault-scoped BM25 corpus statistics and are not comparable
 //     across vaults with very different sizes.

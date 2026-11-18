@@ -34,7 +34,8 @@ whichever vault(s) the agent chooses.
 | `muninn-agentmem-cleanse` | Prunes raw-turn / distributed noise from `agent-memory` so it becomes a curated tier, preserving deliberate remembers + promotions. Snapshot + soft-delete (restorable). |
 | `muninn-promoter-recover` | Recovery tool for a promoter twin-collision incident: restores overwritten originals and re-inserts promotions cleanly. |
 | `muninn-promoter-loop` | Runs the promoter continuously to clear a large backlog. |
-| `muninn-phd-add` | Registers a new project repo (registry + recall group) and backfills it. |
+| `muninn-phd-add` | Registers a new project repo (registry + recall group) and backfills it. Needs a local `phd-add.conf` (see `muninn-phd-add.conf.example`). |
+| `muninn-dream-nightly` | Nightly offline dream sweep over all non-excluded vaults. Needs a local `dream-nightly.conf` (see `muninn-dream-nightly.conf.example`). |
 | `muninn-status` | Prints enricher queue status. |
 
 ## Config
@@ -45,6 +46,8 @@ Copy `muninn-hook.json.template` to `~/.config/muninn-hook.json`, replace the
 The enricher/promoter/contradictor/distributor share a separate
 `~/.config/muninn-enricher.json` (endpoint, LM Studio connection, per-worker
 model + reasoning settings) — not templated here as it's environment-specific.
+Per-script local configs (untracked) live in `${XDG_CONFIG_HOME:-$HOME/.config}/muninn/`;
+copy the matching `ops/*.conf.example` and edit.
 
 ## Server deploy
 

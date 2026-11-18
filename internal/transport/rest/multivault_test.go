@@ -99,7 +99,7 @@ func TestActivate_MultiVault_AllInScopeSucceeds(t *testing.T) {
 	engine := &MockEngine{}
 	server := NewServer("localhost:8080", engine, store, nil, nil, EmbedInfo{}, EnrichInfo{}, nil, "", nil)
 
-	body := `{"context":["memory"],"vaults":["agent-memory","proj-muninndb-3f2a1b9c"]}`
+	body := `{"context":["memory"],"vaults":["agent-memory","proj-example-0000aaaa"]}`
 	req := httptest.NewRequest("POST", "/api/activate", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -310,7 +310,7 @@ type listVaultsMockEngine struct {
 }
 
 func (m *listVaultsMockEngine) ListVaults(ctx context.Context) ([]string, error) {
-	return []string{"agent-memory", "pi", "phd-research", "proj-muninndb-ee56f739"}, nil
+	return []string{"agent-memory", "frozen-archive", "research-notes", "proj-example-0000bbbb"}, nil
 }
 
 func TestListVaults_ScopedKeyFiltersToScope(t *testing.T) {
@@ -334,7 +334,7 @@ func TestListVaults_ScopedKeyFiltersToScope(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&vaults); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	want := map[string]bool{"agent-memory": true, "proj-muninndb-ee56f739": true}
+	want := map[string]bool{"agent-memory": true, "proj-example-0000bbbb": true}
 	if len(vaults) != len(want) {
 		t.Fatalf("expected exactly %d in-scope vaults, got %v", len(want), vaults)
 	}

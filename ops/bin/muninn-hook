@@ -136,7 +136,7 @@ def _registry_override(cfg: dict, root: str) -> tuple[bool, str | None]:
 def resolve_project(cwd: str, cfg: dict) -> str | None:
     """Resolve cwd to a project vault name, or None for a global-only session."""
     root = _git_common_root(cwd)
-    # The registry can claim non-git paths too (e.g. Documents/PhD Draft):
+    # The registry can claim non-git paths too (e.g. Documents/Writing):
     # match against the git root when there is one, else the cwd itself.
     matched, override = _registry_override(cfg, root or os.path.abspath(cwd))
     if matched:
@@ -612,8 +612,8 @@ def format_recall_sections(activations: list[dict], project_vaults: list[str]) -
 
 def recall_group_vaults(cfg: dict, project_vault: str) -> list[str]:
     """Expand a store vault into its recall-tier vault list via `recall_groups`
-    (project-vaults phase: consolidated recall for PhD-writing dirs across all
-    PhD repos). Falls back to [project_vault] when no group is configured —
+    (project-vaults phase: consolidated recall for writing dirs across all
+    related repos). Falls back to [project_vault] when no group is configured —
     this is the identical single-vault behavior as before recall_groups existed."""
     groups = cfg.get("recall_groups", {})
     if isinstance(groups, dict):

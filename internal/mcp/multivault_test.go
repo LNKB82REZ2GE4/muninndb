@@ -121,7 +121,7 @@ func TestResolveVaultsWeighted_OutOfScopeVaultRejectedNoLeak(t *testing.T) {
 func TestResolveVaultsWeighted_InScopeVaultsAccepted(t *testing.T) {
 	scope := []string{"agent-memory", "proj-*"}
 	vaults, weights, present, errMsg := resolveVaultsWeighted(scope, map[string]any{
-		"vaults": []any{"agent-memory", "proj-muninndb-3f2a1b9c"},
+		"vaults": []any{"agent-memory", "proj-example-0000aaaa"},
 	})
 	if !present || errMsg != "" {
 		t.Fatalf("unexpected: present=%v err=%q", present, errMsg)
@@ -310,7 +310,7 @@ func TestHandleRecall_MultiVault_AllInScopeSucceeds(t *testing.T) {
 	eng := &recordingEngine{}
 	srv := New(":0", eng, "mdb_static", store, nil, nil)
 	body := mkToolCallBody("muninn_recall", map[string]any{
-		"vaults":  []any{"agent-memory", "proj-muninndb-3f2a1b9c"},
+		"vaults":  []any{"agent-memory", "proj-example-0000aaaa"},
 		"context": "test",
 	})
 	w := doAuthenticatedPost(srv, "mk_scoped002", body)

@@ -21,12 +21,12 @@ func TestResolveVaultScoped_NoArg_DefaultsToFirstLiteral(t *testing.T) {
 }
 
 func TestResolveVaultScoped_ArgMatchesGlob(t *testing.T) {
-	vault, errMsg := resolveVaultScoped([]string{"agent-memory", "proj-*"}, map[string]any{"vault": "proj-muninndb-abc123"})
+	vault, errMsg := resolveVaultScoped([]string{"agent-memory", "proj-*"}, map[string]any{"vault": "proj-example-abc123"})
 	if errMsg != "" {
 		t.Fatalf("unexpected error: %s", errMsg)
 	}
-	if vault != "proj-muninndb-abc123" {
-		t.Errorf("expected 'proj-muninndb-abc123', got %q", vault)
+	if vault != "proj-example-abc123" {
+		t.Errorf("expected 'proj-example-abc123', got %q", vault)
 	}
 }
 

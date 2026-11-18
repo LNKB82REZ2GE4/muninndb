@@ -1,0 +1,4 @@
+# Local config for muninn-phd-add. Copy to
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/muninn/phd-add.conf
+# Sourced as shell. GROUP is the recall-group key (the group's own vault).
+GROUP="proj-example-group"

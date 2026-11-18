@@ -14,7 +14,7 @@ func TestScopeMatch_Literal(t *testing.T) {
 
 func TestScopeMatch_Glob(t *testing.T) {
 	scope := []string{"proj-*"}
-	if !ScopeMatch(scope, "proj-muninndb-abc123") {
+	if !ScopeMatch(scope, "proj-example-abc123") {
 		t.Error("expected glob prefix match")
 	}
 	if ScopeMatch(scope, "other-vault") {
@@ -102,8 +102,8 @@ func TestResolveScopedVault_ArgMatchesLiteral(t *testing.T) {
 }
 
 func TestResolveScopedVault_ArgMatchesGlob(t *testing.T) {
-	vault, ok := ResolveScopedVault([]string{"agent-memory", "proj-*"}, "proj-muninndb-abc123")
-	if !ok || vault != "proj-muninndb-abc123" {
+	vault, ok := ResolveScopedVault([]string{"agent-memory", "proj-*"}, "proj-example-abc123")
+	if !ok || vault != "proj-example-abc123" {
 		t.Errorf("expected glob match, got (%q, %v)", vault, ok)
 	}
 }

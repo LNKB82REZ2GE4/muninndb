@@ -126,3 +126,7 @@ sdk/php/vendor/
 # scratch browser-automation / screenshot output (workspace convention keeps these
 # at the workspace root; this is a backstop in case a tool writes into the repo)
 .artifacts/
+
+# Local agent state
+.claude/memory-proposals*
+.claude/settings.local.json

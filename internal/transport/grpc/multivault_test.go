@@ -109,7 +109,7 @@ func TestActivate_MultiVault_AllInScopeSucceeds(t *testing.T) {
 	stream := &mockActivateStream{ctx: ctx}
 	err := srv.Activate(&pb.ActivateRequest{
 		Context: []string{"test"},
-		Vaults:  []string{"agent-memory", "proj-muninndb-3f2a1b9c"},
+		Vaults:  []string{"agent-memory", "proj-example-0000aaaa"},
 	}, stream)
 	if err != nil {
 		t.Fatalf("Activate: %v", err)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# muninn-phd-add — give a PhD project its OWN vault and add it to the
-# consolidated PhD recall group, then backfill its history.
+# muninn-phd-add — give a project its OWN vault and add it to a consolidated
+# recall group, then backfill its history.
 #
 # Usage: muninn-phd-add <path> [vault]
 #   <path>  project root (git or plain dir); subfolders inherit automatically
@@ -8,17 +8,26 @@
 #
 # Effect:
 #   1. registry entry  <path> -> <vault>   (isolated project memory)
-#   2. <vault> appended to recall_groups["proj-phd-writing"] so PhD Draft /
-#      PhD-Papers sessions recall across it (consolidated view)
+#   2. <vault> appended to recall_groups[$GROUP] so sessions in the group's
+#      home directories recall across it (consolidated view)
 #   3. provisions <vault> and backfills the path's session history into it
 #
-# Idempotent and safe to re-run. The PhD *writing* dirs (PhD Draft/PhD-Papers)
-# themselves map to proj-phd-writing — this tool is for the analysis repos that
-# feed the consolidated recall.
+# Idempotent and safe to re-run. The group's own "home" dirs map to the group
+# vault itself — this tool is for the repos that feed the consolidated recall.
+#
+# Local config (untracked, required): ${XDG_CONFIG_HOME:-$HOME/.config}/muninn/phd-add.conf
+# Sourced as shell; must define GROUP (the recall-group key, i.e. the group's
+# own vault name). See ops/muninn-phd-add.conf.example.
 set -euo pipefail
 
 CFG="$HOME/.config/muninn-hook.json"
-GROUP="proj-phd-writing"        # the recall-group key (the writing store vault)
+HOOK_BIN="${MUNINN_HOOK_BIN:-$HOME/.local/bin/muninn-hook}"
+CONF="${MUNINN_PHD_ADD_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/muninn/phd-add.conf}"
+[ -r "$CONF" ] || { echo "error: missing config $CONF (copy ops/muninn-phd-add.conf.example and edit)" >&2; exit 1; }
+GROUP=""
+# shellcheck disable=SC1090
+. "$CONF"
+[ -n "$GROUP" ] || { echo "error: GROUP not set in $CONF" >&2; exit 1; }
 PATH_ARG="${1:?usage: muninn-phd-add <path> [vault]}"
 
 ABS=$(realpath -m "$PATH_ARG")
@@ -44,7 +53,7 @@ else
   echo "registered: $ABS -> $VAULT"
 fi
 
-# 2. add vault to the consolidated PhD recall group (idempotent; create group if absent)
+# 2. add vault to the consolidated recall group (idempotent; create group if absent)
 tmp=$(mktemp)
 jq --arg g "$GROUP" --arg v "$VAULT" '
   .recall_groups //= {} |
@@ -54,10 +63,10 @@ jq --arg g "$GROUP" --arg v "$VAULT" '
 echo "recall group $GROUP now includes: $(jq -r --arg g "$GROUP" '.recall_groups[$g] | join(", ")' "$CFG")"
 
 # Verify resolution through the live hook logic (catches typos / shadowed prefixes).
-resolved=$(python3 - "$ABS" <<'EOF'
+resolved=$(python3 - "$ABS" "$HOOK_BIN" "$CFG" <<'EOF'
 import importlib.machinery, json, sys
-mod = importlib.machinery.SourceFileLoader("mh", "/home/jake/.local/bin/muninn-hook").load_module()
-cfg = json.load(open("/home/jake/.config/muninn-hook.json"))
+mod = importlib.machinery.SourceFileLoader("mh", sys.argv[2]).load_module()
+cfg = json.load(open(sys.argv[3]))
 print(mod.resolve_project(sys.argv[1], cfg))
 EOF
 )
@@ -69,11 +78,11 @@ echo "resolves to: $resolved"
 # (ErrVaultNotFound) rather than auto-creating it.
 CLAUDE_KEY=$(jq -r '.agents.claude.key' "$CFG")
 ENDPOINT=$(jq -r '.endpoint' "$CFG")
-provision_payload=$(jq -n --arg name "$VAULT" '{
+provision_payload=$(jq -n --arg name "$VAULT" --arg group "$GROUP" '{
   name: $name,
   template: "knowledge-graph",
   multi_user: false,
-  behavior_instructions: ("This is a project vault (project-vaults design), part of the proj-phd-writing consolidated recall_groups tier. Hook auto-stores (turns, compactions, subagent output) land here only. Deliberate muninn_remember calls should target both this vault and agent-memory, unless the fact is purely project-local.")
+  behavior_instructions: ("This is a project vault (project-vaults design), part of the " + $group + " consolidated recall_groups tier. Hook auto-stores (turns, compactions, subagent output) land here only. Deliberate muninn_remember calls should target both this vault and agent-memory, unless the fact is purely project-local.")
 }')
 if ! curl -sf -o /dev/null -X POST "$ENDPOINT/api/vaults" \
      -H "Authorization: Bearer $CLAUDE_KEY" -H "Content-Type: application/json" \
