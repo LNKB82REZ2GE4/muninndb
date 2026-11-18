@@ -267,6 +267,216 @@ class LMStudio:
             return None, reasoning_tokens
 
 
+# ─── OpenAI-compatible transport (llama-swap) ── BEGIN muninn-gpu transport v1 ──
+# Canonical copy: ~/dev/muninn-gpu/transport_snippet.py (pasted verbatim into muninn-enricher,
+# muninn-promoter and muninn-contradictor; tests/test_transports.py checks the copies are identical).
+#
+# Selected by the worker's config section `llm` block:
+#     "llm": {"transport": "openai", "base_url": "http://127.0.0.1:8091", "model": "strata",
+#             "timeout_sec": 900, "effort_on": "low"}
+# Absent `llm` (or transport != "openai") -> the native LM Studio class, unchanged: rollback is a config edit.
+#
+# Thinking map (reasoning spec from reasoning_fields()):
+#   off              -> reasoning_effort "none" + chat_template_kwargs {enable_thinking: false}
+#                       (Strata DEFAULTS TO HIGH when reasoning_effort is omitted, so "none" is always sent;
+#                        llama-server/Ornith launched with --reasoning off honours the kwargs, both harmless)
+#   on + budget N    -> reasoning_effort `effort_on` (default "low") + reasoning_budget_tokens N
+#   low/medium/high  -> reasoning_effort <that>
+#   on (no budget)   -> reasoning_effort `effort_on`
+# Readiness: llama-swap lists every configured model whether loaded or not, so /v1/models proves nothing.
+# model_ready() makes a 1-token call (which is what loads the model, through muninn-gpu-guard); a refusal
+# (llama-swap HTTP 500 "upstream command exited prematurely") or any 5xx / connection error = not ready,
+# and the worker's existing backoff takes over. A success is trusted for `ready_cache_sec` (120 s); a refusal
+# is remembered for `fail_cache_sec` (300 s) so a fast-polling daemon (the enricher idles at 60 s) asks — and
+# makes the guard write its journal line — at most once per 5 minutes.
+
+class OpenAICompat:
+    """Same surface as the native LMStudio class (model_ready, probe_thinking_off, chat_extract, loaded,
+    is_loaded, ensure_loaded, unload_all, reasoning_allowed_options) over /v1/chat/completions."""
+
+    BUSY_CODES = (409, 503)   # Strata: model busy / engine starting -> wait and resend inside the transport
+
+    def __init__(self, tcfg: dict):
+        self.base = tcfg.get("base_url", "http://127.0.0.1:8091").rstrip("/")
+        self.model = tcfg.get("model")
+        self.key = tcfg.get("key")
+        self.timeout = tcfg.get("timeout_sec", 900)
+        self.effort_on = tcfg.get("effort_on", "low")
+        self.busy_retries = tcfg.get("busy_retries", 6)
+        self.ready_cache_sec = tcfg.get("ready_cache_sec", 120)
+        self.fail_cache_sec = tcfg.get("fail_cache_sec", 300)
+        self._last_ok = 0.0
+        self._last_fail = 0.0
+        self.last_error = None
+
+    def _mid(self, model_id: str) -> str:
+        return self.model or model_id
+
+    def _http(self, path: str, body: dict | None = None, method: str = "GET", timeout: int | None = None):
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self.key:
+            headers["Authorization"] = f"Bearer {self.key}"
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
+                                     method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                raw = r.read()
+                return json.loads(raw) if raw.strip().startswith((b"{", b"[")) else {"_text": raw.decode(errors="replace")}
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read()[:300].decode(errors="replace")
+            except Exception:
+                err_body = ""
+            return {"_http_error": e.code, "_body": err_body}
+        except Exception as e:
+            return {"_http_error": None, "_body": f"transport: {e}"}
+
+    @staticmethod
+    def thinking_fields(spec, effort_on: str = "low") -> dict:
+        """reasoning spec -> OpenAI-compat request fields (see the map above)."""
+        budget = None
+        if isinstance(spec, dict):
+            mode = str(spec.get("mode", "off")).lower()
+            if mode == "budget":
+                budget = int(spec.get("budget_tokens") or 0)
+                if budget <= 0:
+                    raise ValueError(f"reasoning budget_tokens must be > 0, got {spec!r}")
+                mode = "on"
+        elif isinstance(spec, str):
+            mode = spec.lower()
+        else:
+            raise ValueError(f"unrecognised reasoning spec {spec!r}")
+        if mode in ("off", "none"):
+            return {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}}
+        out: dict = {"reasoning_effort": effort_on if mode == "on" else mode}
+        if budget:
+            out["reasoning_budget_tokens"] = budget
+        return out
+
+    def chat(self, model_id: str, max_tokens: int, system: str, user: str, temperature: float = 0.0,
+             reasoning="off", timeout: int | None = None) -> dict:
+        """One /v1/chat/completions call. -> raw response dict, or {"_http_error":..., "_body":...}."""
+        body = {"model": self._mid(model_id), "temperature": temperature, "max_tokens": max_tokens,
+                "messages": ([{"role": "system", "content": system}] if system else [])
+                            + [{"role": "user", "content": user}],
+                "stream": False, **self.thinking_fields(reasoning, self.effort_on)}
+        res: dict = {}
+        for attempt in range(self.busy_retries + 1):
+            res = self._http("/v1/chat/completions", body, "POST", timeout)
+            if res.get("_http_error") in self.BUSY_CODES and attempt < self.busy_retries:
+                time.sleep(min(5 * (attempt + 1), 30))
+                continue
+            break
+        if "_http_error" in res:
+            self.last_error = f"HTTP {res['_http_error']}: {res.get('_body', '')[:160]}"
+            log(f"llama-swap POST /v1/chat/completions {self.last_error}")
+        else:
+            self._last_ok = time.time()
+        return res
+
+    @staticmethod
+    def reasoning_tokens(res: dict) -> int:
+        """usage.completion_tokens_details.reasoning_tokens when the server reports it; otherwise an estimate
+        from reasoning_content (~4 chars/token; Strata's usage has no reasoning count). 0 = no thinking."""
+        rt = ((res.get("usage") or {}).get("completion_tokens_details") or {}).get("reasoning_tokens")
+        if isinstance(rt, int) and rt > 0:
+            return rt
+        msg = (res.get("choices") or [{}])[0].get("message") or {}
+        rc = (msg.get("reasoning_content") or "").strip()
+        content = msg.get("content") or ""
+        if not rc and "<think>" in content:
+            rc = content.split("<think>", 1)[1].split("</think>", 1)[0].strip()
+        return (len(rc) + 3) // 4 if rc else 0
+
+    def chat_extract(self, model_id: str, max_tokens: int, system: str, user: str,
+                     temperature: float = 0.0, reasoning="off") -> tuple[dict | None, int]:
+        """Drop-in for LMStudio.chat_extract: -> (parsed JSON | None, reasoning_tokens; -1 = transport error)."""
+        res = self.chat(model_id, max_tokens, system, user, temperature, reasoning)
+        if "_http_error" in res:
+            return None, -1
+        try:
+            msg = res["choices"][0]["message"]
+        except Exception:
+            log(f"  llama-swap: bad response shape: {str(res)[:150]}")
+            return None, -1
+        rtok = self.reasoning_tokens(res)
+        content = (msg.get("content") or "").strip()
+        if "</think>" in content:
+            content = content.rsplit("</think>", 1)[1].strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip() if "\n" in content else content
+        if not content.startswith("{"):
+            i, j = content.find("{"), content.rfind("}")
+            if i >= 0 and j > i:
+                content = content[i:j + 1]
+        try:
+            return json.loads(content), rtok
+        except Exception as e:
+            log(f"  JSON parse failed: {e}; raw[:120]={content[:120]!r}")
+            return None, rtok
+
+    def model_ready(self, model_id: str) -> tuple[bool, str]:
+        if time.time() - self._last_ok < self.ready_cache_sec:
+            return True, "ready (recent successful call)"
+        since_fail = time.time() - self._last_fail
+        if since_fail < self.fail_cache_sec:
+            return False, f"backing off: last llama-swap attempt failed {since_fail:.0f}s ago ({self.last_error})"
+        res = self.chat(model_id, 1, "", "Reply with OK.", 0.0, "off", timeout=max(self.timeout, 600))
+        if "_http_error" in res:
+            self._last_fail = time.time()
+            return False, (f"{self._mid(model_id)} not available via llama-swap ({self.last_error}) — "
+                           f"refused by muninn-gpu-guard, outside its window, or loading failed; backing off")
+        return True, "ready"
+
+    def probe_thinking_off(self, model_id: str) -> tuple[bool, int]:
+        res = self.chat(model_id, 200, 'Output exactly: {"x":1}', "ping", 0.0, "off")
+        if "_http_error" in res or not res.get("choices"):
+            return False, -1
+        rtok = self.reasoning_tokens(res)
+        return rtok == 0, rtok
+
+    def loaded(self) -> list[dict]:
+        res = self._http("/running", timeout=15)
+        out = []
+        for m in (res.get("running") or []) if isinstance(res, dict) else []:
+            out.append({"key": m.get("model", ""), "instance_id": m.get("model", ""),
+                        "context_length": None, "reasoning_default": None, "state": m.get("state")})
+        return out
+
+    def is_loaded(self, model_id: str) -> bool:
+        return any(m["key"] == self._mid(model_id) for m in self.loaded())
+
+    def ensure_loaded(self, model_id: str, context_length: int = 0, allow_swap: bool = True) -> tuple[bool, str]:
+        ok, why = self.model_ready(model_id)
+        return ok, (f"{self._mid(model_id)} loaded via llama-swap" if ok else why)
+
+    def unload(self, instance_id: str) -> bool:
+        res = self._http(f"/api/models/unload/{instance_id}", {}, "POST", 120)
+        return "_http_error" not in res
+
+    def unload_all(self) -> int:
+        n = len(self.loaded())
+        res = self._http("/api/models/unload", {}, "POST", 120)
+        return n if "_http_error" not in res else 0
+
+    def list_models(self) -> list[dict]:
+        res = self._http("/v1/models", timeout=15)
+        return [{"key": m.get("id"), "loaded_instances": []} for m in (res.get("data") or [])] \
+            if isinstance(res, dict) else []
+
+    def reasoning_allowed_options(self, model_id: str) -> list[str]:
+        return []   # no capability advertisement; thinking_fields() covers every spec shape
+
+
+def make_llm(cfg: dict, section: str):
+    """The worker's LLM client: OpenAICompat when cfg[section]["llm"]["transport"] == "openai", else LM Studio."""
+    tcfg = (cfg.get(section) or {}).get("llm") or {}
+    if tcfg.get("transport") == "openai":
+        return OpenAICompat(tcfg)
+    return LMStudio(cfg["lmstudio"])
+# ─── END muninn-gpu transport v1 ──
+
+
 # ─── DB (durable queue) ────────────────────────────────────────────────────
 
 SCHEMA = """
@@ -569,12 +779,14 @@ def enqueue(conn, candidates, model, vault):
         if not eid:
             continue
         try:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT OR IGNORE INTO jobs (id, concept, missing_stages, expected_updated_at, status, model, queued_at, vault) "
                 "VALUES (?,?,?,?, 'pending', ?, ?, ?)",
                 (eid, c.get("concept", "")[:200], json.dumps(c.get("missing_stages", [])),
                  c.get("updated_at", ""), model, now, vault))
-            added += conn.total_changes and 1
+            # rowcount, not total_changes: total_changes is cumulative per connection, so it
+            # counted ignored rows as added and the STALL GUARD below never fired (2026-10-11).
+            added += max(cur.rowcount, 0)
         except Exception as e:
             log(f"enqueue {eid} ({vault}) failed: {e}")
     conn.commit()
@@ -601,6 +813,15 @@ def mark_done(conn, eid):
     conn.commit()
 
 
+class MuninnDown(Exception):
+    """muninn's REST API refused the connection: a server outage, not a job failure."""
+
+
+def is_server_down(e: Exception) -> bool:
+    reason = getattr(e, "reason", e)
+    return isinstance(reason, (ConnectionRefusedError, ConnectionResetError))
+
+
 def mark_failed(conn, eid, err, max_retries):
     conn.execute("UPDATE jobs SET status=CASE WHEN retries+1>=? THEN 'failed' ELSE 'pending' END, "
                  "retries=retries+1, last_error=? WHERE id=?", (max_retries, err[:300], eid))
@@ -619,7 +840,21 @@ def process_job(conn, muninn, lm, model_cfg, endpoint, api_key, vault, max_retri
         with urllib.request.urlopen(req, timeout=10) as r:
             engram = json.loads(r.read())
     except Exception as e:
+        if is_server_down(e):
+            # muninn itself is down (e.g. nightly dream stops it 03:34-03:41, inside this
+            # window). Not this engram's fault: put the job back untouched and end the pass.
+            conn.execute("UPDATE jobs SET status='pending' WHERE id=?", (eid,))
+            conn.commit()
+            raise MuninnDown(str(e)) from e
         mark_failed(conn, eid, f"fetch failed: {e}", max_retries)
+        return True
+
+    if "kind:knowledge-page" in (engram.get("tags") or []):
+        # Phase 5 §4.4: apply_enrichment's UpdateDigest would overwrite the page's
+        # summary and re-type it (memory_type 11 -> one of 12 enrichment types).
+        # Pages are never enriched; mark done so they are not re-queued.
+        log(f"  {eid}: knowledge page — skipped")
+        mark_done(conn, eid)
         return True
 
     content = (engram.get("content") or "").strip()
@@ -733,7 +968,11 @@ def run_once(cfg, muninn, lm, conn, model_key) -> int:
             if not job:
                 active.remove(vault)
                 continue
-            process_job(conn, muninn, lm, model_cfg, endpoint, api_key, vault, max_retries, job)
+            try:
+                process_job(conn, muninn, lm, model_cfg, endpoint, api_key, vault, max_retries, job)
+            except MuninnDown as e:
+                log(f"muninn unreachable ({e}); ending pass, jobs stay pending")
+                return n
             n += 1
             progressed = True
         if not progressed:
@@ -757,9 +996,10 @@ def main():
     p.add_argument("--reset-failed", action="store_true", help="reset failed jobs to pending")
     args = p.parse_args()
 
-    model_key = "fast" if args.fast else cfg.get("default_model", "standard")
+    # Per-worker override (enricher.model) wins over the shared default_model.
+    model_key = "fast" if args.fast else cfg.get("enricher", {}).get("model") or cfg.get("default_model", "standard")
     model_cfg = cfg["models"][model_key]
-    lm = LMStudio(cfg["lmstudio"])
+    lm = make_llm(cfg, "enricher")
     conn = db_connect()
 
     if args.status:
@@ -799,6 +1039,17 @@ def main():
             print(f"  → target NOT loaded. Run: muninn-enricher --load {'--fast' if args.fast else ''}")
         return
 
+    if args.probe:
+        # --probe was parsed but never handled until 2026-10-08: it fell through to the daemon loop and
+        # enriched the live vault. It now does what its help says: one thinking-off probe, then exit.
+        ok, reasoning = lm.probe_thinking_off(model_cfg["id"])
+        if reasoning < 0:
+            print(f"✗ probe failed for {model_cfg['id']} (model not reachable/refused)")
+            sys.exit(2)
+        print(f"{'✓' if ok else '✗'} {model_cfg['id']}: thinking {'OFF' if ok else 'ON'} "
+              f"(probe used {reasoning} reasoning tokens)")
+        sys.exit(0 if ok else 1)
+
     if args.load:
         ok, msg = lm.ensure_loaded(model_cfg["id"], model_cfg["context_length"], allow_swap=True)
         print(msg)
@@ -807,21 +1058,35 @@ def main():
             print(f"  muninn-enricher --check {'--fast' if args.fast else ''}")
         return
 
-    # Enrichment path: probe thinking-off first, abort if on
+    # Enrichment path: probe thinking-off first, abort if on.
+    #
+    # DAEMON MODE MUST NOT EXIT HERE. The daemon loop below already handles an
+    # absent model correctly (model_ready() -> "pausing until reloaded", logged
+    # at most once per 5 min, idle_interval backoff) -- but it never got the
+    # chance, because this startup gate ran first and sys.exit(1)'d. systemd
+    # then restarted the unit every RestartSec=30 forever whenever LM Studio
+    # had no model loaded (e.g. every boot). That restart loop is the bug; the
+    # backoff the unit comment promised lives twenty lines below this.
+    # A one-shot (--once) run still exits non-zero: a human invoking it wants
+    # the error, and there is no loop to wait in.
     if not lm.is_loaded(model_cfg["id"]):
         print(f"✗ {model_cfg['id']} is not loaded.")
         print(f"  Load it: muninn-enricher --load {'--fast' if args.fast else ''}")
         print(f"  Then toggle thinking OFF in the LM Studio GUI.")
-        sys.exit(1)
-
-    ok, reasoning = lm.probe_thinking_off(model_cfg["id"])
-    if reasoning < 0:
-        print(f"⚠ probe failed — is LM Studio reachable? Proceeding anyway (quality unverified).")
-    elif not ok:
-        print(f"✗ {model_cfg['id']} has thinking ON (probe used {reasoning} reasoning tokens).")
-        print(f"  Toggle OFF in LM Studio GUI: Inference > Custom Fields > Reasoning.")
-        print(f"  Then re-run: muninn-enricher {'--fast' if args.fast else ''} --once")
-        sys.exit(1)
+        if args.once:
+            sys.exit(1)
+        print("  daemon mode: waiting for the model instead of exiting.")
+    else:
+        ok, reasoning = lm.probe_thinking_off(model_cfg["id"])
+        if reasoning < 0:
+            print(f"⚠ probe failed — is LM Studio reachable? Proceeding anyway (quality unverified).")
+        elif not ok:
+            print(f"✗ {model_cfg['id']} has thinking ON (probe used {reasoning} reasoning tokens).")
+            print(f"  Toggle OFF in LM Studio GUI: Inference > Custom Fields > Reasoning.")
+            print(f"  Then re-run: muninn-enricher {'--fast' if args.fast else ''} --once")
+            if args.once:
+                sys.exit(1)
+            print("  daemon mode: pausing until thinking is toggled OFF.")
 
     muninn = MuninnMCP(cfg)
     if args.once:
@@ -833,6 +1098,14 @@ def main():
         log(f"daemon mode: model={model_id}, active poll={interval}s, idle poll={idle_interval}s")
         log(f"  pauses when {model_id} is unloaded; backs off to {idle_interval}s when queue is idle")
         last_unavailable_log = 0.0
+        # None = not yet verified for the current model load. Reset to None
+        # whenever the model goes away, so a reload is always re-probed: the
+        # startup gate no longer guarantees thinking is OFF (daemon mode now
+        # waits here instead of exiting), so this loop owns that guarantee.
+        # Enriching with thinking ON silently degrades output quality, which is
+        # worse than not enriching at all -- so pause rather than proceed.
+        thinking_ok = None
+        last_thinking_log = 0.0
         while True:
             sleep_sec = interval
             try:
@@ -843,8 +1116,29 @@ def main():
                     if now - last_unavailable_log > 300:
                         log(f"paused: {reason}")
                         last_unavailable_log = now
+                    thinking_ok = None
                     sleep_sec = idle_interval
                 else:
+                    if thinking_ok is not True:
+                        ok, reasoning = lm.probe_thinking_off(model_id)
+                        if reasoning < 0:
+                            # Can't determine (LM Studio flaky). Proceed rather
+                            # than stall the queue; quality unverified.
+                            log("thinking probe failed — proceeding, quality unverified")
+                            thinking_ok = True
+                        elif ok:
+                            log(f"thinking is OFF (probe used {reasoning} reasoning tokens) — enriching")
+                            thinking_ok = True
+                        else:
+                            now = time.time()
+                            if now - last_thinking_log > 300:
+                                log(f"paused: {model_id} has thinking ON "
+                                    f"(probe used {reasoning} reasoning tokens); "
+                                    f"toggle OFF in LM Studio > Inference > Custom Fields > Reasoning")
+                                last_thinking_log = now
+                            for _ in range(idle_interval):
+                                time.sleep(1)
+                            continue
                     n = run_once(cfg, muninn, lm, conn, model_key)
                     if n == 0:
                         # Queue drained — nothing to do. Back off so we don't

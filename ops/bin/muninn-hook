@@ -42,8 +42,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 HOME = Path.home()
-CONFIG_PATH = HOME / ".config" / "muninn-hook.json"
-STATE_DIR = HOME / ".local" / "share" / "muninn-hook"
+CONFIG_PATH = Path(os.environ.get("MUNINN_HOOK_CONFIG") or HOME / ".config" / "muninn-hook.json")
+STATE_DIR = Path(os.environ.get("MUNINN_HOOK_STATE_DIR") or HOME / ".local" / "share" / "muninn-hook")
 CURSOR_DIR = STATE_DIR / "cursors"
 LOG_PATH = STATE_DIR / "hook.log"
 
@@ -136,9 +136,19 @@ def _registry_override(cfg: dict, root: str) -> tuple[bool, str | None]:
 def resolve_project(cwd: str, cfg: dict) -> str | None:
     """Resolve cwd to a project vault name, or None for a global-only session."""
     root = _git_common_root(cwd)
-    # The registry can claim non-git paths too (e.g. Documents/Writing):
-    # match against the git root when there is one, else the cwd itself.
-    matched, override = _registry_override(cfg, root or os.path.abspath(cwd))
+    cwd_abs = os.path.abspath(cwd)
+    # Try the cwd BEFORE the git root, so a registry entry may name a
+    # subdirectory of a repo (e.g. "/path/to/repo/subdir" inside the
+    # repo). Matching only the root made such entries dead: the
+    # root is the key's *parent*, so the prefix test could never fire and the
+    # content silently landed in the auto-provisioned repo vault instead
+    # (the subdirectory vault held 0 engrams; the repo vault held 34).
+    matched, override = _registry_override(cfg, cwd_abs)
+    if not matched:
+        # Fall back to the git root, which is what makes worktrees resolve to
+        # the same vault as their main repo (cwd is outside the registry key,
+        # but the shared common-dir root is not).
+        matched, override = _registry_override(cfg, root or cwd_abs)
     if matched:
         return override
     if root is None:
@@ -579,26 +589,96 @@ def _format_activation_lines(activations: list[dict]) -> list[str]:
         concept = a.get("concept", "")
         content = a.get("content", "")
         score = a.get("relevance") or a.get("score") or 0
-        lines.append(f"- [{score:.2f}] {concept}: {content[:300]}")
+        band = a.get("relevance_band")
+        band_str = f" {band}" if band and band != "uncalibrated" else ""
+        lines.append(f"- [{score:.2f}{band_str}] {concept}: {content[:300]}")
     return lines
 
 
-def format_recall(activations: list[dict], source_label: str) -> str:
-    if not activations:
+# G4: the server sets semantic_degraded when the embedder failed and recall
+# fell back to keyword-only (BM25). This used to be a quiet parenthetical; it
+# is now the first line of the injected context so an agent cannot miss it.
+DEGRADED_RECALL_NOTICE = (
+    "WARNING: MUNINN MEMORY IS DEGRADED: semantic search is unavailable (the embedder "
+    "is failing), so the memories below were matched by KEYWORD ONLY and relevant "
+    "memories may be missing. Do not treat an empty or thin recall as evidence that "
+    "nothing was remembered. Mention this to the user if it persists."
+)
+
+
+def embed_backend_status(cfg: dict) -> dict | None:
+    """GET /api/health (public, no key) and return its embed_backend block,
+    or None when the server is unreachable or predates G4 (no such field)."""
+    url = cfg.get("endpoint", "http://127.0.0.1:8475") + "/api/health"
+    try:
+        with urllib.request.urlopen(url, timeout=min(3, defaults(cfg).get("http_timeout_sec", 6))) as r:
+            return (json.loads(r.read()) or {}).get("embed_backend")
+    except Exception as e:
+        dbg(f"health check failed: {e}")
+        return None
+
+
+def embed_backend_banner(eb: dict | None) -> str:
+    """One loud line when the embed backend is degraded/disabled, else ''."""
+    if not eb:
         return ""
+    state = eb.get("state")
+    if state == "degraded":
+        since = eb.get("degraded_since") or "?"
+        n = eb.get("consecutive_failures", "?")
+        return (f"WARNING: MUNINN EMBEDDER DEGRADED since {since} ({n} consecutive failures): "
+                "memory recall is keyword-only until it recovers.")
+    if state == "disabled":
+        reason = eb.get("reason") or "the embed provider failed at startup"
+        return f"WARNING: MUNINN EMBEDDER DISABLED: {reason}."
+    return ""
+
+
+def _response_notices(res: dict | None) -> list[str]:
+    """Top-level recall-honesty signals (v0.10.0 #742-#746/#764): abstained,
+    semantic_degraded, conflict. Server field names verified live against
+    /api/activate (mbp.ActivateResponse) — no top-level `notices` field exists."""
+    if not res:
+        return []
+    notices = []
+    if res.get("abstained"):
+        reason = res.get("abstained_reason")
+        suffix = f" ({reason})" if reason else ""
+        notices.append(f"(memory recall abstained: nothing relevant enough{suffix})")
+    if res.get("semantic_degraded"):
+        notices.append(DEGRADED_RECALL_NOTICE)
+    conflict = res.get("conflict")
+    if conflict:
+        pairs = conflict.get("pairs") or []
+        names = [
+            f"{p.get('a_concept') or p.get('a') or '?'!r} vs {p.get('b_concept') or p.get('b') or '?'!r}"
+            for p in pairs
+        ]
+        if names:
+            notices.append("(conflicting memories shown: " + "; ".join(names) + ")")
+        elif conflict.get("warning"):
+            notices.append(f"(conflicting memories shown: {conflict['warning']})")
+    return notices
+
+
+def format_recall(activations: list[dict], source_label: str, res: dict | None = None) -> str:
+    notices = _response_notices(res)
+    if not activations:
+        return "\n".join(notices)
     lines = [f"Relevant memories from {source_label} vault:"] + _format_activation_lines(activations)
-    return "\n".join(lines)
+    return "\n".join(notices + lines) if notices else "\n".join(lines)
 
 
-def format_recall_sections(activations: list[dict], project_vaults: list[str]) -> str:
+def format_recall_sections(activations: list[dict], project_vaults: list[str], res: dict | None = None) -> str:
     """Two labelled sections for a project-scoped multi-vault recall (design §5.1).
 
     `project_vaults` is the full project-tier vault list (a `recall_groups`
     expansion, or just [store_vault] when the store vault has no group) — any
     activation from one of these vaults is "Project", everything else
     (agent-memory) is "General"."""
+    notices = _response_notices(res)
     if not activations:
-        return ""
+        return "\n".join(notices)
     proj_set = set(project_vaults)
     proj = [a for a in activations if a.get("vault") in proj_set]
     gen = [a for a in activations if a.get("vault") not in proj_set]
@@ -607,7 +687,37 @@ def format_recall_sections(activations: list[dict], project_vaults: list[str]) -
         sections.append("\n".join(["Project memories:"] + _format_activation_lines(proj)))
     if gen:
         sections.append("\n".join(["General memories:"] + _format_activation_lines(gen)))
-    return "\n\n".join(sections)
+    body = "\n\n".join(sections)
+    return "\n".join(notices + [body]) if notices else body
+
+
+def format_vault_banner(cfg: dict, vault: str | None) -> str:
+    """State the resolved vault names explicitly for the agent.
+
+    Without this the hook knows the project vault but never says so, and the
+    agent is told (in CLAUDE.md) to dual-write `vaults: ["<project-vault>",
+    "agent-memory"]` — an instruction it cannot follow, because the vault name
+    is nowhere in its context. Agents then either guess a name (which fails
+    closed) or silently fall back to agent-memory only, losing the project
+    tier. A stray `LNK_MEMORY_MUNINN_VAULT=pi` in the environment (pi's own
+    config, exported globally) has also been mistaken for the answer — `pi`
+    being the frozen archive, that is the worst possible guess.
+    """
+    if not vault:
+        return ('Muninn vault: agent-memory (no project vault for this cwd — '
+                'omit the `vaults` arg; it defaults to agent-memory).')
+    group = recall_group_vaults(cfg, vault)
+    lines = [
+        f'Muninn project vault: {vault}',
+        f'  - Deliberate remembers: vaults: ["{vault}", "agent-memory"]',
+        f'  - Single-vault tools (muninn_read/entities/traverse/status/...) '
+        f'default to agent-memory — pass vault: "{vault}" to read project memory.',
+    ]
+    if len(group) > 1:
+        lines.append(f'  - Recall group: {", ".join(group)}')
+    lines.append('  - Ignore any LNK_MEMORY_MUNINN_VAULT in the environment; '
+                 'that belongs to pi, and `pi` is a frozen archive — never write to it.')
+    return "\n".join(lines)
 
 
 def recall_group_vaults(cfg: dict, project_vault: str) -> list[str]:
@@ -646,6 +756,84 @@ def activate_multi(cfg: dict, key: str, context: list[str], max_results: int, th
 
 
 # ---------------------------------------------------------------------------
+# Raw-chunk exclusion (2026-10-08)
+# ---------------------------------------------------------------------------
+# muninn-git-ingest stores each raw commit chunk as a provenance engram tagged
+# RAW_CHUNK_TAG (the extractor's facts link to it via `source-engram:<id>`).
+# The extractor pilot measured that these raw chunks take ~42% of top-10 recall
+# slots while excluding them is retrieval-neutral, so they stay STORED but are
+# dropped from the hook's default (injected) recall. /api/activate has no
+# per-request tag exclusion and its rows carry no tags, so this is client-side:
+# over-fetch, pre-select by the git-ingest-owned concept prefix, confirm by tag
+# with GET /api/engrams/{id}, drop, truncate. Opt out: "recall_exclude_raw_chunks":
+# false in the hook config `defaults`. Explicit recall (MCP muninn_recall with a
+# tags filter, or a source-engram lookup) still reaches them. Server-side
+# alternative: per-vault plasticity "exclude_tags": ["source:git-history"] (#713).
+RAW_CHUNK_TAG = "source:git-history"
+RAW_CHUNK_CONCEPT_PREFIX = "git history of "
+
+
+def is_raw_chunk(cfg: dict, key: str, act: dict, default_vault: str | None = None) -> bool:
+    """True when an activation row is a git-ingest raw chunk. The concept prefix is a
+    cheap pre-filter (no extra call for ordinary rows); the tag is the contract. If the
+    confirming GET fails, the prefix alone decides (presentation side: fail toward hiding
+    a row only git-ingest writes)."""
+    if not (act.get("concept") or "").startswith(RAW_CHUNK_CONCEPT_PREFIX):
+        return False
+    eid = act.get("id")
+    vault = act.get("vault") or default_vault
+    if not eid:
+        return True
+    path = f"/api/engrams/{urllib.parse.quote(str(eid))}"
+    if vault:
+        path += f"?vault={urllib.parse.quote(vault)}"
+    eng = http_get(cfg, path, key)
+    if not eng:
+        return True
+    return RAW_CHUNK_TAG in (eng.get("tags") or [])
+
+
+def exclude_raw_chunks(cfg: dict, key: str, res: dict | None, max_results: int,
+                       default_vault: str | None = None) -> dict | None:
+    """Drop raw chunks from res['activations'] and truncate to max_results (in place)."""
+    if not res or not isinstance(res.get("activations"), list):
+        return res
+    acts = res["activations"]
+    kept = [a for a in acts if not is_raw_chunk(cfg, key, a, default_vault)]
+    if len(kept) != len(acts):
+        dbg(f"recall: excluded {len(acts) - len(kept)} raw chunk(s) tagged {RAW_CHUNK_TAG}")
+    res["activations"] = kept[:max_results]
+    return res
+
+
+def recall_fetch_size(cfg: dict, max_results: int) -> int:
+    """Over-fetch so excluded raw chunks do not shrink the injected list."""
+    d = defaults(cfg)
+    if not d.get("recall_exclude_raw_chunks", True):
+        return max_results
+    return max_results + int(d.get("recall_exclude_overfetch", max_results))
+
+
+def activate_default(cfg: dict, key: str, context: list[str], max_results: int, threshold: float,
+                     project_vault: str | None) -> dict | None:
+    """Default (hook-injected) recall: multi-vault when a project vault resolves, else
+    agent-memory; raw git chunks excluded unless recall_exclude_raw_chunks is false."""
+    n = recall_fetch_size(cfg, max_results)
+    if project_vault:
+        res = activate_multi(cfg, key, context, n, threshold, project_vault)
+    else:
+        res = http_post(cfg, "/api/activate", {
+            "context": context,
+            "max_results": n,
+            "threshold": threshold,
+            "mode": "balanced",
+        }, key)
+    if n == max_results:
+        return res
+    return exclude_raw_chunks(cfg, key, res, max_results, project_vault or "agent-memory")
+
+
+# ---------------------------------------------------------------------------
 # stdin helpers
 # ---------------------------------------------------------------------------
 
@@ -678,19 +866,18 @@ def cmd_orient(cfg, agent, fmt, args):
     vault = resolve_store_vault(cfg, cwd)
     if vault:
         ensure_project_vault(cfg, key, vault)
-        res = activate_multi(cfg, key, ctx, max_results, threshold, vault)
+        res = activate_default(cfg, key, ctx, max_results, threshold, vault)
         acts = (res or {}).get("activations", []) if res else []
-        text = format_recall_sections(acts, recall_group_vaults(cfg, vault))
+        text = format_recall_sections(acts, recall_group_vaults(cfg, vault), res)
     else:
-        res = http_post(cfg, "/api/activate", {
-            "context": ctx,
-            "max_results": max_results,
-            "threshold": threshold,
-            "mode": "balanced",
-        }, key)
+        res = activate_default(cfg, key, ctx, max_results, threshold, None)
         acts = (res or {}).get("activations", []) if res else []
-        text = format_recall(acts, "agent-memory")
-    emit_context(text, "SessionStart", fmt)
+        text = format_recall(acts, "agent-memory", res)
+    # The vault banner is unconditional: it must survive a session with zero
+    # activations, which is exactly when an agent is most likely to guess.
+    banner = format_vault_banner(cfg, vault)
+    health = embed_backend_banner(embed_backend_status(cfg))
+    emit_context("\n\n".join(p for p in (health, banner, text) if p), "SessionStart", fmt)
 
 
 def cmd_prompt(cfg, agent, fmt, args):
@@ -717,18 +904,18 @@ def cmd_prompt(cfg, agent, fmt, args):
     threshold = defaults(cfg).get("recall_threshold", 0.3)
     if vault:
         ensure_project_vault(cfg, key, vault)
-        res = activate_multi(cfg, key, [prompt[:1000]], max_results, threshold, vault)
+        res = activate_default(cfg, key, [prompt[:1000]], max_results, threshold, vault)
         acts = (res or {}).get("activations", []) if res else []
-        text = format_recall_sections(acts, recall_group_vaults(cfg, vault))
+        text = format_recall_sections(acts, recall_group_vaults(cfg, vault), res)
     else:
-        res = http_post(cfg, "/api/activate", {
-            "context": [prompt[:1000]],
-            "max_results": max_results,
-            "threshold": threshold,
-            "mode": "balanced",
-        }, key)
+        res = activate_default(cfg, key, [prompt[:1000]], max_results, threshold, None)
         acts = (res or {}).get("activations", []) if res else []
-        text = format_recall(acts, "agent-memory")
+        text = format_recall(acts, "agent-memory", res)
+    # One compact line per turn (not the full SessionStart banner): the
+    # session-start banner is lost on compaction, and that is precisely when a
+    # long session starts guessing vault names.
+    if vault:
+        text = "\n\n".join(p for p in (f"Project vault: {vault}", text) if p)
     emit_context(text, "UserPromptSubmit", fmt)
 
 
@@ -763,18 +950,13 @@ def cmd_posttool(cfg, agent, fmt, args):
     vault = resolve_store_vault(cfg, cwd)
     threshold = defaults(cfg).get("recall_threshold", 0.3)
     if vault:
-        res = activate_multi(cfg, key, [f"error fix for: {err[:1000]}"], 4, threshold, vault)
+        res = activate_default(cfg, key, [f"error fix for: {err[:1000]}"], 4, threshold, vault)
         acts = (res or {}).get("activations", []) if res else []
-        text = format_recall_sections(acts, recall_group_vaults(cfg, vault))
+        text = format_recall_sections(acts, recall_group_vaults(cfg, vault), res)
     else:
-        res = http_post(cfg, "/api/activate", {
-            "context": [f"error fix for: {err[:1000]}"],
-            "max_results": 4,
-            "threshold": threshold,
-            "mode": "balanced",
-        }, key)
+        res = activate_default(cfg, key, [f"error fix for: {err[:1000]}"], 4, threshold, None)
         acts = (res or {}).get("activations", []) if res else []
-        text = format_recall(acts, "agent-memory")
+        text = format_recall(acts, "agent-memory", res)
     emit_context(text, "PostToolUse", fmt)
 
 
@@ -863,6 +1045,12 @@ def cmd_store_turn(cfg, agent, fmt, args):
     vault = resolve_store_vault(cfg, cwd)
     n = _store_transcript(cfg, agent, "auto", transcript, session_id, vault=vault)
     dbg(f"store-turn: {n} engrams")
+    # G4: the Stop hook's output is shown to the user, not the model, so this
+    # is where a degraded embedder reaches the human.
+    if fmt == "claude":
+        health = embed_backend_banner(embed_backend_status(cfg))
+        if health:
+            print(json.dumps({"systemMessage": health}))
 
 
 def cmd_store_subagent(cfg, agent, fmt, args):

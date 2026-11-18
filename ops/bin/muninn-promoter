@@ -23,6 +23,13 @@ Design (project-vaults phase 6, design §5.4):
     REST GET /api/contradictions?vault=agent-memory.
   - Never mints custom entity-relationship types.
   - --dry-run performs zero writes, including tag writes.
+  - Verification stage (plan Phase 4 / G6): after the rewrite, a strict JSON
+    check asks "is every claim in REWRITE supported by SOURCE?" (thinking off,
+    temperature 0). `supported` -> promote with `promotion:verified` and
+    `promoted-from:<source id>` tags. `partial`/`unsupported` -> NOT promoted;
+    the row is parked in the sqlite queue as status='review' (same convention
+    as the resolver's `defer`: nothing remote is changed except the source is
+    marked assessed so it is not re-judged). List with --review-list.
 """
 from __future__ import annotations
 
@@ -62,8 +69,58 @@ DEFAULT_PROMOTER_CFG = {
     "max_retries": 3,
     "model": "standard",  # key into cfg["models"], same models the enricher uses
     "twin_similarity_threshold": 0.75,
-    "reasoning": "off",  # "off"|"low"|"medium"|"high"|"on"; validated against the model's advertised allowed_options
+    "verify": True,            # post-rewrite fidelity check (G6); False = legacy behaviour
+    "verify_model": None,      # key into cfg["models"]; None = same model as the rewrite
+    "verify_max_tokens": 1500,
+    "reasoning": "off",  # distil/rewrite call: "off"|"low"|"medium"|"high"|"on"; stays OFF (thinking doubled confabulated promotions in the A/B)
+    # VERIFY call only: thinking ON under a fixed budget (2026-10-08 bake-off: +5/+10 points
+    # for Ornith on verify_shared). A string ("off"/"on") is also accepted. See reasoning_fields().
+    # 1200 (was 2048, 2026-10-08): on Ornith 9B, verify_shared verdicts identical at 1200 vs 2048 on 20/20,
+    # 10/10 controls caught at both; see ~/dev/muninn-bakeoff/PROMOTE_GOLD_AND_OPTIONS.md.
+    "verify_reasoning": {"mode": "budget", "budget_tokens": 1200},
+    # DISTIL call options (2026-10-08 promoter-options test, see ~/dev/muninn-bakeoff/PROMOTE_GOLD_AND_OPTIONS.md).
+    # distil_fewshot: append FEWSHOT_PROMOTE (one invented promote + one reject example) to the distil system
+    #   prompt; False sends SYS_PROMPT_PROMOTE byte-identical to before.
+    # distil_reasoning: reasoning spec for the distil call (same shapes as verify_reasoning); None = use
+    #   "reasoning" above (default "off"), i.e. unchanged behaviour.
+    "distil_fewshot": False,
+    "distil_reasoning": None,
 }
+
+
+def reasoning_fields(spec) -> dict:
+    """Map a config reasoning spec onto native /api/v1/chat request fields.
+      "off"/"on"/"low"/...                    -> {"reasoning": spec}
+      {"mode": "budget", "budget_tokens": N}  -> {"reasoning": "on", "reasoning_budget": N}
+      {"mode": "off"|"on"|...}                -> {"reasoning": mode}
+    The native endpoint rejects thinking_budget_tokens (HTTP 400 unrecognized_keys)
+    and an object-valued `reasoning`; `reasoning_budget` is what it honours (probed
+    2026-10-08: budget 2048 -> 2048 reasoning tokens on ornith-1.5-9b, 2047 on
+    gemma-4-26b-a4b-qat). Anything malformed raises ValueError — fail loudly."""
+    if isinstance(spec, dict):
+        mode = spec.get("mode")
+        if mode == "budget":
+            n = int(spec.get("budget_tokens", 0))
+            if n <= 0:
+                raise ValueError(f"reasoning budget_tokens must be > 0, got {spec!r}")
+            return {"reasoning": "on", "reasoning_budget": n}
+        if isinstance(mode, str) and mode:
+            return {"reasoning": mode}
+        raise ValueError(f"unrecognised reasoning spec {spec!r}")
+    if isinstance(spec, str) and spec:
+        return {"reasoning": spec}
+    raise ValueError(f"unrecognised reasoning spec {spec!r}")
+
+
+def warn_reasoning(label: str, spec, reasoning_tokens: int) -> None:
+    """Runtime guard: off-but-reasoned, or over budget (the model ignored the cap)."""
+    rf = reasoning_fields(spec)
+    if rf["reasoning"] == "off" and reasoning_tokens > 0:
+        log(f"  ⚠ {label} used {reasoning_tokens} reasoning tokens despite reasoning=off")
+    b = rf.get("reasoning_budget")
+    if b and reasoning_tokens > b * 1.1:
+        log(f"  ⚠ {label} used {reasoning_tokens} reasoning tokens over a {b}-token budget — "
+            f"this model may be ignoring reasoning_budget")
 
 
 # ─── Config + logging ──────────────────────────────────────────────────────
@@ -74,6 +131,12 @@ def load_config() -> dict:
     except Exception as e:
         log(f"config load failed: {e}; defaults")
         return {}
+
+
+def distil_reasoning_spec(pcfg: dict):
+    """Effective reasoning spec for the distil call: promoter.distil_reasoning if set, else promoter.reasoning."""
+    spec = pcfg.get("distil_reasoning")
+    return spec if spec is not None else pcfg.get("reasoning", "off")
 
 
 def promoter_cfg(cfg: dict) -> dict:
@@ -174,13 +237,13 @@ class LMStudio:
         return reasoning == 0, reasoning
 
     def chat_extract(self, model_id: str, max_tokens: int, system: str, user: str,
-                      temperature: float = 0.0, reasoning: str = "off") -> tuple[dict | None, int]:
+                      temperature: float = 0.0, reasoning="off") -> tuple[dict | None, int]:
         """Native /api/v1/chat call (see muninn-enricher for full rationale).
         `reasoning` is per-request ("off"|"low"|"medium"|"high"|"on") and
         overrides the GUI toggle entirely."""
         payload = {
             "model": model_id, "temperature": temperature, "max_output_tokens": max_tokens,
-            "input": user, "system_prompt": system, "reasoning": reasoning,
+            "input": user, "system_prompt": system, **reasoning_fields(reasoning),
         }
         res = self._req("/api/v1/chat", body=payload, method="POST", timeout=self.timeout)
         if not res or "_http_error" in res:
@@ -225,6 +288,216 @@ class LMStudio:
         return []
 
 
+# ─── OpenAI-compatible transport (llama-swap) ── BEGIN muninn-gpu transport v1 ──
+# Canonical copy: ~/dev/muninn-gpu/transport_snippet.py (pasted verbatim into muninn-enricher,
+# muninn-promoter and muninn-contradictor; tests/test_transports.py checks the copies are identical).
+#
+# Selected by the worker's config section `llm` block:
+#     "llm": {"transport": "openai", "base_url": "http://127.0.0.1:8091", "model": "strata",
+#             "timeout_sec": 900, "effort_on": "low"}
+# Absent `llm` (or transport != "openai") -> the native LM Studio class, unchanged: rollback is a config edit.
+#
+# Thinking map (reasoning spec from reasoning_fields()):
+#   off              -> reasoning_effort "none" + chat_template_kwargs {enable_thinking: false}
+#                       (Strata DEFAULTS TO HIGH when reasoning_effort is omitted, so "none" is always sent;
+#                        llama-server/Ornith launched with --reasoning off honours the kwargs, both harmless)
+#   on + budget N    -> reasoning_effort `effort_on` (default "low") + reasoning_budget_tokens N
+#   low/medium/high  -> reasoning_effort <that>
+#   on (no budget)   -> reasoning_effort `effort_on`
+# Readiness: llama-swap lists every configured model whether loaded or not, so /v1/models proves nothing.
+# model_ready() makes a 1-token call (which is what loads the model, through muninn-gpu-guard); a refusal
+# (llama-swap HTTP 500 "upstream command exited prematurely") or any 5xx / connection error = not ready,
+# and the worker's existing backoff takes over. A success is trusted for `ready_cache_sec` (120 s); a refusal
+# is remembered for `fail_cache_sec` (300 s) so a fast-polling daemon (the enricher idles at 60 s) asks — and
+# makes the guard write its journal line — at most once per 5 minutes.
+
+class OpenAICompat:
+    """Same surface as the native LMStudio class (model_ready, probe_thinking_off, chat_extract, loaded,
+    is_loaded, ensure_loaded, unload_all, reasoning_allowed_options) over /v1/chat/completions."""
+
+    BUSY_CODES = (409, 503)   # Strata: model busy / engine starting -> wait and resend inside the transport
+
+    def __init__(self, tcfg: dict):
+        self.base = tcfg.get("base_url", "http://127.0.0.1:8091").rstrip("/")
+        self.model = tcfg.get("model")
+        self.key = tcfg.get("key")
+        self.timeout = tcfg.get("timeout_sec", 900)
+        self.effort_on = tcfg.get("effort_on", "low")
+        self.busy_retries = tcfg.get("busy_retries", 6)
+        self.ready_cache_sec = tcfg.get("ready_cache_sec", 120)
+        self.fail_cache_sec = tcfg.get("fail_cache_sec", 300)
+        self._last_ok = 0.0
+        self._last_fail = 0.0
+        self.last_error = None
+
+    def _mid(self, model_id: str) -> str:
+        return self.model or model_id
+
+    def _http(self, path: str, body: dict | None = None, method: str = "GET", timeout: int | None = None):
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self.key:
+            headers["Authorization"] = f"Bearer {self.key}"
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode() if body is not None else None,
+                                     method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
+                raw = r.read()
+                return json.loads(raw) if raw.strip().startswith((b"{", b"[")) else {"_text": raw.decode(errors="replace")}
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read()[:300].decode(errors="replace")
+            except Exception:
+                err_body = ""
+            return {"_http_error": e.code, "_body": err_body}
+        except Exception as e:
+            return {"_http_error": None, "_body": f"transport: {e}"}
+
+    @staticmethod
+    def thinking_fields(spec, effort_on: str = "low") -> dict:
+        """reasoning spec -> OpenAI-compat request fields (see the map above)."""
+        budget = None
+        if isinstance(spec, dict):
+            mode = str(spec.get("mode", "off")).lower()
+            if mode == "budget":
+                budget = int(spec.get("budget_tokens") or 0)
+                if budget <= 0:
+                    raise ValueError(f"reasoning budget_tokens must be > 0, got {spec!r}")
+                mode = "on"
+        elif isinstance(spec, str):
+            mode = spec.lower()
+        else:
+            raise ValueError(f"unrecognised reasoning spec {spec!r}")
+        if mode in ("off", "none"):
+            return {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}}
+        out: dict = {"reasoning_effort": effort_on if mode == "on" else mode}
+        if budget:
+            out["reasoning_budget_tokens"] = budget
+        return out
+
+    def chat(self, model_id: str, max_tokens: int, system: str, user: str, temperature: float = 0.0,
+             reasoning="off", timeout: int | None = None) -> dict:
+        """One /v1/chat/completions call. -> raw response dict, or {"_http_error":..., "_body":...}."""
+        body = {"model": self._mid(model_id), "temperature": temperature, "max_tokens": max_tokens,
+                "messages": ([{"role": "system", "content": system}] if system else [])
+                            + [{"role": "user", "content": user}],
+                "stream": False, **self.thinking_fields(reasoning, self.effort_on)}
+        res: dict = {}
+        for attempt in range(self.busy_retries + 1):
+            res = self._http("/v1/chat/completions", body, "POST", timeout)
+            if res.get("_http_error") in self.BUSY_CODES and attempt < self.busy_retries:
+                time.sleep(min(5 * (attempt + 1), 30))
+                continue
+            break
+        if "_http_error" in res:
+            self.last_error = f"HTTP {res['_http_error']}: {res.get('_body', '')[:160]}"
+            log(f"llama-swap POST /v1/chat/completions {self.last_error}")
+        else:
+            self._last_ok = time.time()
+        return res
+
+    @staticmethod
+    def reasoning_tokens(res: dict) -> int:
+        """usage.completion_tokens_details.reasoning_tokens when the server reports it; otherwise an estimate
+        from reasoning_content (~4 chars/token; Strata's usage has no reasoning count). 0 = no thinking."""
+        rt = ((res.get("usage") or {}).get("completion_tokens_details") or {}).get("reasoning_tokens")
+        if isinstance(rt, int) and rt > 0:
+            return rt
+        msg = (res.get("choices") or [{}])[0].get("message") or {}
+        rc = (msg.get("reasoning_content") or "").strip()
+        content = msg.get("content") or ""
+        if not rc and "<think>" in content:
+            rc = content.split("<think>", 1)[1].split("</think>", 1)[0].strip()
+        return (len(rc) + 3) // 4 if rc else 0
+
+    def chat_extract(self, model_id: str, max_tokens: int, system: str, user: str,
+                     temperature: float = 0.0, reasoning="off") -> tuple[dict | None, int]:
+        """Drop-in for LMStudio.chat_extract: -> (parsed JSON | None, reasoning_tokens; -1 = transport error)."""
+        res = self.chat(model_id, max_tokens, system, user, temperature, reasoning)
+        if "_http_error" in res:
+            return None, -1
+        try:
+            msg = res["choices"][0]["message"]
+        except Exception:
+            log(f"  llama-swap: bad response shape: {str(res)[:150]}")
+            return None, -1
+        rtok = self.reasoning_tokens(res)
+        content = (msg.get("content") or "").strip()
+        if "</think>" in content:
+            content = content.rsplit("</think>", 1)[1].strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip() if "\n" in content else content
+        if not content.startswith("{"):
+            i, j = content.find("{"), content.rfind("}")
+            if i >= 0 and j > i:
+                content = content[i:j + 1]
+        try:
+            return json.loads(content), rtok
+        except Exception as e:
+            log(f"  JSON parse failed: {e}; raw[:120]={content[:120]!r}")
+            return None, rtok
+
+    def model_ready(self, model_id: str) -> tuple[bool, str]:
+        if time.time() - self._last_ok < self.ready_cache_sec:
+            return True, "ready (recent successful call)"
+        since_fail = time.time() - self._last_fail
+        if since_fail < self.fail_cache_sec:
+            return False, f"backing off: last llama-swap attempt failed {since_fail:.0f}s ago ({self.last_error})"
+        res = self.chat(model_id, 1, "", "Reply with OK.", 0.0, "off", timeout=max(self.timeout, 600))
+        if "_http_error" in res:
+            self._last_fail = time.time()
+            return False, (f"{self._mid(model_id)} not available via llama-swap ({self.last_error}) — "
+                           f"refused by muninn-gpu-guard, outside its window, or loading failed; backing off")
+        return True, "ready"
+
+    def probe_thinking_off(self, model_id: str) -> tuple[bool, int]:
+        res = self.chat(model_id, 200, 'Output exactly: {"x":1}', "ping", 0.0, "off")
+        if "_http_error" in res or not res.get("choices"):
+            return False, -1
+        rtok = self.reasoning_tokens(res)
+        return rtok == 0, rtok
+
+    def loaded(self) -> list[dict]:
+        res = self._http("/running", timeout=15)
+        out = []
+        for m in (res.get("running") or []) if isinstance(res, dict) else []:
+            out.append({"key": m.get("model", ""), "instance_id": m.get("model", ""),
+                        "context_length": None, "reasoning_default": None, "state": m.get("state")})
+        return out
+
+    def is_loaded(self, model_id: str) -> bool:
+        return any(m["key"] == self._mid(model_id) for m in self.loaded())
+
+    def ensure_loaded(self, model_id: str, context_length: int = 0, allow_swap: bool = True) -> tuple[bool, str]:
+        ok, why = self.model_ready(model_id)
+        return ok, (f"{self._mid(model_id)} loaded via llama-swap" if ok else why)
+
+    def unload(self, instance_id: str) -> bool:
+        res = self._http(f"/api/models/unload/{instance_id}", {}, "POST", 120)
+        return "_http_error" not in res
+
+    def unload_all(self) -> int:
+        n = len(self.loaded())
+        res = self._http("/api/models/unload", {}, "POST", 120)
+        return n if "_http_error" not in res else 0
+
+    def list_models(self) -> list[dict]:
+        res = self._http("/v1/models", timeout=15)
+        return [{"key": m.get("id"), "loaded_instances": []} for m in (res.get("data") or [])] \
+            if isinstance(res, dict) else []
+
+    def reasoning_allowed_options(self, model_id: str) -> list[str]:
+        return []   # no capability advertisement; thinking_fields() covers every spec shape
+
+
+def make_llm(cfg: dict, section: str):
+    """The worker's LLM client: OpenAICompat when cfg[section]["llm"]["transport"] == "openai", else LM Studio."""
+    tcfg = (cfg.get(section) or {}).get("llm") or {}
+    if tcfg.get("transport") == "openai":
+        return OpenAICompat(tcfg)
+    return LMStudio(cfg["lmstudio"])
+# ─── END muninn-gpu transport v1 ──
+
+
 # ─── DB (durable queue) ────────────────────────────────────────────────────
 #
 # The queue caches assessment results (separate from the enricher's job
@@ -252,7 +525,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     last_error TEXT,
     queued_at REAL,
     assessed_at REAL,
-    promoted_at REAL
+    promoted_at REAL,
+    verify_verdict TEXT,
+    verify_spans TEXT,
+    verified_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_status_vault ON jobs(status, vault);
 """
@@ -262,6 +538,10 @@ def db_connect() -> sqlite3.Connection:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+    for col, ddl in (("verify_verdict", "TEXT"), ("verify_spans", "TEXT"), ("verified_at", "REAL")):
+        if col not in cols:  # migrate queue.db files created before the verify stage
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {ddl}")
     conn.commit()
     return conn
 
@@ -442,6 +722,15 @@ def is_enriched(engram: dict) -> bool:
     return bool(engram.get("summary")) or bool(engram.get("entities"))
 
 
+KNOWLEDGE_PAGE_TAG = "kind:knowledge-page"
+
+
+def is_knowledge_page(engram: dict) -> bool:
+    """Pager-written knowledge pages (Phase 5 design §4.4) are derived artefacts:
+    the promoter must never assess, promote or rewrite one."""
+    return KNOWLEDGE_PAGE_TAG in (engram.get("tags") or [])
+
+
 def select_candidates(rest: RestClient, vault: str, settling_cutoff_ts: float,
                        scan_limit: int, want: int) -> list[dict]:
     """Page through the vault oldest-first, filtering to engrams that are
@@ -471,7 +760,7 @@ def select_candidates(rest: RestClient, vault: str, settling_cutoff_ts: float,
             if scanned > scan_limit:
                 break
             tags = item.get("tags") or []
-            if "promotion:assessed" in tags:
+            if "promotion:assessed" in tags or KNOWLEDGE_PAGE_TAG in tags:
                 continue
             # created_at units vary by endpoint: list returns epoch seconds,
             # GET-by-id returns nanoseconds. Normalise by magnitude.
@@ -539,25 +828,49 @@ SYS_PROMPT_PROMOTE = (
 )
 
 
+# Appended to SYS_PROMPT_PROMOTE only when promoter.distil_fewshot is true. Invented content (<200 words).
+FEWSHOT_PROMOTE = (
+    'EXAMPLES (invented, for calibration only):\n'
+    'Example 1 source: "Fixed the flaky ingest in quillbox: worker-3 kept dying at 02:00 because cron rotated '
+    '/var/log/quillbox/ingest.log while the process still held the old file handle, so writes went to a deleted file '
+    'and the disk filled. Switched logrotate.d/quillbox to copytruncate; branch fix/rotate merged, ticket QB-212 closed."\n'
+    'Correct output: {"promote": true, "distilled_concept": "Log rotation vs a process holding the log open", '
+    '"distilled_content": "If a long-running process keeps writing to a log file after logrotate has moved or deleted '
+    'it, the writes go to the unlinked file and disk usage grows invisibly. Use copytruncate rotation for a process '
+    'that holds its log file open.", "type": "procedure", "tags": ["logging", "logrotate", "linux"], '
+    '"reason": "Reusable bug pattern and fix; project name, paths, branch and ticket stripped."}\n'
+    'Example 2 source: "Phase 2 of quillbox done: added the /sync endpoint, wired retries, 58 tests green. Next: dashboard."\n'
+    'Correct output: {"promote": false, "distilled_concept": "", "distilled_content": "", "type": "event", "tags": [], '
+    '"reason": "Status report of completed work; no decision rationale or reusable technique."}'
+)
+
+
+def promote_system_prompt(fewshot: bool = False) -> str:
+    """The distil system prompt. fewshot=False returns SYS_PROMPT_PROMOTE unchanged (byte-identical)."""
+    return SYS_PROMPT_PROMOTE + "\n\n" + FEWSHOT_PROMOTE if fewshot else SYS_PROMPT_PROMOTE
+
+
 def coerce_memory_type(t) -> str:
     s = str(t or "").strip().lower()
     return s if s in VALID_MEMORY_TYPES else "fact"
 
 
 def assess(lm: LMStudio, model_id: str, max_tokens: int, temperature: float, engram: dict,
-           reasoning_mode: str = "on") -> dict | None:
+           reasoning_mode: str = "on", fewshot: bool = False) -> dict | None:
     user = (
         f"Source vault: {engram.get('vault','')}\n"
         f"Concept: {engram.get('concept','')}\n"
         f"Summary: {engram.get('summary','')}\n"
         f"Content:\n{(engram.get('content') or '')[:2500]}"
     )
-    parsed, reasoning = lm.chat_extract(model_id, max_tokens, SYS_PROMPT_PROMOTE, user, temperature,
+    parsed, reasoning = lm.chat_extract(model_id, max_tokens, promote_system_prompt(fewshot), user, temperature,
                                          reasoning=reasoning_mode)
     if parsed is None:
         return None
     if reasoning_mode == "off" and reasoning > 0:
         log(f"  ⚠ assessment used {reasoning} reasoning tokens despite reasoning=off — API may have ignored the setting")
+    elif reasoning_mode != "off" and isinstance(reasoning, int) and reasoning >= 0:
+        warn_reasoning("assessment", reasoning_mode, reasoning)
     promote = bool(parsed.get("promote"))
     tags = [t.strip().lower() for t in (parsed.get("tags") or []) if isinstance(t, str) and t.strip()]
     return {
@@ -569,6 +882,48 @@ def assess(lm: LMStudio, model_id: str, max_tokens: int, temperature: float, eng
         "reason": (parsed.get("reason") or "").strip(),
         "reasoning_tokens": reasoning,
     }
+
+
+# ─── Verification (G6): is every claim in REWRITE supported by SOURCE? ──────
+
+SYS_PROMPT_VERIFY = (
+    'You are a strict fidelity checker. You get a SOURCE memory and a REWRITE derived from it. '
+    'The rewrite may generalize and drop detail, but every factual claim, number, cause and '
+    'recommendation it states must be supported by SOURCE. Do not use outside knowledge.\n'
+    'Labels: "supported" = every claim in REWRITE is supported by SOURCE; '
+    '"partial" = the core is supported but at least one claim, number or detail is added or '
+    'distorted beyond SOURCE; "unsupported" = the main claim is not supported by, or contradicts, SOURCE.\n'
+    'Output ONLY valid JSON, no prose, no markdown fences:\n'
+    '{"verdict": "supported"|"partial"|"unsupported", "unsupported_spans": [string, ...]}\n'
+    'unsupported_spans lists the exact REWRITE spans that SOURCE does not support (empty when supported).'
+)
+VERIFY_VERDICTS = ("supported", "partial", "unsupported")
+
+
+def verify_rewrite(lm: LMStudio, model_id: str, max_tokens: int, engram: dict, rewrite: str,
+                   reasoning_mode: str = "off") -> dict | None:
+    """Returns {"verdict", "spans"} or None on transport/parse failure or an
+    out-of-schema verdict (None => caller must NOT promote and retries later)."""
+    user = (
+        f"SOURCE concept: {engram.get('concept','')}\n"
+        f"SOURCE summary: {engram.get('summary','')}\n"
+        f"SOURCE content:\n{(engram.get('content') or '')[:2500]}\n\n"
+        f"REWRITE:\n{rewrite}"
+    )
+    parsed, rtok = lm.chat_extract(model_id, max_tokens, SYS_PROMPT_VERIFY, user, 0.0,
+                                   reasoning=reasoning_mode)
+    if isinstance(rtok, int) and rtok >= 0:
+        warn_reasoning("verify", reasoning_mode, rtok)
+    if not isinstance(parsed, dict):
+        return None
+    verdict = str(parsed.get("verdict", "")).strip().lower()
+    if verdict not in VERIFY_VERDICTS:
+        log(f"  verify: out-of-schema verdict {verdict!r}")
+        return None
+    spans = [s for s in (parsed.get("unsupported_spans") or []) if isinstance(s, str)]
+    if verdict == "supported":
+        spans = []
+    return {"verdict": verdict, "spans": spans}
 
 
 # ─── Twin-collision + write path (--run only, never invoked in --dry-run) ─
@@ -598,13 +953,15 @@ def find_twin(rest: RestClient, target_vault: str, op: str, distilled_content: s
 
 
 def promote_one(rest: RestClient, muninn: MuninnMCP, target_vault: str, source_vault: str,
-                 source_id: str, assessment: dict, twin_threshold: float) -> tuple[bool, str]:
+                 source_id: str, assessment: dict, twin_threshold: float,
+                 verified: bool = False) -> tuple[bool, str]:
     """Write path — gated behind --run, never called from --dry-run."""
     content = assessment["distilled_content"]
     op = op_hash(content)
     twin = find_twin(rest, target_vault, op, content, twin_threshold)
     tags = list(dict.fromkeys(
         assessment["tags"] + ["promoted", f"promoted:from:{source_vault}", "source:promoter", f"op:{op}"]
+        + ([f"promoted-from:{source_id}", "promotion:verified"] if verified else [])
     ))
     if twin:
         ok = muninn.evolve(target_vault, twin["id"], content,
@@ -628,9 +985,9 @@ def _add_tags(rest: RestClient, vault: str, engram_id: str, add: list[str]) -> l
     return tags
 
 
-def mark_assessed_only(rest: RestClient, vault: str, engram_id: str) -> bool:
+def mark_assessed_only(rest: RestClient, vault: str, engram_id: str, extra: list[str] | None = None) -> bool:
     """Rejected candidates still get `promotion:assessed` so they aren't re-judged forever."""
-    tags = _add_tags(rest, vault, engram_id, ["promotion:assessed"])
+    tags = _add_tags(rest, vault, engram_id, ["promotion:assessed"] + (extra or []))
     return rest.set_tags(vault, engram_id, tags)
 
 
@@ -643,10 +1000,20 @@ def run_pass(cfg: dict, pcfg: dict, rest: RestClient, muninn: MuninnMCP, lm: LMS
     scan_limit = pcfg["scan_limit_per_vault"]
     target_vault = pcfg["target_vault"]
     twin_threshold = pcfg["twin_similarity_threshold"]
-    reasoning_mode = pcfg.get("reasoning", "off")
+    reasoning_mode = distil_reasoning_spec(pcfg)
+    fewshot = bool(pcfg.get("distil_fewshot", False))
+    dbudget = reasoning_fields(reasoning_mode).get("reasoning_budget") or 0  # budget spent inside max_output_tokens
 
-    totals = {"assessed": 0, "promote": 0, "reject": 0, "errors": 0}
-    samples_promote, samples_reject = [], []
+    verify_on = bool(pcfg.get("verify", True))
+    vkey = pcfg.get("verify_model") or pcfg["model"]
+    vmodel_id = cfg["models"][vkey]["id"]
+    vmax = pcfg.get("verify_max_tokens", 1500)
+    vreasoning = pcfg.get("verify_reasoning", "off")
+    vbudget = reasoning_fields(vreasoning).get("reasoning_budget") or 0
+    vmax_eff = vmax + vbudget  # the budget is spent inside max_output_tokens; keep the answer's room intact
+    totals = {"assessed": 0, "promote": 0, "reject": 0, "errors": 0,
+              "verified": 0, "review": 0, "verify_errors": 0}
+    samples_promote, samples_reject, samples_review = [], [], []
 
     per_vault_limit = max(1, limit // max(1, len(vaults)))
     for vault in vaults:
@@ -654,6 +1021,8 @@ def run_pass(cfg: dict, pcfg: dict, rest: RestClient, muninn: MuninnMCP, lm: LMS
         log(f"[{vault}] {len(candidates)} candidate(s) (scan cap={scan_limit}, settling>={pcfg['settling_hours']}h)")
         for engram in candidates:
             eid = engram["id"]
+            if conn.execute("SELECT 1 FROM jobs WHERE id=? AND status='review'", (eid,)).fetchone():
+                continue  # already parked for human review; never re-judged or promoted
             row = conn.execute("SELECT promote, distilled_content, distilled_concept, distilled_type, "
                                 "distilled_tags, reject_reason FROM jobs WHERE id=? AND status='assessed'",
                                 (eid,)).fetchone()
@@ -664,9 +1033,9 @@ def run_pass(cfg: dict, pcfg: dict, rest: RestClient, muninn: MuninnMCP, lm: LMS
                     "tags": json.loads(row[4] or "[]"), "reason": row[5] or "",
                 }
             else:
-                assessment = assess(lm, model_cfg["id"], model_cfg["max_tokens"],
+                assessment = assess(lm, model_cfg["id"], model_cfg["max_tokens"] + dbudget,
                                      model_cfg.get("temperature", 0.0), engram,
-                                     reasoning_mode=reasoning_mode)
+                                     reasoning_mode=reasoning_mode, fewshot=fewshot)
                 if assessment is None:
                     totals["errors"] += 1
                     conn.execute(
@@ -688,6 +1057,35 @@ def run_pass(cfg: dict, pcfg: dict, rest: RestClient, muninn: MuninnMCP, lm: LMS
 
             totals["assessed"] += 1
             if assessment["promote"] and assessment["distilled_content"]:
+                verified = False
+                if verify_on:
+                    vrow = conn.execute("SELECT verify_verdict, verify_spans FROM jobs WHERE id=?", (eid,)).fetchone()
+                    if vrow and vrow[0]:
+                        vres = {"verdict": vrow[0], "spans": json.loads(vrow[1] or "[]")}
+                    else:
+                        vres = verify_rewrite(lm, vmodel_id, vmax_eff, engram, assessment["distilled_content"],
+                                              reasoning_mode=vreasoning)
+                        if vres is not None:
+                            conn.execute("UPDATE jobs SET verify_verdict=?, verify_spans=?, verified_at=? WHERE id=?",
+                                         (vres["verdict"], json.dumps(vres["spans"]), time.time(), eid))
+                            conn.commit()
+                    if vres is None:
+                        totals["verify_errors"] += 1
+                        log(f"  [{vault}] {eid}: verify failed — not promoting this pass")
+                        continue
+                    if vres["verdict"] != "supported":
+                        totals["review"] += 1
+                        if len(samples_review) < 4:
+                            samples_review.append({"source_vault": vault, "source_id": eid,
+                                                    "verdict": vres["verdict"], "spans": vres["spans"]})
+                        if not dry_run:
+                            conn.execute("UPDATE jobs SET status='review' WHERE id=?", (eid,))
+                            conn.commit()
+                            mark_assessed_only(rest, vault, eid, ["promotion:review"])
+                            log(f"  [{vault}] {eid}: verify={vres['verdict']} — routed to review, not promoted")
+                        continue
+                    verified = True
+                    totals["verified"] += 1
                 totals["promote"] += 1
                 if len(samples_promote) < 6:
                     samples_promote.append({
@@ -699,7 +1097,8 @@ def run_pass(cfg: dict, pcfg: dict, rest: RestClient, muninn: MuninnMCP, lm: LMS
                         "reason": assessment["reason"],
                     })
                 if not dry_run:
-                    ok, result = promote_one(rest, muninn, target_vault, vault, eid, assessment, twin_threshold)
+                    ok, result = promote_one(rest, muninn, target_vault, vault, eid, assessment, twin_threshold,
+                                              verified=verified)
                     conn.execute("UPDATE jobs SET status=?, promoted_at=? WHERE id=?",
                                  ("promoted" if ok else "promote_failed", time.time(), eid))
                     conn.commit()
@@ -724,7 +1123,8 @@ def run_pass(cfg: dict, pcfg: dict, rest: RestClient, muninn: MuninnMCP, lm: LMS
             n = len(contra.get("contradictions", []) or [])
             log(f"post-batch contradictions check on {target_vault}: {n} pair(s) found")
 
-    return {"totals": totals, "samples_promote": samples_promote, "samples_reject": samples_reject}
+    return {"totals": totals, "samples_promote": samples_promote, "samples_reject": samples_reject,
+            "samples_review": samples_review}
 
 
 # ─── Entry ─────────────────────────────────────────────────────────────────
@@ -742,12 +1142,16 @@ def main():
     p.add_argument("--scan-limit", type=int, default=None,
                    help="override scan_limit_per_vault (engrams scanned per vault per pass; raise to reach past already-assessed engrams in a big vault)")
     p.add_argument("--status", action="store_true", help="show queue status and exit")
+    p.add_argument("--review-list", action="store_true", help="list rewrites held for review (verify=partial/unsupported) and exit")
+    p.add_argument("--no-verify", action="store_true", help="skip the post-rewrite verification stage (legacy behaviour)")
     p.add_argument("--fast", action="store_true", help="use the fast model instead of default")
     args = p.parse_args()
     if args.settling_hours is not None:
         pcfg["settling_hours"] = args.settling_hours
     if args.scan_limit is not None:
         pcfg["scan_limit_per_vault"] = args.scan_limit
+    if args.no_verify:
+        pcfg["verify"] = False
 
     conn = db_connect()
 
@@ -757,6 +1161,12 @@ def main():
         print("  by vault:")
         for vault, n in conn.execute("SELECT vault, COUNT(*) AS n FROM jobs GROUP BY vault ORDER BY n DESC"):
             print(f"    {vault}: {n}")
+        return
+
+    if args.review_list:
+        for eid, vault, concept, verdict, spans in conn.execute(
+                "SELECT id, vault, concept, verify_verdict, verify_spans FROM jobs WHERE status='review' ORDER BY verified_at"):
+            print(f"{vault} {eid} [{verdict}] {concept}\n    unsupported: {json.loads(spans or '[]')}")
         return
 
     if not args.dry_run and not args.run:
@@ -769,7 +1179,7 @@ def main():
     if "fast" in cfg.get("models", {}):
         pcfg["model"] = "fast" if args.fast else pcfg["model"]
     model_cfg = cfg["models"][pcfg["model"]]
-    lm = LMStudio(cfg["lmstudio"])
+    lm = make_llm(cfg, "promoter")
 
     # exit 0 when the model isn't loaded — mirrors the enricher's daemon
     # semantics so a systemd timer never reports a spurious failure.
@@ -786,11 +1196,19 @@ def main():
         print(f"✗ requesting reasoning=off used {reasoning} reasoning tokens — native API is not honoring the per-request override.")
         sys.exit(1)
 
-    reasoning_mode = pcfg.get("reasoning", "off")
-    allowed = lm.reasoning_allowed_options(model_cfg["id"])
-    if allowed and reasoning_mode not in allowed:
-        print(f"✗ promoter.reasoning={reasoning_mode!r} not in {model_cfg['id']}'s allowed_options {allowed}")
-        sys.exit(1)
+    vmodel_key = pcfg.get("verify_model") or pcfg["model"]
+    for key, spec, mid in (("distil_reasoning/reasoning", distil_reasoning_spec(pcfg), model_cfg["id"]),
+                           ("verify_reasoning", pcfg.get("verify_reasoning", "off"),
+                            cfg["models"][vmodel_key]["id"])):
+        try:
+            rmode = reasoning_fields(spec)["reasoning"]
+        except ValueError as e:
+            print(f"✗ promoter.{key}: {e}")
+            sys.exit(1)
+        allowed = lm.reasoning_allowed_options(mid)
+        if allowed and rmode not in allowed:
+            print(f"✗ promoter.{key}={spec!r} not in {mid}'s allowed_options {allowed}")
+            sys.exit(1)
 
     endpoint, api_key = cfg["endpoint"], cfg["apply_api_key"]
     rest = RestClient(endpoint, api_key)
@@ -814,6 +1232,10 @@ def main():
         print(f"  {s['distilled_content']}")
         if s["reason"]:
             print(f"  reason: {s['reason']}")
+    print(f"verified={totals['verified']} review={totals['review']} verify_errors={totals['verify_errors']}")
+    print("\n--- REVIEW samples (held, not promoted) ---")
+    for s in result["samples_review"]:
+        print(f"  [{s['source_vault']}] {s['source_id']} verdict={s['verdict']} spans={s['spans']}")
     print("\n--- REJECT samples ---")
     for s in result["samples_reject"]:
         print(f"\n[{s['source_vault']}] {s['source_id']}  ({s['source_concept']})")
